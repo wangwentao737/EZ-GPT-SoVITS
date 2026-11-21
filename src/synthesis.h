@@ -26,9 +26,10 @@ public:
     void importVoice(QJsonObject defaults = {});
     void playAudio(const QString &path);
     void loadRequest(const QJsonObject &request);
+    void refreshVoices(const QString &selected = {});
+    bool importing() const { return importing_; }
 
 private:
-    void refreshVoices(const QString &selected = {});
     void generate();
     void receiveAudio(const QString &id, const QJsonObject &result);
 
@@ -36,6 +37,7 @@ private:
     TaskScheduler &scheduler_;
     std::function<QString()> launcher_;
     QFutureWatcher<QJsonObject> importer_;
+    bool importing_ = false;
     QComboBox *voices_ = nullptr;
     QComboBox *language_ = nullptr;
     QPlainTextEdit *text_ = nullptr;

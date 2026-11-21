@@ -1,5 +1,6 @@
 #include "engine.h"
 #include "jobs.h"
+#include "library.h"
 #include "settings.h"
 #include "synthesis.h"
 #include "training.h"
@@ -183,7 +184,7 @@ public:
                 synthesis->importVoice(settings);
             }, tabs);
         tabs->addTab(training, QStringLiteral("训练项目"));
-        tabs->addTab(createAssets(tabs, synthesis), QStringLiteral("声音与素材"));
+        tabs->addTab(ez::createLibraryPage(root_, defaultOutput_, *scheduler_, synthesis, tabs), QStringLiteral("声音与素材"));
         tabs->addTab(createHistory(tabs, synthesis), QStringLiteral("任务记录"));
         tabs->addTab(settings, QStringLiteral("设置"));
         connect(existing, &QPushButton::clicked, tabs, [tabs, synthesis] { tabs->setCurrentWidget(synthesis); });
@@ -401,61 +402,6 @@ private:
         const auto path = ez::checkedPath(location);
         if (!QDir().mkpath(path) || !QDesktopServices::openUrl(QUrl::fromLocalFile(path)))
             throw std::runtime_error(QStringLiteral("无法打开目录：%1").arg(path).toStdString());
-    }
-
-    QWidget *createAssets(QTabWidget *tabs, ez::SynthesisPanel *synthesis)
-    {
-        auto *page = new QWidget(tabs);
-        auto *layout = new QVBoxLayout(page);
-        auto *table = new QTableWidget(0, 4, page);
-        table->setHorizontalHeaderLabels({QStringLiteral("声音"), QStringLiteral("模型家族"),
-                                         QStringLiteral("参考语言"), QStringLiteral("验证引擎")});
-        table->setSelectionBehavior(QAbstractItemView::SelectRows);
-        table->setEditTriggers(QAbstractItemView::NoEditTriggers);
-        table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
-        table->horizontalHeader()->setStretchLastSection(true);
-        layout->addWidget(table);
-        auto *actions = new QHBoxLayout;
-        auto *import = new QPushButton(QStringLiteral("导入声音"), page);
-        actions->addWidget(import);
-        connect(import, &QPushButton::clicked, page, [tabs, synthesis] {
-            tabs->setCurrentWidget(synthesis);
-            synthesis->importVoice();
-        });
-        const QMap<QString, QString> folders{{QStringLiteral("模型目录"), "/assets/models"},
-            {QStringLiteral("参考音频目录"), "/assets/audio"}, {QStringLiteral("成品目录"), "/outputs"},
-            {QStringLiteral("训练项目目录"), "/projects"}};
-        for (auto entry = folders.cbegin(); entry != folders.cend(); ++entry) {
-            auto *open = new QPushButton(entry.key(), page);
-            actions->addWidget(open);
-            const auto folder = entry.value();
-            connect(open, &QPushButton::clicked, page, [this, folder] {
-                try {
-                    openFolder(folder == "/outputs" ? ez::configuredOutputRoot(defaultOutput_) : root_ + folder);
-                } catch (const std::exception &error) {
-                    status_->setText(failureMessage(error));
-                }
-            });
-        }
-        actions->addStretch();
-        layout->addLayout(actions);
-        connect(tabs, &QTabWidget::currentChanged, page, [tabs, page, table] {
-            if (tabs->currentWidget() != page)
-                return;
-            QSqlQuery query("SELECT name, settings, verified_engine FROM voices ORDER BY name");
-            table->setRowCount(0);
-            while (query.next()) {
-                const int row = table->rowCount();
-                const auto settings = QJsonDocument::fromJson(query.value(1).toByteArray()).object();
-                const auto verified = query.value(2).toString();
-                const QStringList fields{query.value(0).toString(), settings.value("family").toString(),
-                    settings.value("prompt_language").toString(), verified.isEmpty() ? QStringLiteral("待验证") : verified};
-                table->insertRow(row);
-                for (int column = 0; column < fields.size(); ++column)
-                    table->setItem(row, column, new QTableWidgetItem(fields[column]));
-            }
-        });
-        return page;
     }
 
     QWidget *createHistory(QTabWidget *parent, ez::SynthesisPanel *synthesis)

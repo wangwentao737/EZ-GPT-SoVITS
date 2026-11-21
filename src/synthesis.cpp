@@ -190,6 +190,7 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
         }
     });
     connect(&importer_, &QFutureWatcher<QJsonObject>::finished, this, [this] {
+        importing_ = false;
         try {
             auto result = importer_.result();
             if (result.contains("error"))
@@ -258,7 +259,7 @@ void SynthesisPanel::refreshVoices(const QString &selected)
 
 void SynthesisPanel::importVoice(QJsonObject defaults)
 {
-    if (importer_.isRunning()) {
+    if (importing_) {
         status_->setText(QStringLiteral("正在导入声音，请稍候"));
         return;
     }
@@ -316,6 +317,11 @@ void SynthesisPanel::importVoice(QJsonObject defaults)
     QJsonObject values{{"name", name->text().trimmed()}, {"family", family->currentText()},
         {"gpt", gpt->text()}, {"sovits", sovits->text()}, {"reference", ref->text()},
         {"prompt", prompt->toPlainText().trimmed()}, {"prompt_language", lang->currentText()}};
+    if (defaults.contains("id") && values.value("family") == defaults.value("family")
+        && values.value("gpt") == defaults.value("gpt")
+        && values.value("sovits") == defaults.value("sovits")) {
+        values["project_id"] = defaults.value("id");
+    }
     if (values.value("name").toString().isEmpty() || values.value("prompt").toString().isEmpty()
         || !gpt->text().endsWith(".ckpt", Qt::CaseInsensitive) || !sovits->text().endsWith(".pth", Qt::CaseInsensitive)
         || ref->text().isEmpty()) {
@@ -323,6 +329,7 @@ void SynthesisPanel::importVoice(QJsonObject defaults)
         return;
     }
     status_->setText(QStringLiteral("正在复制和校验声音文件…"));
+    importing_ = true;
     const auto root = root_;
     importer_.setFuture(QtConcurrent::run([root, values]() mutable {
         try {
@@ -331,6 +338,8 @@ void SynthesisPanel::importVoice(QJsonObject defaults)
                 bytes += QFileInfo(checkedPath(values.value(key).toString())).size();
             if (QStorageInfo(root).bytesAvailable() < bytes)
                 throw std::runtime_error(QStringLiteral("素材库磁盘空间不足").toStdString());
+            for (const auto &key : {"gpt", "sovits", "reference"})
+                values[QString::fromLatin1(key) + "_name"] = QFileInfo(values.value(key).toString()).fileName();
             const auto models = root + "/assets/models/" + values.value("family").toString();
             values["gpt"] = storeFile(values.value("gpt").toString(), models + "/GPT");
             values["sovits"] = storeFile(values.value("sovits").toString(), models + "/SoVITS");
