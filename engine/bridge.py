@@ -1,5 +1,6 @@
 """Run one EZ job with the Gradio client bundled in the selected engine."""
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -160,7 +161,10 @@ def synthesize(client, engine, data, job, request):
             ) as destination:
                 for block in source.blocks(blocksize=65536):
                     destination.write(block)
-        publish(audio=str(temporary), seed=int(actual_seed), duration=info.duration)
+        with temporary.open("rb") as audio:
+            digest = hashlib.file_digest(audio, "sha256").hexdigest()
+        publish(audio=str(temporary), seed=int(actual_seed), duration=info.duration,
+                bytes=temporary.stat().st_size, sha256=digest)
     finally:
         try:
             if start_requested:

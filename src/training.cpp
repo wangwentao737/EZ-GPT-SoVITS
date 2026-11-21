@@ -231,6 +231,23 @@ void TrainingPanel::loadProject()
     query.addBindValue(projects_->currentData().toString());
     execute(query);
     project_ = query.next() ? QJsonDocument::fromJson(query.value(0).toByteArray()).object() : QJsonObject{};
+    query.finish();
+    const auto pending = project_.value("pending").toString();
+    if (!pending.isEmpty()) {
+        query.prepare("SELECT state,result FROM jobs WHERE id=?");
+        query.addBindValue(pending);
+        execute(query);
+        const bool exists = query.next();
+        const auto status = exists ? query.value(0).toString() : QString();
+        const auto result = exists ? QJsonDocument::fromJson(query.value(1).toByteArray()).object() : QJsonObject{};
+        query.finish();
+        if (status == "succeeded") {
+            complete(pending, result, false);
+        } else if (status != "queued" && status != "running") {
+            project_.remove("pending");
+            saveProject(project_);
+        }
+    }
     readClips();
     if (project_.contains("annotation"))
         loadLabels(project_.value("annotation").toString());
@@ -368,19 +385,16 @@ void TrainingPanel::submit(const QString &operation)
     } else if (operation == "prepare") {
         require(project_.contains("annotation"), QStringLiteral("请保存校对后的标注"));
         request["experiment"] = "ez_" + newId();
-        project_["experiment"] = request.value("experiment");
-        invalidate(project_);
     } else {
         require(project_.contains("dataset") && project_.value("engine") == launcher,
                 QStringLiteral("请先用当前引擎准备数据"));
     }
-    const auto task = scheduler_.enqueue(launcher, request);
+    const auto task = scheduler_.enqueue(launcher, request, project_);
     project_["pending"] = task;
-    saveProject(project_);
     showState();
 }
 
-void TrainingPanel::complete(const QString &id, const QJsonObject &result)
+void TrainingPanel::complete(const QString &id, const QJsonObject &result, bool live)
 {
     QSqlQuery query;
     query.prepare("SELECT launcher,operation,request FROM jobs WHERE id=?");
@@ -411,6 +425,8 @@ void TrainingPanel::complete(const QString &id, const QJsonObject &result)
         state["experiment"] = "ez_" + newId();
         invalidate(state);
     } else if (operation == "prepare") {
+        invalidate(state);
+        state["experiment"] = request.value("experiment");
         state["dataset"] = result.value("dataset");
         state["engine"] = launcher;
     } else if (operation == "train_sovits" || operation == "train_gpt") {
@@ -418,15 +434,16 @@ void TrainingPanel::complete(const QString &id, const QJsonObject &result)
     }
     saveProject(state);
     const bool current = project_.value("id") == state.value("id");
-    if (current && operation == "slice")
+    if (live && current && operation == "slice")
         readClips();
-    if (current && operation == "asr")
+    if (live && current && operation == "asr")
         loadLabels(state.value("annotation").toString());
-    if (operation == "train_sovits") {
+    if (live && operation == "train_sovits") {
         auto next = request;
         next["operation"] = "train_gpt";
-        state["pending"] = scheduler_.enqueue(launcher, next);
-        saveProject(state);
+        state["pending"] = scheduler_.enqueue(launcher, next, state);
+        if (current)
+            project_ = state;
     }
     showState();
 }
@@ -467,6 +484,8 @@ void TrainingPanel::showState()
     }
     if (project_.contains("gpt") && project_.contains("sovits"))
         stage_->setText(QStringLiteral("模型已训练完成。选择参考片段，点击「试听并入库」。"));
+    else if (project_.contains("sovits"))
+        stage_->setText(QStringLiteral("SoVITS 阶段已完成。点击「开始训练」继续 GPT 阶段。"));
     else if (project_.contains("dataset"))
         stage_->setText(QStringLiteral("训练数据已就绪。设置批量和轮数，再点击「开始训练」。"));
     else if (project_.contains("clips"))

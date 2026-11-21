@@ -28,7 +28,7 @@ private:
     void loadLabels(const QString &path);
     void saveLabels();
     void submit(const QString &operation);
-    void complete(const QString &id, const QJsonObject &result);
+    void complete(const QString &id, const QJsonObject &result, bool live = true);
     void importVoice();
     void showState();
     bool busy() const;

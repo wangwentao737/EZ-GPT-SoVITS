@@ -18,6 +18,8 @@ cmake --install build --config Release --prefix (Join-Path $PWD "out/portable")
 
 运行 `pwsh -File tests/portable-smoke.ps1` 验证便携启动、SQLite 初始化、端口冲突与目录联接拒绝。运行时需让 9874 端口空闲，以便脚本创建临时监听器。
 
+如开发机安装了 Python，也可运行 `python -B tests/task-recovery.py`。该脚本通过便携 EXE 验证归档提交和训练阶段的重启恢复，测试数据写入项目的 `.test` 目录。
+
 ## 开发接入
 
 - 在「工作台」手动添加独立整合包的 `go-webui.bat`，选择要检查的模型家族，然后启动引擎。EZ 使用本机 Gradio 接口。目标整合包是 GPT-SoVITS-v5-20261006，主服务使用 9874，快速推理服务使用 9872。

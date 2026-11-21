@@ -15,7 +15,7 @@ class TaskScheduler final : public QObject {
     Q_OBJECT
 public:
     TaskScheduler(QString dataRoot, EngineManager &engine, QObject *parent = nullptr);
-    QString enqueue(const QString &launcher, const QJsonObject &request);
+    QString enqueue(const QString &launcher, const QJsonObject &request, QJsonObject project = {});
     void cancel(const QString &id);
     void stop();
     bool running() const;

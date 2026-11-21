@@ -582,7 +582,7 @@ int main(int argc, char **argv)
     QApplication app(argc, argv);
     app.setApplicationName("EZ-GPT-SoVITS");
     app.setOrganizationName("EZ-GPT-SoVITS");
-    app.setApplicationVersion("0.1.0");
+    app.setApplicationVersion(QStringLiteral(EZ_APP_VERSION));
     QCommandLineParser parser;
     parser.addHelpOption();
     parser.addVersionOption();

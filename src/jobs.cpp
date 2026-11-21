@@ -1,6 +1,7 @@
 #include "jobs.h"
 #include "engine.h"
 
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -8,9 +9,11 @@
 #include <QJsonDocument>
 #include <QProcessEnvironment>
 #include <QSaveFile>
+#include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QUuid>
+#include <QtEndian>
 #include <stdexcept>
 #include <utility>
 
@@ -46,6 +49,24 @@ QJsonObject readResult(const QString &path)
     if (!file.open(QIODevice::ReadOnly))
         return {};
     return QJsonDocument::fromJson(file.readAll()).object();
+}
+
+bool isArchivedWave(const QString &path, const QJsonObject &receipt)
+{
+    QFile file(checkedPath(path));
+    if (!file.open(QIODevice::ReadOnly) || file.size() <= 44)
+        return false;
+    const auto header = file.read(12);
+    if (header.size() != 12 || !header.startsWith("RIFF") || header.mid(8) != "WAVE"
+        || qFromLittleEndian<quint32>(header.constData() + 4) + qint64(8) != file.size()) {
+        return false;
+    }
+    if (!receipt.contains("sha256") && !receipt.contains("bytes"))
+        return true; // Receipts written before audio checksums were recorded.
+    const auto digest = receipt.value("sha256").toString().toLatin1();
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    return receipt.value("bytes").toInteger() == file.size() && digest.size() == 64
+        && file.seek(0) && hash.addData(&file) && hash.result().toHex() == digest;
 }
 
 }
@@ -94,13 +115,10 @@ TaskScheduler::TaskScheduler(QString dataRoot, EngineManager &engine, QObject *p
         try {
             const auto completion = readResult(root_ + "/jobs/" + id + "/completion.json");
             const auto audio = completion.value("audio").toString();
-            if (!audio.startsWith(root_ + "/outputs/") || QFileInfo(audio).fileName() != id + ".wav")
+            if (!audio.startsWith(root_ + "/outputs/") || QDir::cleanPath(audio) != audio
+                || QFileInfo(audio).fileName() != id + ".wav")
                 continue;
-            QFile file(checkedPath(audio));
-            if (!file.open(QIODevice::ReadOnly))
-                continue;
-            const auto header = file.read(12);
-            if (header.startsWith("RIFF") && header.mid(8) == "WAVE" && file.size() > 44)
+            if (isArchivedWave(audio, completion))
                 update(id, "succeeded", {}, completion);
         } catch (const std::exception &) {
             // An unavailable artifact stays in the interrupted task list.
@@ -123,7 +141,7 @@ TaskScheduler::TaskScheduler(QString dataRoot, EngineManager &engine, QObject *p
     });
 }
 
-QString TaskScheduler::enqueue(const QString &launcher, const QJsonObject &request)
+QString TaskScheduler::enqueue(const QString &launcher, const QJsonObject &request, QJsonObject project)
 {
     const auto root = engineRoot(launcher);
     const auto id = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -135,7 +153,26 @@ QString TaskScheduler::enqueue(const QString &launcher, const QJsonObject &reque
     query.addBindValue(root + "/go-webui.bat");
     query.addBindValue(request.value("operation").toString());
     query.addBindValue(json(request));
-    execute(query);
+    auto database = QSqlDatabase::database();
+    if (!database.transaction())
+        fail(database.lastError().text());
+    try {
+        execute(query);
+        if (!project.isEmpty()) {
+            project.insert("pending", id);
+            query.prepare("UPDATE projects SET state=? WHERE id=?");
+            query.addBindValue(json(project));
+            query.addBindValue(project.value("id").toString());
+            execute(query);
+            if (query.numRowsAffected() != 1)
+                fail(QStringLiteral("训练项目已不存在，请重新打开项目"));
+        }
+        if (!database.commit())
+            fail(database.lastError().text());
+    } catch (...) {
+        database.rollback();
+        throw;
+    }
     emit changed();
     if (!engine_.active()) {
         try {
