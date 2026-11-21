@@ -14,7 +14,7 @@ cmake --build build --config Release --parallel
 cmake --install build --config Release --prefix (Join-Path $PWD "out/portable")
 ```
 
-从便携目录打开 `EZ-GPT-SoVITS.exe`。默认数据目录为 `%LOCALAPPDATA%\\EZ-GPT-SoVITS`，开发联调可以通过 `--data-root` 指定绝对路径。
+从便携目录打开 `EZ-GPT-SoVITS.exe` 即进入工作台。新安装的素材和项目保存在 EXE 同级的 `data`，默认成品目录为 `data/outputs`。「设置」页可添加引擎启动路径及更改成品生成目录。开发联调可以通过 `--data-root` 指定独立的数据目录。
 
 运行 `pwsh -File tests/portable-smoke.ps1` 验证便携启动、SQLite 初始化、端口冲突与目录联接拒绝。运行时需让 9874 端口空闲，以便脚本创建临时监听器。
 
@@ -24,7 +24,7 @@ cmake --install build --config Release --prefix (Join-Path $PWD "out/portable")
 
 ## 开发接入
 
-- 在「工作台」手动添加独立整合包的 `go-webui.bat`，选择要检查的模型家族，然后启动引擎。EZ 使用本机 Gradio 接口。目标整合包是 GPT-SoVITS-v5-20261006，主服务使用 9874，快速推理服务使用 9872。
+- 在「设置」手动添加独立整合包的 `go-webui.bat`，再在「工作台」检查模型家族并启动引擎。EZ 使用本机 Gradio 接口。目标整合包是 GPT-SoVITS-v5-20261006，主服务使用 9874，快速推理服务使用 9872。
 - 在「语音合成」导入配套的 GPT 和 SoVITS 权重、参考音频和参考文本。选择声音并输入台词，生成后的 WAV 可试听或另存。
 - 在「训练项目」创建项目、导入录音、切片及校对。保存标注并准备数据后，启动 SoVITS 和 GPT 训练。选中片段可用作训练后试听的参考音频。
 - 「任务记录」保存任务状态、参数与日志路径。取消时会先请求停止当前任务，超时后关闭本程序启动的引擎进程。队列里仍有任务时会尝试重启引擎并继续执行。失败的合成可重试，训练任务从项目内重新提交。

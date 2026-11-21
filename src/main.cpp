@@ -1,5 +1,6 @@
 #include "engine.h"
 #include "jobs.h"
+#include "settings.h"
 #include "synthesis.h"
 #include "training.h"
 
@@ -12,6 +13,7 @@
 #include <QDesktopServices>
 #include <QDir>
 #include <QFileDialog>
+#include <QFormLayout>
 #include <QFutureWatcher>
 #include <QHeaderView>
 #include <QInputDialog>
@@ -29,10 +31,10 @@
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
-#include <QStandardPaths>
 #include <QStorageInfo>
 #include <QTabWidget>
 #include <QTableWidget>
@@ -57,7 +59,7 @@ void checkQuery(const QSqlQuery &query)
 
 QString prepareDataRoot(const QString &requested)
 {
-    const auto path = ez::checkedPath(requested);
+    const auto path = ez::checkedWorkspaceRoot(requested);
     if (!QDir().mkpath(path))
         throw std::runtime_error(QStringLiteral("无法创建数据目录：%1").arg(path).toStdString());
     return path;
@@ -74,6 +76,7 @@ void initDatabase(const QString &root)
                "id INTEGER PRIMARY KEY, name TEXT NOT NULL, "
                "launcher TEXT NOT NULL COLLATE NOCASE UNIQUE)");
     checkQuery(query);
+    ez::initWorkspaceSettings();
 }
 
 void startProbeJob(QProcess &worker, const QString &engine, const QString &root, const QString &requestPath)
@@ -90,7 +93,7 @@ void startProbeJob(QProcess &worker, const QString &engine, const QString &root,
 
 class Workspace final : public QWidget {
 public:
-    explicit Workspace(const QString &root) : root_(root)
+    Workspace(const QString &root, const QString &defaultOutput) : root_(root), defaultOutput_(defaultOutput)
     {
         setWindowTitle(QStringLiteral("EZ-GPT-SoVITS · 语音工作台"));
         resize(1000, 690);
@@ -117,26 +120,26 @@ public:
         auto *home = new QWidget(tabs);
         tabs->addTab(home, QStringLiteral("工作台"));
         auto *homeLayout = new QVBoxLayout(home);
-        auto *hint = new QLabel(QStringLiteral("选择独立整合包中的 go-webui.bat，然后检查资源和启动引擎。"), home);
-        hint->setObjectName("muted");
-        hint->setWordWrap(true);
-        homeLayout->addWidget(hint);
+        engineLocation_ = new QLabel(home);
+        engineLocation_->setObjectName("muted");
+        engineLocation_->setWordWrap(true);
+        homeLayout->addWidget(engineLocation_);
         auto *paths = new QHBoxLayout;
         auto *existing = new QPushButton(QStringLiteral("使用已有模型"), home);
         auto *newVoice = new QPushButton(QStringLiteral("用录音训练声音"), home);
         paths->addWidget(existing);
         paths->addWidget(newVoice);
+        auto *configure = new QPushButton(QStringLiteral("引擎设置"), home);
+        paths->addWidget(configure);
         paths->addStretch();
         homeLayout->addLayout(paths);
 
         auto *selector = new QHBoxLayout;
-        profiles_ = new QComboBox(this);
         family_ = new QComboBox(this);
         family_->addItems({"v5turbo", "v5dev", "v2Pro", "v2ProPlus", "v2"});
-        auto *add = new QPushButton(QStringLiteral("添加引擎"), this);
-        selector->addWidget(profiles_, 1);
+        selector->addWidget(new QLabel(QStringLiteral("检查模型家族"), home));
         selector->addWidget(family_);
-        selector->addWidget(add);
+        selector->addStretch();
         homeLayout->addLayout(selector);
 
         auto *actions = new QHBoxLayout;
@@ -166,7 +169,8 @@ public:
         status_->setObjectName("muted");
         layout->addWidget(status_);
 
-        scheduler_ = new ez::TaskScheduler(root_, engine_, this);
+        auto *settings = createSettings(tabs);
+        scheduler_ = new ez::TaskScheduler(root_, defaultOutput_, engine_, this);
         auto *synthesis = new ez::SynthesisPanel(root_, *scheduler_, [this] { return currentLauncher(); }, tabs);
         tabs->addTab(synthesis, QStringLiteral("语音合成"));
         auto *training = new ez::TrainingPanel(root_, *scheduler_, [this] { return currentLauncher(); },
@@ -177,10 +181,11 @@ public:
         tabs->addTab(training, QStringLiteral("训练项目"));
         tabs->addTab(createAssets(tabs, synthesis), QStringLiteral("声音与素材"));
         tabs->addTab(createHistory(tabs, synthesis), QStringLiteral("任务记录"));
+        tabs->addTab(settings, QStringLiteral("设置"));
         connect(existing, &QPushButton::clicked, tabs, [tabs, synthesis] { tabs->setCurrentWidget(synthesis); });
         connect(newVoice, &QPushButton::clicked, tabs, [tabs, training] { tabs->setCurrentWidget(training); });
 
-        connect(add, &QPushButton::clicked, this, &Workspace::addEngine);
+        connect(configure, &QPushButton::clicked, tabs, [tabs, settings] { tabs->setCurrentWidget(settings); });
         connect(check_, &QPushButton::clicked, this, &Workspace::checkEngine);
         connect(digest, &QPushButton::clicked, this, [this, digest, cancelCheck] {
             if (inspection_.isRunning())
@@ -254,7 +259,15 @@ public:
             status_->setText(message);
             refreshActions();
         });
-        connect(profiles_, &QComboBox::currentIndexChanged, this, [this] { refreshActions(); });
+        connect(profiles_, &QComboBox::currentIndexChanged, this, [this] {
+            try {
+                if (!currentLauncher().isEmpty())
+                    ez::setWorkspaceSetting("currentEngine", currentLauncher());
+                refreshActions();
+            } catch (const std::exception &error) {
+                status_->setText(failureMessage(error));
+            }
+        });
         connect(&inspection_, &QFutureWatcher<QString>::finished, this, [this] {
             report_->setPlainText(inspection_.result());
             refreshActions();
@@ -294,19 +307,93 @@ protected:
 
 private:
     QString root_;
+    QString defaultOutput_;
     ez::EngineManager engine_;
     QFutureWatcher<QString> inspection_;
     std::atomic_bool cancelled_ = false;
     QComboBox *profiles_ = nullptr;
     QComboBox *family_ = nullptr;
+    QLineEdit *enginePath_ = nullptr;
+    QLabel *engineLocation_ = nullptr;
     QPlainTextEdit *report_ = nullptr;
     QLabel *status_ = nullptr;
     QPushButton *check_ = nullptr;
     QPushButton *start_ = nullptr;
+    QPushButton *addEngine_ = nullptr;
     ez::TaskScheduler *scheduler_ = nullptr;
 
     QString logPath() const { return root_ + "/engine-start.log"; }
     QString currentLauncher() const { return profiles_->currentData().toString(); }
+
+    QWidget *createSettings(QWidget *parent)
+    {
+        auto *page = new QWidget(parent);
+        auto *form = new QFormLayout(page);
+        auto *options = new QHBoxLayout;
+        profiles_ = new QComboBox(page);
+        profiles_->setPlaceholderText(QStringLiteral("尚未配置独立引擎"));
+        addEngine_ = new QPushButton(QStringLiteral("添加启动路径"), page);
+        options->addWidget(profiles_, 1);
+        options->addWidget(addEngine_);
+        form->addRow(QStringLiteral("GPT-SoVITS 引擎"), options);
+
+        enginePath_ = new QLineEdit(page);
+        enginePath_->setReadOnly(true);
+        enginePath_->setPlaceholderText(QStringLiteral("请选择独立整合包中的 go-webui.bat"));
+        form->addRow(QStringLiteral("引擎启动文件"), enginePath_);
+        const auto savedOutput = ez::workspaceSetting("outputRoot");
+        auto *output = new QLineEdit(QDir::toNativeSeparators(savedOutput.isEmpty() ? defaultOutput_ : savedOutput), page);
+        output->setReadOnly(true);
+        form->addRow(QStringLiteral("成品生成目录"), output);
+
+        auto *actions = new QHBoxLayout;
+        auto *choose = new QPushButton(QStringLiteral("更改目录"), page);
+        auto *reset = new QPushButton(QStringLiteral("恢复默认目录"), page);
+        auto *open = new QPushButton(QStringLiteral("打开成品目录"), page);
+        actions->addWidget(choose);
+        actions->addWidget(reset);
+        actions->addWidget(open);
+        actions->addStretch();
+        form->addRow(actions);
+        auto *dataFolder = new QLineEdit(QDir::toNativeSeparators(root_), page);
+        dataFolder->setReadOnly(true);
+        form->addRow(QStringLiteral("素材和项目数据"), dataFolder);
+
+        const auto saveOutput = [this, output](const QString &selected) {
+            try {
+                const auto path = ez::checkedWorkspaceRoot(selected.isEmpty() ? defaultOutput_ : selected);
+                if (!QDir().mkpath(path) || !QFileInfo(path).isWritable())
+                    throw std::runtime_error(QStringLiteral("此目录无法写入，请选择可写目录").toStdString());
+                ez::setWorkspaceSetting("outputRoot", selected.isEmpty() ? QStringLiteral("") : path);
+                output->setText(QDir::toNativeSeparators(path));
+                status_->setText(QStringLiteral("生成目录已更新，新提交的合成任务将使用此目录。"));
+            } catch (const std::exception &error) {
+                status_->setText(failureMessage(error));
+            }
+        };
+        connect(addEngine_, &QPushButton::clicked, this, &Workspace::addEngine);
+        connect(choose, &QPushButton::clicked, page, [this, output, saveOutput] {
+            const auto selected = QFileDialog::getExistingDirectory(this, QStringLiteral("选择成品生成目录"), output->text());
+            if (!selected.isEmpty())
+                saveOutput(selected);
+        });
+        connect(reset, &QPushButton::clicked, page, [saveOutput] { saveOutput({}); });
+        connect(open, &QPushButton::clicked, page, [this] {
+            try {
+                openFolder(ez::configuredOutputRoot(defaultOutput_));
+            } catch (const std::exception &error) {
+                status_->setText(failureMessage(error));
+            }
+        });
+        return page;
+    }
+
+    void openFolder(const QString &location)
+    {
+        const auto path = ez::checkedWorkspaceRoot(location);
+        if (!QDir().mkpath(path) || !QDesktopServices::openUrl(QUrl::fromLocalFile(path)))
+            throw std::runtime_error(QStringLiteral("无法打开目录：%1").arg(path).toStdString());
+    }
 
     QWidget *createAssets(QTabWidget *tabs, ez::SynthesisPanel *synthesis)
     {
@@ -336,9 +423,7 @@ private:
             const auto folder = entry.value();
             connect(open, &QPushButton::clicked, page, [this, folder] {
                 try {
-                    const auto path = ez::checkedPath(root_ + folder);
-                    if (QDir().mkpath(path))
-                        QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+                    openFolder(folder == "/outputs" ? ez::configuredOutputRoot(defaultOutput_) : root_ + folder);
                 } catch (const std::exception &error) {
                     status_->setText(failureMessage(error));
                 }
@@ -494,23 +579,30 @@ private:
     void refreshActions()
     {
         const bool selected = !currentLauncher().isEmpty();
+        enginePath_->setText(QDir::toNativeSeparators(currentLauncher()));
+        engineLocation_->setText(selected ? QStringLiteral("当前引擎：%1").arg(QDir::toNativeSeparators(currentLauncher()))
+            : QStringLiteral("请在「设置」中添加 GPT-SoVITS 引擎路径。"));
         check_->setEnabled(selected && !inspection_.isRunning());
         start_->setEnabled(selected || engine_.active());
         start_->setText(engine_.active() ? QStringLiteral("停止引擎") : QStringLiteral("启动引擎"));
         profiles_->setEnabled(!engine_.active());
+        addEngine_->setEnabled(!engine_.active());
     }
 
     void reloadProfiles(const QString &selected = {})
     {
         QSqlQuery query("SELECT name, launcher FROM engines ORDER BY id");
         checkQuery(query);
+        const QSignalBlocker block(profiles_);
         profiles_->clear();
         profiles_->setPlaceholderText(QStringLiteral("请选择 GPT-SoVITS 引擎"));
         while (query.next()) {
             profiles_->addItem(query.value(0).toString(), query.value(1).toString());
             profiles_->setItemData(profiles_->count() - 1, query.value(1), Qt::ToolTipRole);
         }
-        profiles_->setCurrentIndex(selected.isEmpty() && profiles_->count() ? 0 : profiles_->findData(selected));
+        const auto saved = selected.isEmpty() ? ez::workspaceSetting("currentEngine") : selected;
+        const int match = profiles_->findData(saved);
+        profiles_->setCurrentIndex(match >= 0 ? match : (profiles_->count() ? 0 : -1));
         refreshActions();
     }
 
@@ -529,8 +621,9 @@ private:
             query.addBindValue(path);
             query.exec();
             checkQuery(query);
+            ez::setWorkspaceSetting("currentEngine", path);
             reloadProfiles(path);
-            checkEngine();
+            status_->setText(QStringLiteral("引擎已保存，可回到工作台检查资源或启动。"));
         } catch (const std::exception &error) {
             QMessageBox::warning(this, QStringLiteral("无法添加引擎"), failureMessage(error));
         }
@@ -596,25 +689,23 @@ int main(int argc, char **argv)
     parser.process(app);
 
     try {
-        const auto location = QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + "/EZ-GPT-SoVITS";
-        QString requested;
-        if (parser.isSet(dataOption)) {
-            requested = parser.value(dataOption);
-        } else {
-            QSettings settings;
-            requested = settings.value("dataRoot").toString();
-            if (requested.isEmpty()) {
-                bool accepted = false;
-                requested = QInputDialog::getText(nullptr, QStringLiteral("选择数据目录"),
-                    QStringLiteral("素材、训练项目和生成的音频会保存在此目录。"),
-                    QLineEdit::Normal, location, &accepted);
-                if (!accepted)
-                    return 0;
-                requested = prepareDataRoot(requested);
-                settings.setValue("dataRoot", requested);
+        const auto portableData = QCoreApplication::applicationDirPath() + "/data";
+        auto requested = parser.isSet(dataOption) ? parser.value(dataOption) : portableData;
+        if (!parser.isSet(dataOption) && !QFileInfo::exists(ez::checkedPath(portableData + "/library.sqlite"))) {
+            // Installations from before the portable default can still open their existing library.
+            const auto previous = QSettings().value("dataRoot").toString();
+            if (!previous.isEmpty()) {
+                try {
+                    const auto legacy = ez::checkedWorkspaceRoot(previous);
+                    if (QFileInfo::exists(ez::checkedPath(legacy + "/library.sqlite")))
+                        requested = legacy;
+                } catch (const std::exception &) {
+                    // A disconnected or disallowed legacy workspace must not block startup.
+                }
             }
         }
         const auto root = prepareDataRoot(requested);
+        const auto defaultOutput = (parser.isSet(dataOption) ? root : portableData) + "/outputs";
         QLockFile lock(ez::checkedPath(root + "/workspace.lock"));
         if (!lock.tryLock())
             throw std::runtime_error(QStringLiteral("此数据目录已由另一个 EZ 实例使用").toStdString());
@@ -622,7 +713,7 @@ int main(int argc, char **argv)
         if (parser.isSet(probeOption)) {
             ez::EngineManager engine;
             if (parser.isSet(queueOption)) {
-                ez::TaskScheduler scheduler(root, engine);
+                ez::TaskScheduler scheduler(root, defaultOutput, engine);
                 QFile source(ez::checkedPath(parser.value(jobOption)));
                 if (!source.open(QIODevice::ReadOnly))
                     return 3;
@@ -698,7 +789,7 @@ int main(int argc, char **argv)
             engine.start(parser.value(probeOption), root + "/engine-start.log");
             return app.exec();
         }
-        Workspace window(root);
+        Workspace window(root, defaultOutput);
         window.show();
         if (parser.isSet(smokeOption))
             QTimer::singleShot(750, &app, &QApplication::quit);

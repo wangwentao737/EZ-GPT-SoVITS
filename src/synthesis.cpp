@@ -347,8 +347,12 @@ void SynthesisPanel::generate()
     try {
         const auto launcher = launcher_();
         const auto voice = voices_->currentData().toString();
-        if (launcher.isEmpty() || voice.isEmpty() || text_->toPlainText().trimmed().isEmpty()) {
-            status_->setText(QStringLiteral("请先选择引擎和声音，再输入台词"));
+        if (launcher.isEmpty()) {
+            status_->setText(QStringLiteral("请在「设置」中添加并选择引擎"));
+            return;
+        }
+        if (voice.isEmpty() || text_->toPlainText().trimmed().isEmpty()) {
+            status_->setText(QStringLiteral("请先选择声音，再输入台词"));
             return;
         }
         const auto seedText = seed_->text().trimmed();

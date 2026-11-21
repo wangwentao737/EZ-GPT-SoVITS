@@ -135,6 +135,14 @@ QString engineRoot(const QString &launcher)
     return root;
 }
 
+QString checkedWorkspaceRoot(const QString &path)
+{
+    const auto absolute = checkedPath(path);
+    if (inside(protectedRoot, absolute))
+        fail(QStringLiteral("请选择独立的数据目录，当前位置包含受保护的引擎安装目录"));
+    return absolute;
+}
+
 QStringList inspectEngine(const QString &launcher, const QString &family)
 {
     const auto root = engineRoot(launcher);

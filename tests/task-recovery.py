@@ -23,7 +23,8 @@ def start(program, data):
 
 def interrupted_synthesis(database, data, variant):
     job_id = str(uuid.uuid4())
-    target = data / "outputs" / f"{job_id}.wav"
+    output_root = data.with_name(data.name + "-external") if variant == "custom_output" else data / "outputs"
+    target = output_root / f"{job_id}.wav"
     temporary = data / "jobs" / job_id
     temporary.mkdir(parents=True)
     target.parent.mkdir(exist_ok=True)
@@ -40,9 +41,12 @@ def interrupted_synthesis(database, data, variant):
     elif variant == "legacy_truncated":
         wave_path.write_bytes(content[:-50])
     (temporary / "completion.json").write_text(json.dumps(receipt), encoding="utf-8")
+    request = {"text": "snapshot"}
+    if variant == "custom_output":
+        request["output_root"] = output_root.as_posix()
     database.execute(
         "INSERT INTO jobs(id,created,launcher,operation,state,request) VALUES(?,?,?,?,?,?)",
-        (job_id, "2026-01-01", "fixture", "synthesize", "running", b'{"text":"snapshot"}'),
+        (job_id, "2026-01-01", "fixture", "synthesize", "running", json.dumps(request).encode()),
     )
     return job_id
 
@@ -54,7 +58,7 @@ def main():
     data = workspace / ".test" / f"recovery-{uuid.uuid4().hex}"
     start(program, data)
     database = sqlite3.connect(data / "library.sqlite")
-    variants = ("complete", "before_move", "changed", "legacy_truncated")
+    variants = ("complete", "custom_output", "before_move", "changed", "legacy_truncated")
     jobs = {variant: interrupted_synthesis(database, data, variant) for variant in variants}
 
     project_id = uuid.uuid4().hex
@@ -83,8 +87,8 @@ def main():
         state, request, result = database.execute(
             "SELECT state,request,result FROM jobs WHERE id=?", (job_id,)
         ).fetchone()
-        assert json.loads(request) == {"text": "snapshot"}
-        if variant == "complete":
+        assert json.loads(request)["text"] == "snapshot"
+        if variant in ("complete", "custom_output"):
             assert state == "succeeded" and Path(json.loads(result)["audio"]).is_file(), (variant, state)
         else:
             assert state == "interrupted" and result is None, (variant, state, result)
@@ -108,7 +112,7 @@ def main():
     restored = json.loads(database.execute("SELECT state FROM projects WHERE id=?", (project_id,)).fetchone()[0])
     assert restored["sovits"] == recovered["sovits"] and "pending" not in restored and "gpt" not in restored
     database.close()
-    print("Recovery passed: verified WAV, incomplete publish, corrupt WAV, and completed/interrupted training stages.")
+    print("Recovery passed: default and custom output roots, incomplete/corrupt WAV, and completed/interrupted training stages.")
 
 
 if __name__ == "__main__":

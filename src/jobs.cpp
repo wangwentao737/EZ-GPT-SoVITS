@@ -1,5 +1,6 @@
 #include "jobs.h"
 #include "engine.h"
+#include "settings.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -72,6 +73,29 @@ bool isArchivedWave(const QString &path, const QJsonObject &receipt)
         && file.seek(0) && hash.addData(&file) && hash.result().toHex() == digest;
 }
 
+QString outputRootForRequest(const QString &dataRoot, const QJsonObject &request)
+{
+    const auto saved = request.value("output_root").toString();
+    return checkedWorkspaceRoot(saved.isEmpty() ? dataRoot + "/outputs" : saved);
+}
+
+void publishWave(const QString &source, const QString &target)
+{
+    QFile input(source);
+    QSaveFile output(target);
+    if (QFileInfo::exists(target) || !input.open(QIODevice::ReadOnly) || !output.open(QIODevice::WriteOnly))
+        fail(QStringLiteral("无法归档音频，请检查生成目录权限和可用空间"));
+    while (!input.atEnd()) {
+        const auto block = input.read(1024 * 1024);
+        if (input.error() != QFileDevice::NoError || output.write(block) != block.size())
+            fail(QStringLiteral("音频写入中断，请检查生成目录权限和可用空间"));
+    }
+    if (!output.commit())
+        fail(QStringLiteral("无法保存成品音频：%1").arg(output.errorString()));
+    input.close();
+    QFile::remove(source);
+}
+
 }
 
 void startJobProcess(QProcess &worker, const QString &engine, const QString &root,
@@ -99,8 +123,8 @@ void startJobProcess(QProcess &worker, const QString &engine, const QString &roo
     worker.start();
 }
 
-TaskScheduler::TaskScheduler(QString dataRoot, EngineManager &engine, QObject *parent)
-    : QObject(parent), root_(std::move(dataRoot)), engine_(engine)
+TaskScheduler::TaskScheduler(QString dataRoot, QString defaultOutputRoot, EngineManager &engine, QObject *parent)
+    : QObject(parent), root_(std::move(dataRoot)), defaultOutputRoot_(std::move(defaultOutputRoot)), engine_(engine)
 {
     QSqlQuery query;
     query.prepare("CREATE TABLE IF NOT EXISTS jobs ("
@@ -108,17 +132,19 @@ TaskScheduler::TaskScheduler(QString dataRoot, EngineManager &engine, QObject *p
                   "operation TEXT NOT NULL, state TEXT NOT NULL, request BLOB NOT NULL,"
                   "message TEXT NOT NULL DEFAULT '', result BLOB)");
     execute(query);
-    query.prepare("SELECT id FROM jobs WHERE state='running' AND operation='synthesize'");
+    query.prepare("SELECT id,request FROM jobs WHERE state='running' AND operation='synthesize'");
     execute(query);
-    QStringList unfinished;
+    QList<QPair<QString, QJsonObject>> unfinished;
     while (query.next())
-        unfinished.append(query.value(0).toString());
+        unfinished.append({query.value(0).toString(), QJsonDocument::fromJson(query.value(1).toByteArray()).object()});
     query.finish();
-    for (const auto &id : unfinished) {
+    for (const auto &[id, request] : unfinished) {
         try {
             const auto completion = readResult(root_ + "/jobs/" + id + "/completion.json");
             const auto audio = completion.value("audio").toString();
-            if (!audio.startsWith(root_ + "/outputs/") || QDir::cleanPath(audio) != audio
+            const auto output = outputRootForRequest(root_, request);
+            if (!audio.startsWith(output.endsWith('/') ? output : output + '/', Qt::CaseInsensitive)
+                || QDir::cleanPath(audio) != audio
                 || QFileInfo(audio).fileName() != id + ".wav")
                 continue;
             if (isArchivedWave(audio, completion))
@@ -154,6 +180,12 @@ TaskScheduler::TaskScheduler(QString dataRoot, EngineManager &engine, QObject *p
 QString TaskScheduler::enqueue(const QString &launcher, const QJsonObject &request, QJsonObject project)
 {
     const auto root = engineRoot(launcher);
+    auto snapshot = request;
+    if (snapshot.value("operation") == "synthesize") {
+        const auto output = snapshot.value("output_root").toString().isEmpty()
+            ? configuredOutputRoot(defaultOutputRoot_) : outputRootForRequest(root_, snapshot);
+        snapshot.insert("output_root", output);
+    }
     const auto id = QUuid::createUuid().toString(QUuid::WithoutBraces);
     QSqlQuery query;
     query.prepare("INSERT INTO jobs(id, created, launcher, operation, state, request)"
@@ -162,7 +194,7 @@ QString TaskScheduler::enqueue(const QString &launcher, const QJsonObject &reque
     query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
     query.addBindValue(root + "/go-webui.bat");
     query.addBindValue(request.value("operation").toString());
-    query.addBindValue(json(request));
+    query.addBindValue(json(snapshot));
     auto database = QSqlDatabase::database();
     if (!database.transaction())
         fail(database.lastError().text());
@@ -259,13 +291,17 @@ void TaskScheduler::finish(bool processSucceeded, QString message)
             if (request.value("operation") == "synthesize") {
                 const auto source = checkedPath(job + "/verified.wav");
                 const auto voice = QUuid(request.value("voice_id").toString()).toString(QUuid::WithoutBraces);
-                const auto directory = checkedPath(root_ + "/outputs/" + voice + "/"
+                auto outputRoot = outputRootForRequest(root_, request);
+                if (!outputRoot.endsWith('/'))
+                    outputRoot += '/';
+                const auto directory = checkedPath(outputRoot + voice + "/"
                     + QDate::currentDate().toString(Qt::ISODate));
                 const auto output = checkedPath(directory + "/" + id + ".wav");
                 result.insert("audio", output);
                 save(job + "/completion.json", json(result));
-                if (!QDir().mkpath(directory) || !QFile::rename(source, output))
-                    fail(QStringLiteral("无法归档音频，请检查磁盘空间和输出目录权限"));
+                if (!QDir().mkpath(directory))
+                    fail(QStringLiteral("无法创建生成目录：%1").arg(directory));
+                publishWave(source, output);
             }
             update(id, "succeeded", {}, result);
             emit completed(id, result);

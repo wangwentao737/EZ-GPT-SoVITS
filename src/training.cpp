@@ -370,7 +370,7 @@ void TrainingPanel::submit(const QString &operation)
 {
     require(!project_.isEmpty() && !busy(), QStringLiteral("请选择项目并等待当前任务结束"));
     const auto launcher = launcher_();
-    require(!launcher.isEmpty(), QStringLiteral("请在工作台添加并选择引擎"));
+    require(!launcher.isEmpty(), QStringLiteral("请在「设置」中添加并选择引擎"));
     auto request = project_;
     request["operation"] = operation;
     request["project"] = project_.value("directory");

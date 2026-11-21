@@ -15,7 +15,7 @@ void startJobProcess(QProcess &worker, const QString &engine, const QString &roo
 class TaskScheduler final : public QObject {
     Q_OBJECT
 public:
-    TaskScheduler(QString dataRoot, EngineManager &engine, QObject *parent = nullptr);
+    TaskScheduler(QString dataRoot, QString defaultOutputRoot, EngineManager &engine, QObject *parent = nullptr);
     QString enqueue(const QString &launcher, const QJsonObject &request, QJsonObject project = {});
     void cancel(const QString &id);
     void stop();
@@ -37,6 +37,7 @@ private:
                 const QJsonObject &result = {});
 
     QString root_;
+    QString defaultOutputRoot_;
     QString active_;
     QString jobPath_;
     QJsonObject activeRequest_;
