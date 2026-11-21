@@ -20,6 +20,7 @@
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QSaveFile>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QStorageInfo>
@@ -173,8 +174,17 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
         try {
             if (!target.endsWith(".wav", Qt::CaseInsensitive))
                 target += ".wav";
-            if (!QFile::copy(checkedPath(audio_), checkedPath(target)))
-                throw std::runtime_error(QStringLiteral("无法写入目标文件，请选择新文件名").toStdString());
+            QFile source(checkedPath(audio_));
+            QSaveFile output(checkedPath(target));
+            if (!source.open(QIODevice::ReadOnly) || !output.open(QIODevice::WriteOnly))
+                throw std::runtime_error(QStringLiteral("无法读取音频或写入目标文件").toStdString());
+            while (!source.atEnd()) {
+                const auto chunk = source.read(1024 * 1024);
+                if (source.error() != QFileDevice::NoError || output.write(chunk) != chunk.size())
+                    throw std::runtime_error(QStringLiteral("写入中断，请检查磁盘空间").toStdString());
+            }
+            if (!output.commit())
+                throw std::runtime_error(output.errorString().toStdString());
         } catch (const std::exception &error) {
             status_->setText(QString::fromUtf8(error.what()));
         }
@@ -203,6 +213,30 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
 SynthesisPanel::~SynthesisPanel()
 {
     importer_.waitForFinished();
+}
+
+void SynthesisPanel::playAudio(const QString &path)
+{
+    audio_ = checkedPath(path);
+    if (!QFileInfo(audio_).isFile())
+        throw std::runtime_error(QStringLiteral("历史音频文件已移动或删除").toStdString());
+    player_->setSource(QUrl::fromLocalFile(audio_));
+    play_->setEnabled(true);
+    export_->setEnabled(true);
+    player_->play();
+}
+
+void SynthesisPanel::loadRequest(const QJsonObject &request)
+{
+    const auto index = voices_->findData(request.value("voice_id").toString());
+    if (index >= 0)
+        voices_->setCurrentIndex(index);
+    text_->setPlainText(request.value("text").toString());
+    language_->setCurrentText(request.value("language").toString());
+    speed_->setValue(request.value("speed").toDouble(1));
+    const auto seed = request.value("seed").toInteger(-1);
+    seed_->setText(seed < 0 ? QString() : QString::number(seed));
+    batch_->setChecked(false);
 }
 
 void SynthesisPanel::refreshVoices(const QString &selected)
@@ -243,6 +277,25 @@ void SynthesisPanel::importVoice(QJsonObject defaults)
     auto *sovits = fileRow(form, QStringLiteral("SoVITS 权重"), "SoVITS (*.pth)", defaults.value("sovits").toString(), &dialog);
     auto *ref = fileRow(form, QStringLiteral("参考音频"), "Audio (*.wav *.flac *.mp3)",
                         defaults.value("reference").toString(), &dialog);
+    auto *preview = new QPushButton(QStringLiteral("试听参考音频"), &dialog);
+    form->addRow(preview);
+    auto *referencePlayer = new QMediaPlayer(&dialog);
+    referencePlayer->setAudioOutput(new QAudioOutput(referencePlayer));
+    connect(preview, &QPushButton::clicked, &dialog, [referencePlayer, ref, &dialog] {
+        if (referencePlayer->playbackState() == QMediaPlayer::PlayingState) {
+            referencePlayer->stop();
+            return;
+        }
+        try {
+            const auto source = checkedPath(ref->text());
+            if (!QFileInfo(source).isFile())
+                throw std::runtime_error(QStringLiteral("请选择有效的参考音频").toStdString());
+            referencePlayer->setSource(QUrl::fromLocalFile(source));
+            referencePlayer->play();
+        } catch (const std::exception &error) {
+            QMessageBox::warning(&dialog, QStringLiteral("无法试听"), QString::fromUtf8(error.what()));
+        }
+    });
     auto *prompt = new QPlainTextEdit(defaults.value("prompt").toString(), &dialog);
     prompt->setPlaceholderText(QStringLiteral("填写参考音频中实际说出的内容，推荐 3 至 10 秒的清晰录音"));
     form->addRow(QStringLiteral("参考文本"), prompt);

@@ -15,6 +15,7 @@
 #include <QFutureWatcher>
 #include <QHeaderView>
 #include <QInputDialog>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
@@ -25,6 +26,8 @@
 #include <QPlainTextEdit>
 #include <QProcess>
 #include <QPushButton>
+#include <QRegularExpression>
+#include <QSaveFile>
 #include <QSettings>
 #include <QSqlDatabase>
 #include <QSqlError>
@@ -118,6 +121,13 @@ public:
         hint->setObjectName("muted");
         hint->setWordWrap(true);
         homeLayout->addWidget(hint);
+        auto *paths = new QHBoxLayout;
+        auto *existing = new QPushButton(QStringLiteral("使用已有模型"), home);
+        auto *newVoice = new QPushButton(QStringLiteral("用录音训练声音"), home);
+        paths->addWidget(existing);
+        paths->addWidget(newVoice);
+        paths->addStretch();
+        homeLayout->addLayout(paths);
 
         auto *selector = new QHBoxLayout;
         profiles_ = new QComboBox(this);
@@ -137,11 +147,13 @@ public:
         start_ = new QPushButton(QStringLiteral("启动引擎"), this);
         start_->setObjectName("primary");
         auto *log = new QPushButton(QStringLiteral("打开启动日志"), this);
+        auto *diagnostic = new QPushButton(QStringLiteral("导出诊断"), this);
         actions->addWidget(check_);
         actions->addWidget(digest);
         actions->addWidget(cancelCheck);
         actions->addWidget(start_);
         actions->addWidget(log);
+        actions->addWidget(diagnostic);
         actions->addStretch();
         homeLayout->addLayout(actions);
 
@@ -164,7 +176,9 @@ public:
             }, tabs);
         tabs->addTab(training, QStringLiteral("训练项目"));
         tabs->addTab(createAssets(tabs, synthesis), QStringLiteral("声音与素材"));
-        tabs->addTab(createHistory(tabs), QStringLiteral("任务记录"));
+        tabs->addTab(createHistory(tabs, synthesis), QStringLiteral("任务记录"));
+        connect(existing, &QPushButton::clicked, tabs, [tabs, synthesis] { tabs->setCurrentWidget(synthesis); });
+        connect(newVoice, &QPushButton::clicked, tabs, [tabs, training] { tabs->setCurrentWidget(training); });
 
         connect(add, &QPushButton::clicked, this, &Workspace::addEngine);
         connect(check_, &QPushButton::clicked, this, &Workspace::checkEngine);
@@ -174,11 +188,21 @@ public:
             const auto chosen = QFileDialog::getOpenFileName(this, QStringLiteral("选择要校验的文件"), root_);
             if (chosen.isEmpty())
                 return;
+            bool accepted = false;
+            const auto expected = QInputDialog::getText(this, QStringLiteral("参考摘要"),
+                QStringLiteral("可填写可信来源提供的 SHA-256 摘要，留空则只计算文件摘要。"),
+                QLineEdit::Normal, {}, &accepted).trimmed().toLower();
+            if (!accepted)
+                return;
+            if (!expected.isEmpty() && !QRegularExpression("^[0-9a-f]{64}$").match(expected).hasMatch()) {
+                status_->setText(QStringLiteral("参考摘要应为 64 位十六进制字符"));
+                return;
+            }
             cancelled_.store(false);
             digest->setEnabled(false);
             cancelCheck->setEnabled(true);
             report_->setPlainText(QStringLiteral("正在计算 SHA-256…"));
-            inspection_.setFuture(QtConcurrent::run([this, chosen] {
+            inspection_.setFuture(QtConcurrent::run([this, chosen, expected] {
                 try {
                     QFile file(ez::checkedPath(chosen));
                     if (!file.open(QIODevice::ReadOnly))
@@ -192,8 +216,10 @@ public:
                             return file.errorString();
                         hash.addData(block);
                     }
-                    return QStringLiteral("已计算摘要，缺少同版本校验依据\n%1\n%2")
-                        .arg(chosen, QString::fromLatin1(hash.result().toHex()));
+                    const auto actual = QString::fromLatin1(hash.result().toHex());
+                    const auto status = expected.isEmpty() ? QStringLiteral("已计算摘要，缺少同版本校验依据")
+                        : expected == actual ? QStringLiteral("摘要匹配") : QStringLiteral("内容不匹配");
+                    return QStringLiteral("%1\n%2\n%3").arg(status, chosen, actual);
                 } catch (const std::exception &error) {
                     return failureMessage(error);
                 }
@@ -207,6 +233,22 @@ public:
                 QDesktopServices::openUrl(QUrl::fromLocalFile(logPath()));
             else
                 status_->setText(QStringLiteral("启动引擎后可查看日志"));
+        });
+        connect(diagnostic, &QPushButton::clicked, this, [this] {
+            const auto target = QFileDialog::getSaveFileName(this, QStringLiteral("导出诊断"),
+                root_ + "/EZ-诊断.txt", "Text (*.txt)");
+            if (target.isEmpty())
+                return;
+            try {
+                QSaveFile file(ez::checkedPath(target));
+                const auto details = QStringLiteral("EZ-GPT-SoVITS %1\n引擎状态 %2\n\n%3\n")
+                    .arg(qApp->applicationVersion(), status_->text(), report_->toPlainText()).toUtf8();
+                if (!file.open(QIODevice::WriteOnly) || file.write(details) != details.size() || !file.commit())
+                    throw std::runtime_error(file.errorString().toStdString());
+                status_->setText(QStringLiteral("已保存诊断报告"));
+            } catch (const std::exception &error) {
+                status_->setText(failureMessage(error));
+            }
         });
         connect(&engine_, &ez::EngineManager::statusChanged, this, [this](const QString &message) {
             status_->setText(message);
@@ -323,7 +365,7 @@ private:
         return page;
     }
 
-    QWidget *createHistory(QWidget *parent)
+    QWidget *createHistory(QTabWidget *parent, ez::SynthesisPanel *synthesis)
     {
         auto *page = new QWidget(parent);
         auto *layout = new QVBoxLayout(page);
@@ -340,9 +382,13 @@ private:
         auto *cancel = new QPushButton(QStringLiteral("取消所选任务"), page);
         auto *retry = new QPushButton(QStringLiteral("重试所选任务"), page);
         auto *open = new QPushButton(QStringLiteral("打开产物或日志目录"), page);
+        auto *play = new QPushButton(QStringLiteral("播放成品"), page);
+        auto *reuse = new QPushButton(QStringLiteral("复用合成参数"), page);
         actions->addWidget(cancel);
         actions->addWidget(retry);
         actions->addWidget(open);
+        actions->addWidget(play);
+        actions->addWidget(reuse);
         actions->addStretch();
         layout->addLayout(actions);
         const auto selection = [table] {
@@ -420,6 +466,26 @@ private:
                     QDesktopServices::openUrl(QUrl::fromLocalFile(path));
             } catch (const std::exception &error) {
                 status_->setText(failureMessage(error));
+            }
+        });
+        connect(play, &QPushButton::clicked, page, [this, parent, synthesis, table] {
+            const auto *item = table->item(table->currentRow(), 3);
+            if (!item || item->data(Qt::UserRole).toString().isEmpty())
+                return;
+            try {
+                synthesis->playAudio(item->data(Qt::UserRole).toString());
+                parent->setCurrentWidget(synthesis);
+            } catch (const std::exception &error) {
+                status_->setText(failureMessage(error));
+            }
+        });
+        connect(reuse, &QPushButton::clicked, page, [parent, synthesis, selection] {
+            QSqlQuery query;
+            query.prepare("SELECT request FROM jobs WHERE id=? AND operation='synthesize'");
+            query.addBindValue(selection());
+            if (query.exec() && query.next()) {
+                synthesis->loadRequest(QJsonDocument::fromJson(query.value(0).toByteArray()).object());
+                parent->setCurrentWidget(synthesis);
             }
         });
         return page;
@@ -559,16 +625,26 @@ int main(int argc, char **argv)
                 QFile source(ez::checkedPath(parser.value(jobOption)));
                 if (!source.open(QIODevice::ReadOnly))
                     return 3;
-                const auto request = QJsonDocument::fromJson(source.readAll()).object();
-                if (request.value("operation").toString().isEmpty())
+                const auto document = QJsonDocument::fromJson(source.readAll());
+                const auto requests = document.isArray() ? document.array() : QJsonArray{document.object()};
+                if (requests.isEmpty())
                     return 3;
-                QObject::connect(&scheduler, &ez::TaskScheduler::completed, &app, [&app] { app.exit(0); });
+                auto remaining = requests.size();
+                QObject::connect(&scheduler, &ez::TaskScheduler::completed, &app, [&] {
+                    if (--remaining == 0)
+                        app.exit(0);
+                });
                 QObject::connect(&scheduler, &ez::TaskScheduler::failed, &app, [&app] { app.exit(3); });
                 QObject::connect(&engine, &ez::EngineManager::statusChanged, &app, [&] {
                     if (!engine.active() && !scheduler.running())
                         app.exit(2);
                 });
-                scheduler.enqueue(parser.value(probeOption), request);
+                for (const auto &value : requests) {
+                    const auto request = value.toObject();
+                    if (request.value("operation").toString().isEmpty())
+                        return 3;
+                    scheduler.enqueue(parser.value(probeOption), request);
+                }
                 return app.exec();
             }
             QProcess worker;

@@ -24,6 +24,8 @@ public:
                    QWidget *parent = nullptr);
     ~SynthesisPanel() override;
     void importVoice(QJsonObject defaults = {});
+    void playAudio(const QString &path);
+    void loadRequest(const QJsonObject &request);
 
 private:
     void refreshVoices(const QString &selected = {});

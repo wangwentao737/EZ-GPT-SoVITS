@@ -11,10 +11,12 @@ EZ-GPT-SoVITS 是使用本地 GPT-SoVITS 整合包的中文 Windows 语音工作
 ```powershell
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 "-DCMAKE_PREFIX_PATH=C:/Qt/6.8.3/msvc2022_64"
 cmake --build build --config Release --parallel
-cmake --install build --config Release --prefix out/portable
+cmake --install build --config Release --prefix (Join-Path $PWD "out/portable")
 ```
 
 从便携目录打开 `EZ-GPT-SoVITS.exe`。默认数据目录为 `%LOCALAPPDATA%\\EZ-GPT-SoVITS`，开发联调可以通过 `--data-root` 指定绝对路径。
+
+运行 `pwsh -File tests/portable-smoke.ps1` 验证便携启动、SQLite 初始化、端口冲突与目录联接拒绝。运行时需让 9874 端口空闲，以便脚本创建临时监听器。
 
 ## 开发接入
 

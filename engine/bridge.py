@@ -1,5 +1,6 @@
 """Run one EZ job with the Gradio client bundled in the selected engine."""
 
+import importlib.util
 import json
 import os
 import re
@@ -176,6 +177,53 @@ def require_outputs(folder, glob, stage):
     return files
 
 
+def transcribe(engine, project, request, gpu):
+    # The embedded Python distribution omits site initialization and its .pth hooks.
+    if importlib.util.find_spec("distutils") is None:
+        from _distutils_hack import add_shim
+        add_shim()
+    from funasr import AutoModel
+    import torch
+
+    source = safe_path(request["source"], project)
+    destination = safe_path(request["destination"], project)
+    language = request.get("asr_language", "zh")
+    models = engine / "tools/asr/models"
+    if language == "zh":
+        names = {
+            "model": "speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
+            "vad_model": "speech_fsmn_vad_zh-cn-16k-common-pytorch",
+            "punc_model": "punc_ct-transformer_zh-cn-common-vocab272727-pytorch",
+        }
+    elif language == "yue":
+        names = {
+            "model": "speech_UniASR_asr_2pass-cantonese-CHS-16k-common-vocab1468-tensorflow1-online"
+        }
+    else:
+        raise ValueError("请使用本地普通话或粤语模型，其他语种可导入标注")
+    local = {role: safe_path(models / name, engine) for role, name in names.items()}
+    for path in local.values():
+        if not (path / "config.yaml").is_file() or not (path / "model.pt").is_file():
+            raise FileNotFoundError(f"本地转写资源不完整：{path.name}。可导入已有标注或手动填写。")
+    model = AutoModel(
+        **{role: str(path) for role, path in local.items()},
+        device=f"cuda:{gpu}" if torch.cuda.is_available() else "cpu",
+        disable_update=True,
+    )
+    labels = []
+    for candidate in require_outputs(source, "*.wav", "切片"):
+        clip = safe_path(candidate, source)
+        inspect_wav(clip)
+        response = model.generate(input=str(clip))
+        text = response[0].get("text", "").strip() if response else ""
+        text = text.replace("|", "｜").replace("\n", " ")
+        labels.append(f"{clip}|{source.name}|{language.upper()}|{text}")
+    destination.mkdir()
+    annotation = safe_path(destination / f"{source.name}.list", project)
+    annotation.write_text("\n".join(labels) + "\n", encoding="utf-8")
+    publish(annotation=str(annotation))
+
+
 def run_training(client, engine, data, request):
     stage = request["operation"]
     project = safe_path(request["project"], data)
@@ -197,15 +245,7 @@ def run_training(client, engine, data, request):
         return
 
     if stage == "asr":
-        source = safe_path(request["source"], project)
-        destination = safe_path(request["destination"], project)
-        destination.mkdir()
-        invoke(client, "open_asr", shell_path(source, project), shell_path(destination, project),
-               "达摩 ASR (中文)", "large", request.get("asr_language", "zh"), "float32")
-        annotation = safe_path(destination / f"{source.name}.list", project)
-        if not annotation.is_file() or annotation.stat().st_size == 0:
-            raise RuntimeError("未生成标注清单，请查看引擎日志")
-        publish(annotation=str(annotation))
+        transcribe(engine, project, request, gpu)
         return
 
     family = request["family"]
@@ -243,20 +283,23 @@ def run_training(client, engine, data, request):
 
     batch = int(request.get("batch", 1))
     epochs = int(request.get("epochs", 2))
+    kind, extension = ("SoVITS", "pth") if stage == "train_sovits" else ("GPT", "ckpt")
+    weights = safe_path(engine / weight_directory(kind, family), engine)
+    pattern = f"{experiment}*.{extension}"
+    before = {path.name: path.stat().st_mtime_ns for path in weights.glob(pattern) if path.is_file()}
     if stage == "train_sovits":
         discriminator = "" if family.startswith("v5") else sovits.replace("/s2G", "/s2D")
         invoke(client, "open1Ba", family, batch, epochs, experiment, 0.4, True, True, epochs,
                gpu, sovits, discriminator, family.startswith("v5"), 32)
-        kind, extension = "SoVITS", "pth"
     elif stage == "train_gpt":
         invoke(client, "open1Bb", batch, epochs, experiment, False, True, True, epochs, gpu, gpt)
-        kind, extension = "GPT", "ckpt"
     else:
         raise ValueError(f"未知训练阶段：{stage}")
-    weight = max(
-        require_outputs(engine / weight_directory(kind, family), f"{experiment}*.{extension}", stage),
-        key=lambda path: path.stat().st_mtime_ns,
-    )
+    changed = [path for path in require_outputs(weights, pattern, stage)
+               if path.stat().st_mtime_ns != before.get(path.name)]
+    if not changed:
+        raise RuntimeError("训练没有生成新权重，请检查本次引擎日志")
+    weight = max(changed, key=lambda path: path.stat().st_mtime_ns)
     saved = safe_path(project / "weights" / experiment / weight.name, project)
     saved.parent.mkdir(parents=True, exist_ok=True)
     temporary = saved.with_name(saved.name + ".partial")

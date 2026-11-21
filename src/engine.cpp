@@ -71,7 +71,7 @@ QString probeApi()
     if (config.value("version").toString() != "4.44.1")
         return QStringLiteral("WebUI 响应成功，但 Gradio 版本与 20261006 适配契约不符");
     const QMap<QString, int> expected{
-        {"change_tts_inference", 6}, {"open_slice", 10}, {"open_asr", 6},
+        {"change_tts_inference", 6}, {"open_slice", 10},
         {"open1abc", 10}, {"open1Ba", 13}, {"open1Bb", 9}, {"switch_version", 1}
     };
     QMap<QString, int> published;
@@ -173,8 +173,11 @@ QStringList inspectEngine(const QString &launcher, const QString &family)
         training.append(models + discriminator);
     }
     check(QStringLiteral("训练"), training);
-    check(QStringLiteral("中文自动转写"), {"tools/asr/funasr_asr.py",
-        "tools/asr/models/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch/config.yaml"});
+    const QString paraformer = "tools/asr/models/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch";
+    const QString vad = "tools/asr/models/speech_fsmn_vad_zh-cn-16k-common-pytorch";
+    const QString punctuation = "tools/asr/models/punc_ct-transformer_zh-cn-common-vocab272727-pytorch";
+    check(QStringLiteral("中文自动转写"), {paraformer + "/config.yaml", paraformer + "/model.pt",
+        vad + "/config.yaml", vad + "/model.pt", punctuation + "/config.yaml", punctuation + "/model.pt"});
     return report;
 }
 

@@ -6,6 +6,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
+#include <QProcessEnvironment>
 #include <QSaveFile>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -64,10 +65,13 @@ void startJobProcess(QProcess &worker, const QString &engine, const QString &roo
         fail(QStringLiteral("无法读取引擎适配程序"));
     save(directory + "/bridge.py", embedded.readAll());
     worker.setWorkingDirectory(engine);
+    auto environment = QProcessEnvironment::systemEnvironment();
+    environment.insert("PATH", QDir::toNativeSeparators(engine + "/runtime") + ';' + environment.value("PATH"));
+    worker.setProcessEnvironment(environment);
     worker.setStandardOutputFile(checkedPath(directory + "/result.log"));
     worker.setStandardErrorFile(checkedPath(directory + "/error.log"));
     worker.setProgram(checkedPath(engine + "/runtime/python.exe"));
-    worker.setArguments({"-I", "-B", "-u", directory + "/bridge.py", directory + "/request.json"});
+    worker.setArguments({"-I", "-X", "utf8", "-B", "-u", directory + "/bridge.py", directory + "/request.json"});
     worker.start();
 }
 
