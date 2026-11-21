@@ -5,6 +5,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QMap>
+#include <QStorageInfo>
 #include <stdexcept>
 
 namespace ez {
@@ -100,6 +101,22 @@ bool checkpointHeader(QFile &file, bool sovits)
     return file.seek(qMax<qint64>(0, file.size() - 65557)) && file.readAll().contains("PK\x05\x06");
 }
 
+ResourceCheck checkDisk(const QString &id, const QString &label, const QString &requested)
+{
+    const auto path = checkedPath(requested);
+    QFileInfo directory(path);
+    while (!directory.exists() && directory.absolutePath() != directory.absoluteFilePath())
+        directory.setFile(directory.absolutePath());
+    const QStorageInfo disk(directory.absoluteFilePath());
+    if (!disk.isReady() || !disk.isValid())
+        return {id, label, QStringLiteral("无法读取磁盘状态。请检查目录或重新连接磁盘。\n%1").arg(path), false};
+    if (!directory.isDir() || !directory.isWritable() || disk.isReadOnly())
+        return {id, label, QStringLiteral("目录不可写。请在「设置」中选择可写位置或检查权限。\n%1").arg(path), false};
+    if (disk.bytesAvailable() <= 0)
+        return {id, label, QStringLiteral("磁盘空间不足，请释放空间后复查。\n%1").arg(path), false};
+    return {id, label, QStringLiteral("可用空间 %1 GiB\n%2").arg(disk.bytesAvailable() / 1073741824.0, 0, 'f', 1).arg(path), true};
+}
+
 }
 
 QStringList engineOperations()
@@ -119,7 +136,7 @@ QString operationLabel(const QString &operation)
 }
 
 QString resourceIssue(const QString &engine, const QString &operation, const QString &family,
-                      const QString &asrLanguage)
+                      const QString &asrLanguage, const std::atomic_bool *cancelled)
 {
     if (operation != "start" && !engineOperations().contains(operation))
         return QStringLiteral("当前适配暂不支持此操作：%1").arg(operation);
@@ -130,6 +147,8 @@ QString resourceIssue(const QString &engine, const QString &operation, const QSt
 
     QStringList missing;
     for (const auto &resource : resourcesFor(operation, family, asrLanguage)) {
+        if (cancelled && cancelled->load())
+            return {};
         if (!readableFile(engine + '/' + resource))
             missing << resource;
     }
@@ -179,6 +198,56 @@ QString jobResourceIssue(const QString &engine, const QString &data, const QJson
         }
     }
     return {};
+}
+
+QList<ResourceCheck> inspectResources(const QString &launcher, const QString &family, const QString &data,
+                                      const QString &output, const QJsonObject &voice,
+                                      const QMap<QString, QString> &interfaces, const QString &only,
+                                      const std::atomic_bool &cancelled)
+{
+    QList<ResourceCheck> checks;
+    const auto run = [&](const QString &id, const QString &label, auto check) {
+        if (cancelled.load() || (!only.isEmpty() && id != only))
+            return;
+        try {
+            checks.append(check());
+        } catch (const std::exception &error) {
+            checks.append({id, label, QString::fromUtf8(error.what()), false});
+        }
+    };
+    const auto disk = [&](const QString &id, const QString &label, const QString &path) {
+        run(id, label, [&] { return checkDisk(id, label, path); });
+    };
+
+    const auto operations = QStringList{"start"} + engineOperations() + QStringList{"asr-yue"};
+    for (const auto &id : operations) {
+        const auto operation = id == "asr-yue" ? QString("asr") : id;
+        const auto label = id == "asr-yue" ? QStringLiteral("粤语自动转写")
+            : id == "asr" ? QStringLiteral("普通话自动转写") : operationLabel(operation);
+        run(id, label, [&] {
+            const auto engine = engineRoot(launcher);
+            auto issue = resourceIssue(engine, operation, family, id == "asr-yue" ? "yue" : "zh", &cancelled);
+            if (issue.isEmpty())
+                issue = interfaces.value(operation);
+            return ResourceCheck{id, label, issue.isEmpty() ? QStringLiteral("所需文件可读") : issue, issue.isEmpty()};
+        });
+    }
+    if (!voice.isEmpty()) {
+        const auto label = QStringLiteral("声音预设 · %1").arg(voice.value("name").toString());
+        run("voice", label, [&] {
+            auto request = voice;
+            request["operation"] = "synthesize";
+            const auto issue = jobResourceIssue(engineRoot(launcher), data, request);
+            return ResourceCheck{"voice", label, issue.isEmpty()
+                ? QStringLiteral("两份权重和参考音频可读，可提交试音验证。") : issue, issue.isEmpty()};
+        });
+    }
+    run("engine-disk", QStringLiteral("引擎工作目录"), [&] {
+        return checkDisk("engine-disk", QStringLiteral("引擎工作目录"), engineRoot(launcher));
+    });
+    disk("data-disk", QStringLiteral("项目和素材目录"), data);
+    disk("output-disk", QStringLiteral("成品目录"), output);
+    return cancelled.load() ? QList<ResourceCheck>{} : checks;
 }
 
 }

@@ -69,6 +69,14 @@ EngineProbe probeApi()
         result.error = QStringLiteral("WebUI 响应成功，但 Gradio 版本与 20261006 适配契约不符");
         return result;
     }
+    for (const auto &component : config.value("components").toArray()) {
+        const auto props = component.toObject().value("props").toObject();
+        const auto label = props.value("label").toString();
+        if (label == QStringLiteral("显卡信息") || label.compare("GPU Information", Qt::CaseInsensitive) == 0) {
+            result.devices = props.value("value").toString().trimmed();
+            break;
+        }
+    }
     const QMap<QString, QMap<QString, int>> expected{
         {"synthesize", {{"switch_version", 1}, {"change_choices", 0}, {"change_tts_inference", 6},
                         {"change_tts_inference_1", 6}}},
@@ -145,22 +153,6 @@ QString engineRoot(const QString &launcher)
     return root;
 }
 
-QStringList inspectEngine(const QString &launcher, const QString &family)
-{
-    const auto root = engineRoot(launcher);
-    QStringList report;
-    const auto operations = QStringList{"start"} + engineOperations();
-    for (const auto &operation : operations) {
-        try {
-            const auto issue = resourceIssue(root, operation, family);
-            report << (issue.isEmpty() ? QStringLiteral("%1：文件可读").arg(operationLabel(operation)) : issue);
-        } catch (const std::exception &error) {
-            report << QStringLiteral("%1：%2").arg(operationLabel(operation), QString::fromUtf8(error.what()));
-        }
-    }
-    return report;
-}
-
 struct EngineManager::Process {
     HANDLE job = nullptr;
     HANDLE handle = nullptr;
@@ -201,6 +193,7 @@ EngineManager::EngineManager(QObject *parent) : QObject(parent)
             return;
         }
         unavailable_ = result.unavailable;
+        devices_ = result.devices;
         ready_ = true;
         QStringList limited;
         for (const auto &operation : unavailable_.keys())
@@ -322,10 +315,12 @@ QString EngineManager::interfaceIssue(const QString &operation) const
     return unavailable_.value(operation);
 }
 
-QStringList EngineManager::interfaceReport() const
+QMap<QString, QString> EngineManager::interfaceIssues() const
 {
-    return unavailable_.values();
+    return unavailable_;
 }
+
+QString EngineManager::devices() const { return ready_ ? devices_ : QString(); }
 
 quint32 EngineManager::webuiPid() const
 {

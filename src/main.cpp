@@ -1,6 +1,8 @@
+#include "diagnostics.h"
 #include "engine.h"
 #include "jobs.h"
 #include "library.h"
+#include "resources.h"
 #include "settings.h"
 #include "synthesis.h"
 #include "training.h"
@@ -26,23 +28,23 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QLockFile>
+#include <QMenu>
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QProcess>
 #include <QPushButton>
 #include <QRegularExpression>
-#include <QSaveFile>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
-#include <QStorageInfo>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QTextStream>
 #include <QVBoxLayout>
 #include <QtConcurrentRun>
+#include <algorithm>
 #include <atomic>
 #include <stdexcept>
 
@@ -93,6 +95,13 @@ void startProbeJob(QProcess &worker, const ez::EngineManager &engine, const QStr
     ez::startJobProcess(worker, engine.root(), root, root + "/probe-job", request, engine.webuiPid());
 }
 
+struct InspectionResult {
+    QList<ez::ResourceCheck> checks;
+    QString heading;
+    QString message;
+    bool replace = false;
+};
+
 class Workspace final : public QWidget {
 public:
     Workspace(const QString &root, const QString &defaultOutput) : root_(root), defaultOutput_(defaultOutput)
@@ -141,26 +150,36 @@ public:
         family_->addItems({"v5turbo", "v5dev", "v2Pro", "v2ProPlus", "v2"});
         selector->addWidget(new QLabel(QStringLiteral("检查模型家族"), home));
         selector->addWidget(family_);
-        selector->addStretch();
+        checkVoice_ = new QComboBox(home);
+        selector->addWidget(checkVoice_, 1);
         homeLayout->addLayout(selector);
 
         auto *actions = new QHBoxLayout;
         check_ = new QPushButton(QStringLiteral("检查资源"), this);
-        auto *digest = new QPushButton(QStringLiteral("计算文件 SHA-256"), this);
-        auto *cancelCheck = new QPushButton(QStringLiteral("取消校验"), this);
-        cancelCheck->setEnabled(false);
+        digest_ = new QPushButton(QStringLiteral("计算文件 SHA-256"), this);
+        cancelCheck_ = new QPushButton(QStringLiteral("取消检查"), this);
         start_ = new QPushButton(QStringLiteral("启动引擎"), this);
         start_->setObjectName("primary");
         auto *log = new QPushButton(QStringLiteral("打开启动日志"), this);
         auto *diagnostic = new QPushButton(QStringLiteral("导出诊断"), this);
         actions->addWidget(check_);
-        actions->addWidget(digest);
-        actions->addWidget(cancelCheck);
+        actions->addWidget(digest_);
+        actions->addWidget(cancelCheck_);
         actions->addWidget(start_);
         actions->addWidget(log);
         actions->addWidget(diagnostic);
         actions->addStretch();
         homeLayout->addLayout(actions);
+
+        auto *reportActions = new QHBoxLayout;
+        failedCheck_ = new QComboBox(home);
+        failedCheck_->setPlaceholderText(QStringLiteral("没有待复查项"));
+        retryCheck_ = new QPushButton(QStringLiteral("复查所选项"), home);
+        auto *copyReport = new QPushButton(QStringLiteral("复制报告"), home);
+        reportActions->addWidget(failedCheck_, 1);
+        reportActions->addWidget(retryCheck_);
+        reportActions->addWidget(copyReport);
+        homeLayout->addLayout(reportActions);
 
         report_ = new QPlainTextEdit(this);
         report_->setPlaceholderText(QStringLiteral("资源检查结果会显示在这里"));
@@ -191,52 +210,30 @@ public:
         connect(newVoice, &QPushButton::clicked, tabs, [tabs, training] { tabs->setCurrentWidget(training); });
 
         connect(configure, &QPushButton::clicked, tabs, [tabs, settings] { tabs->setCurrentWidget(settings); });
-        connect(check_, &QPushButton::clicked, this, &Workspace::checkEngine);
-        connect(digest, &QPushButton::clicked, this, [this, digest, cancelCheck] {
-            if (inspection_.isRunning())
-                return;
-            const auto chosen = QFileDialog::getOpenFileName(this, QStringLiteral("选择要校验的文件"), root_);
-            if (chosen.isEmpty())
-                return;
-            bool accepted = false;
-            const auto expected = QInputDialog::getText(this, QStringLiteral("参考摘要"),
-                QStringLiteral("可填写可信来源提供的 SHA-256 摘要，留空则只计算文件摘要。"),
-                QLineEdit::Normal, {}, &accepted).trimmed().toLower();
-            if (!accepted)
-                return;
-            if (!expected.isEmpty() && !QRegularExpression("^[0-9a-f]{64}$").match(expected).hasMatch()) {
-                status_->setText(QStringLiteral("参考摘要应为 64 位十六进制字符"));
-                return;
-            }
-            cancelled_.store(false);
-            digest->setEnabled(false);
-            cancelCheck->setEnabled(true);
-            report_->setPlainText(QStringLiteral("正在计算 SHA-256…"));
-            inspection_.setFuture(QtConcurrent::run([this, chosen, expected] {
-                try {
-                    QFile file(ez::checkedPath(chosen));
-                    if (!file.open(QIODevice::ReadOnly))
-                        return file.errorString();
-                    QCryptographicHash hash(QCryptographicHash::Sha256);
-                    while (!file.atEnd()) {
-                        if (cancelled_.load())
-                            return QStringLiteral("已取消校验");
-                        const auto block = file.read(1024 * 1024);
-                        if (file.error() != QFileDevice::NoError)
-                            return file.errorString();
-                        hash.addData(block);
-                    }
-                    const auto actual = QString::fromLatin1(hash.result().toHex());
-                    const auto status = expected.isEmpty() ? QStringLiteral("已计算摘要，缺少同版本校验依据")
-                        : expected == actual ? QStringLiteral("摘要匹配") : QStringLiteral("内容不匹配");
-                    return QStringLiteral("%1\n%2\n%3").arg(status, chosen, actual);
-                } catch (const std::exception &error) {
-                    return failureMessage(error);
-                }
-            }));
-            refreshActions();
+        connect(check_, &QPushButton::clicked, this, [this] { checkEngine({}); });
+        connect(retryCheck_, &QPushButton::clicked, this, [this] {
+            const auto id = failedCheck_->currentData().toString();
+            if (!id.isEmpty())
+                checkEngine(id);
         });
-        connect(cancelCheck, &QPushButton::clicked, this, [this] { cancelled_.store(true); });
+        connect(digest_, &QPushButton::clicked, this, &Workspace::checkDigest);
+        connect(cancelCheck_, &QPushButton::clicked, this, [this] { cancelled_.store(true); });
+        connect(copyReport, &QPushButton::clicked, this, [this] {
+            QApplication::clipboard()->setText(report_->toPlainText());
+        });
+        connect(report_, &QPlainTextEdit::textChanged, copyReport, [this, copyReport] {
+            copyReport->setEnabled(!report_->toPlainText().isEmpty());
+        });
+        copyReport->setEnabled(false);
+        connect(family_, &QComboBox::currentTextChanged, this, [this] {
+            reloadCheckVoices();
+            resetReport();
+        });
+        connect(checkVoice_, &QComboBox::currentIndexChanged, this, [this] { resetReport(); });
+        connect(tabs, &QTabWidget::currentChanged, this, [this, tabs, home] {
+            if (tabs->currentWidget() == home)
+                reloadCheckVoices();
+        });
         connect(start_, &QPushButton::clicked, this, &Workspace::toggleEngine);
         connect(log, &QPushButton::clicked, this, [this] {
             if (QFileInfo::exists(logPath()))
@@ -244,22 +241,7 @@ public:
             else
                 status_->setText(QStringLiteral("启动引擎后可查看日志"));
         });
-        connect(diagnostic, &QPushButton::clicked, this, [this] {
-            const auto target = QFileDialog::getSaveFileName(this, QStringLiteral("导出诊断"),
-                root_ + "/EZ-诊断.txt", "Text (*.txt)");
-            if (target.isEmpty())
-                return;
-            try {
-                QSaveFile file(ez::checkedPath(target));
-                const auto details = QStringLiteral("EZ-GPT-SoVITS %1\n引擎状态 %2\n\n%3\n")
-                    .arg(qApp->applicationVersion(), status_->text(), report_->toPlainText()).toUtf8();
-                if (!file.open(QIODevice::WriteOnly) || file.write(details) != details.size() || !file.commit())
-                    throw std::runtime_error(file.errorString().toStdString());
-                status_->setText(QStringLiteral("已保存诊断报告"));
-            } catch (const std::exception &error) {
-                status_->setText(failureMessage(error));
-            }
-        });
+        connect(diagnostic, &QPushButton::clicked, this, [this] { showDiagnostics(); });
         connect(&engine_, &ez::EngineManager::statusChanged, this, [this](const QString &message) {
             status_->setText(message);
             refreshActions();
@@ -268,19 +250,23 @@ public:
             try {
                 if (!currentLauncher().isEmpty())
                     ez::setWorkspaceSetting("currentEngine", currentLauncher());
+                resetReport();
                 refreshActions();
             } catch (const std::exception &error) {
                 status_->setText(failureMessage(error));
             }
         });
-        connect(&inspection_, &QFutureWatcher<QString>::finished, this, [this] {
-            report_->setPlainText(inspection_.result());
+        connect(&inspection_, &QFutureWatcher<InspectionResult>::finished, this, [this] {
+            checking_ = false;
+            const auto result = inspection_.result();
+            if (result.checks.isEmpty()) {
+                report_->setPlainText(result.message);
+            } else {
+                updateReport(result);
+            }
             refreshActions();
         });
-        connect(&inspection_, &QFutureWatcher<QString>::finished, this, [digest, cancelCheck] {
-            digest->setEnabled(true);
-            cancelCheck->setEnabled(false);
-        });
+        reloadCheckVoices();
         reloadProfiles();
     }
 
@@ -314,15 +300,23 @@ private:
     QString root_;
     QString defaultOutput_;
     ez::EngineManager engine_;
-    QFutureWatcher<QString> inspection_;
+    QFutureWatcher<InspectionResult> inspection_;
     std::atomic_bool cancelled_ = false;
+    bool checking_ = false;
+    QList<ez::ResourceCheck> resourceChecks_;
+    QString resourceReport_;
     QComboBox *profiles_ = nullptr;
     QComboBox *family_ = nullptr;
+    QComboBox *checkVoice_ = nullptr;
+    QComboBox *failedCheck_ = nullptr;
     QLineEdit *enginePath_ = nullptr;
     QLabel *engineLocation_ = nullptr;
     QPlainTextEdit *report_ = nullptr;
     QLabel *status_ = nullptr;
     QPushButton *check_ = nullptr;
+    QPushButton *digest_ = nullptr;
+    QPushButton *cancelCheck_ = nullptr;
+    QPushButton *retryCheck_ = nullptr;
     QPushButton *start_ = nullptr;
     QPushButton *addEngine_ = nullptr;
     ez::TaskScheduler *scheduler_ = nullptr;
@@ -423,13 +417,17 @@ private:
         auto *open = new QPushButton(QStringLiteral("打开产物或日志目录"), page);
         auto *play = new QPushButton(QStringLiteral("播放成品"), page);
         auto *reuse = new QPushButton(QStringLiteral("复用合成参数"), page);
-        auto *copyResult = new QPushButton(QStringLiteral("复制结果"), page);
+        auto *more = new QPushButton(QStringLiteral("更多操作"), page);
+        auto *menu = new QMenu(more);
+        auto *copyResult = menu->addAction(QStringLiteral("复制结果"));
+        auto *exportJob = menu->addAction(QStringLiteral("导出所选任务诊断"));
+        more->setMenu(menu);
         actions->addWidget(cancel);
         actions->addWidget(retry);
         actions->addWidget(open);
         actions->addWidget(play);
         actions->addWidget(reuse);
-        actions->addWidget(copyResult);
+        actions->addWidget(more);
         actions->addStretch();
         layout->addLayout(actions);
         const auto selection = [table] {
@@ -469,9 +467,13 @@ private:
         };
         refresh();
         connect(scheduler_, &ez::TaskScheduler::changed, page, refresh);
-        connect(copyResult, &QPushButton::clicked, page, [table] {
+        connect(copyResult, &QAction::triggered, page, [table] {
             if (const auto *result = table->item(table->currentRow(), 3); result && !result->text().isEmpty())
                 QApplication::clipboard()->setText(result->text());
+        });
+        connect(exportJob, &QAction::triggered, page, [this, selection] {
+            if (const auto id = selection(); !id.isEmpty())
+                showDiagnostics(id);
         });
         connect(cancel, &QPushButton::clicked, page, [this, selection] {
             if (const auto id = selection(); !id.isEmpty()) {
@@ -543,11 +545,17 @@ private:
         enginePath_->setText(QDir::toNativeSeparators(currentLauncher()));
         engineLocation_->setText(selected ? QStringLiteral("当前引擎：%1").arg(QDir::toNativeSeparators(currentLauncher()))
             : QStringLiteral("请在「设置」中添加 GPT-SoVITS 引擎路径。"));
-        check_->setEnabled(selected && !inspection_.isRunning());
+        check_->setEnabled(selected && !checking_);
+        digest_->setEnabled(!checking_);
+        cancelCheck_->setEnabled(checking_);
+        retryCheck_->setEnabled(selected && !checking_ && failedCheck_->count() > 0);
+        failedCheck_->setEnabled(retryCheck_->isEnabled());
+        family_->setEnabled(!checking_);
+        checkVoice_->setEnabled(!checking_);
         start_->setEnabled(selected || engine_.active());
         start_->setText(engine_.active() ? QStringLiteral("停止引擎") : QStringLiteral("启动引擎"));
-        profiles_->setEnabled(!engine_.active());
-        addEngine_->setEnabled(!engine_.active());
+        profiles_->setEnabled(!engine_.active() && !checking_);
+        addEngine_->setEnabled(!engine_.active() && !checking_);
     }
 
     void reloadProfiles(const QString &selected = {})
@@ -564,6 +572,7 @@ private:
         const auto saved = selected.isEmpty() ? ez::workspaceSetting("currentEngine") : selected;
         const int match = profiles_->findData(saved);
         profiles_->setCurrentIndex(match >= 0 ? match : (profiles_->count() ? 0 : -1));
+        resetReport();
         refreshActions();
     }
 
@@ -590,27 +599,157 @@ private:
         }
     }
 
-    void checkEngine()
+    void reloadCheckVoices()
     {
-        if (inspection_.isRunning())
+        if (checking_)
             return;
-        report_->setPlainText(QStringLiteral("正在检查资源…"));
-        const auto launcher = currentLauncher();
-        const auto family = family_->currentText();
-        const auto root = root_;
-        const auto interfaceReport = engine_.interfaceReport();
-        inspection_.setFuture(QtConcurrent::run([launcher, family, root, interfaceReport] {
-            try {
-                auto report = ez::inspectEngine(launcher, family);
-                report.append(interfaceReport);
-                const QStorageInfo disk(root);
-                report.append(QStringLiteral("数据磁盘：可用 %1 GiB").arg(disk.bytesAvailable() / 1073741824.0, 0, 'f', 1));
-                return report.join("\n\n");
-            } catch (const std::exception &error) {
-                return failureMessage(error);
+        QSqlQuery query("SELECT id,name,settings FROM voices ORDER BY name");
+        if (query.lastError().isValid())
+            return;
+        const auto oldVoice = checkVoice_->currentData();
+        const auto oldSettings = checkVoice_->currentData(Qt::UserRole + 1);
+        const QSignalBlocker block(checkVoice_);
+        checkVoice_->clear();
+        checkVoice_->addItem(QStringLiteral("检查声音预设（可选）"));
+        while (query.next()) {
+            const auto settings = query.value(2).toByteArray();
+            if (QJsonDocument::fromJson(settings).object().value("family").toString() == family_->currentText()) {
+                checkVoice_->addItem(query.value(1).toString(), query.value(0));
+                checkVoice_->setItemData(checkVoice_->count() - 1, settings, Qt::UserRole + 1);
             }
-        }));
+        }
+        checkVoice_->setCurrentIndex(qMax(0, checkVoice_->findData(oldVoice)));
+        if (oldSettings != checkVoice_->currentData(Qt::UserRole + 1))
+            resetReport();
+    }
+
+    void resetReport()
+    {
+        if (!resourceChecks_.isEmpty()) {
+            resourceChecks_.clear();
+            resourceReport_.clear();
+            report_->clear();
+        }
+        failedCheck_->clear();
         refreshActions();
+    }
+
+    void updateReport(const InspectionResult &result)
+    {
+        if (result.replace)
+            resourceChecks_.clear();
+        for (const auto &check : result.checks) {
+            const auto old = std::find_if(resourceChecks_.begin(), resourceChecks_.end(),
+                                          [&](const ez::ResourceCheck &entry) { return entry.id == check.id; });
+            if (old == resourceChecks_.end())
+                resourceChecks_.append(check);
+            else
+                *old = check;
+        }
+        QStringList lines{result.heading};
+        const auto selected = failedCheck_->currentData();
+        failedCheck_->clear();
+        for (const auto &entry : resourceChecks_) {
+            lines << QStringLiteral("%1 · %2\n%3").arg(entry.passed ? QStringLiteral("通过") : QStringLiteral("需处理"),
+                                                       entry.label, entry.detail);
+            if (!entry.passed)
+                failedCheck_->addItem(entry.label, entry.id);
+        }
+        if (failedCheck_->count() > 0)
+            failedCheck_->setCurrentIndex(qMax(0, failedCheck_->findData(selected)));
+        resourceReport_ = lines.join("\n\n");
+        report_->setPlainText(resourceReport_);
+    }
+
+    void beginInspection(const QString &message, auto work)
+    {
+        cancelled_.store(false);
+        checking_ = true;
+        report_->setPlainText(message);
+        inspection_.setFuture(QtConcurrent::run(std::move(work)));
+        refreshActions();
+    }
+
+    void checkEngine(const QString &only)
+    {
+        if (checking_)
+            return;
+        try {
+            const auto launcher = currentLauncher();
+            const auto family = family_->currentText();
+            const auto root = root_;
+            const auto configured = ez::workspaceSetting("outputRoot");
+            const auto output = configured.isEmpty() ? defaultOutput_ : configured;
+            const auto voice = QJsonDocument::fromJson(checkVoice_->currentData(Qt::UserRole + 1).toByteArray()).object();
+            const auto interfaces = engine_.interfaceIssues();
+            auto devices = engine_.devices();
+            if (devices.isEmpty())
+                devices = engine_.ready() ? QStringLiteral("此引擎未报告设备信息") : QStringLiteral("启动引擎后可查看");
+            const auto heading = QStringLiteral("引擎 · %1\n模型家族 · %2\n设备 · %3").arg(launcher, family, devices);
+            beginInspection(QStringLiteral("正在检查资源…"), [this, launcher, family, root, output, voice, interfaces, only, heading] {
+                const auto checks = ez::inspectResources(launcher, family, root, output, voice, interfaces, only, cancelled_);
+                return InspectionResult{checks, heading, QStringLiteral("已取消资源检查"), only.isEmpty()};
+            });
+        } catch (const std::exception &error) {
+            status_->setText(failureMessage(error));
+        }
+    }
+
+    void checkDigest()
+    {
+        if (checking_)
+            return;
+        const auto chosen = QFileDialog::getOpenFileName(this, QStringLiteral("选择要校验的文件"), root_);
+        if (chosen.isEmpty())
+            return;
+        bool accepted = false;
+        const auto expected = QInputDialog::getText(this, QStringLiteral("参考摘要"),
+            QStringLiteral("可填写可信来源提供的 SHA-256 摘要，留空则只计算文件摘要。"),
+            QLineEdit::Normal, {}, &accepted).trimmed().toLower();
+        if (!accepted)
+            return;
+        if (!expected.isEmpty() && !QRegularExpression("^[0-9a-f]{64}$").match(expected).hasMatch()) {
+            status_->setText(QStringLiteral("参考摘要应为 64 位十六进制字符"));
+            return;
+        }
+        beginInspection(QStringLiteral("正在计算 SHA-256…"), [this, chosen, expected] {
+            InspectionResult result;
+            try {
+                QFile file(ez::checkedPath(chosen));
+                if (!file.open(QIODevice::ReadOnly))
+                    throw std::runtime_error(file.errorString().toStdString());
+                QCryptographicHash hash(QCryptographicHash::Sha256);
+                while (!file.atEnd() && !cancelled_.load()) {
+                    const auto block = file.read(1024 * 1024);
+                    if (file.error() != QFileDevice::NoError)
+                        throw std::runtime_error(file.errorString().toStdString());
+                    hash.addData(block);
+                }
+                if (cancelled_.load()) {
+                    result.message = QStringLiteral("已取消校验");
+                } else {
+                    const auto actual = QString::fromLatin1(hash.result().toHex());
+                    const auto status = expected.isEmpty() ? QStringLiteral("已计算摘要，缺少同版本校验依据")
+                        : expected == actual ? QStringLiteral("摘要匹配") : QStringLiteral("内容不匹配");
+                    result.message = QStringLiteral("%1\n%2\n%3").arg(status, chosen, actual);
+                }
+            } catch (const std::exception &error) {
+                result.message = failureMessage(error);
+            }
+            return result;
+        });
+    }
+
+    void showDiagnostics(const QString &job = {})
+    {
+        try {
+            const auto state = engine_.ready() ? QStringLiteral("已就绪")
+                : engine_.active() ? QStringLiteral("正在启动") : QStringLiteral("未启动");
+            if (ez::exportDiagnostics(this, root_, state, resourceReport_, job))
+                status_->setText(QStringLiteral("已保存诊断报告"));
+        } catch (const std::exception &error) {
+            status_->setText(failureMessage(error));
+        }
     }
 
     void toggleEngine()

@@ -11,12 +11,12 @@ namespace ez {
 
 QString checkedPath(const QString &path);
 QString engineRoot(const QString &launcher);
-QStringList inspectEngine(const QString &launcher, const QString &family);
 
 struct EngineProbe {
     bool responded = false;
     QString error;
     QMap<QString, QString> unavailable;
+    QString devices;
 };
 
 class EngineManager final : public QObject {
@@ -30,7 +30,8 @@ public:
     bool active() const;
     QString root() const;
     QString interfaceIssue(const QString &operation) const;
-    QStringList interfaceReport() const;
+    QMap<QString, QString> interfaceIssues() const;
+    QString devices() const;
     quint32 webuiPid() const;
     bool ownsListener(quint16 port) const;
 
@@ -44,6 +45,7 @@ private:
     QTimer timer_;
     QFutureWatcher<EngineProbe> probe_;
     QMap<QString, QString> unavailable_;
+    QString devices_;
     QString root_;
     QString logPath_;
     int ticks_ = 0;
