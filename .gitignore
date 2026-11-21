@@ -1,0 +1,14 @@
+/.deps/
+/.test/
+/.test-*.log
+/aqtinstall.log
+/build/
+/out/
+/dist/
+/.vs/
+/CMakeUserPresets.json
+__pycache__/
+*.pyc
+*.sqlite*
+*.ckpt
+*.pth
