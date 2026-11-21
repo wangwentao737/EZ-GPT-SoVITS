@@ -2,6 +2,7 @@
 #include "engine.h"
 #include "jobs.h"
 #include "resources.h"
+#include "ui.h"
 
 #include <QAudioOutput>
 #include <QComboBox>
@@ -73,16 +74,18 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     execute(query);
 
     auto *layout = new QVBoxLayout(this);
+    ui::pageHeader(layout, this, QStringLiteral("训练项目"),
+        QStringLiteral("按录音、标注和训练的顺序操作。已有切片或标注时，可直接导入。"));
     auto *selection = new QHBoxLayout;
     projects_ = new QComboBox(this);
     projects_->setPlaceholderText(QStringLiteral("创建或选择训练项目"));
+    projects_->setAccessibleName(QStringLiteral("选择训练项目"));
     selection->addWidget(projects_, 1);
     layout->addLayout(selection);
-    stage_ = new QLabel(this);
-    stage_->setWordWrap(true);
+    stage_ = ui::hint({}, this);
+    stage_->setObjectName("stageHint");
     layout->addWidget(stage_);
-    status_ = new QLabel(this);
-    status_->setWordWrap(true);
+    status_ = ui::hint({}, this);
     const auto button = [this](QHBoxLayout *row, const QString &label, auto action) {
         auto *control = new QPushButton(label, this);
         row->addWidget(control);
@@ -112,7 +115,11 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     labels_ = new QTableWidget(0, 3, this);
     labels_->setHorizontalHeaderLabels({QStringLiteral("片段"), QStringLiteral("语言"), QStringLiteral("文本")});
     labels_->setSelectionBehavior(QAbstractItemView::SelectRows);
-    labels_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    labels_->setAccessibleName(QStringLiteral("音频切片与标注"));
+    ui::styleTable(labels_);
+    labels_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Interactive);
+    labels_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    labels_->setColumnWidth(0, 230);
     labels_->horizontalHeader()->setStretchLastSection(true);
     layout->addWidget(labels_, 1);
     player_ = new QMediaPlayer(this);
@@ -153,7 +160,7 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     training->addWidget(epochs_);
     button(training, QStringLiteral("开始训练"), [this] {
         submit(nextTrainingStage());
-    });
+    })->setObjectName("primary");
     resume_ = button(training, QStringLiteral("从检查点继续"), [this] {
         submit(nextTrainingStage(), true);
     });
@@ -194,6 +201,7 @@ void TrainingPanel::addProject()
     QDialog dialog(this);
     dialog.setWindowTitle(QStringLiteral("新建训练项目"));
     QFormLayout form(&dialog);
+    form.addRow(ui::hint(QStringLiteral("可先用默认的 v5turbo 模型家族。素材语言按录音中主要使用的语言选择。"), &dialog));
     auto *name = new QLineEdit(&dialog);
     auto *speaker = new QLineEdit("Speaker", &dialog);
     auto *family = new QComboBox(&dialog);
@@ -577,24 +585,28 @@ void TrainingPanel::showState()
 {
     resume_->setVisible(!busy() && !resumeJob(nextTrainingStage()).isEmpty());
     if (project_.isEmpty()) {
-        stage_->setText(QStringLiteral("新建项目后，导入录音或已切好的 WAV 片段。"));
+        stage_->setText(QStringLiteral("下一步：点「新建项目」，再导入原始录音或已切好的 WAV。"));
         return;
     }
     if (busy()) {
-        stage_->setText(QStringLiteral("当前阶段已提交。进度和错误详情见任务记录。"));
+        stage_->setText(QStringLiteral("当前阶段已提交。可在「任务记录」查看结果、错误详情或取消任务。"));
         return;
     }
     if (project_.contains("gpt") && project_.contains("sovits"))
-        stage_->setText(QStringLiteral("模型已训练完成。选择参考片段，点击「试听并入库」。"));
+        stage_->setText(QStringLiteral("两份模型权重已完成。选一段清晰的参考录音，点「试听并入库」。"));
     else if (project_.contains("sovits"))
         stage_->setText(QStringLiteral("SoVITS 阶段已完成。点击「开始训练」继续 GPT 阶段。"));
     else if (project_.contains("dataset")) {
         const int count = project_.value("sampleCount").toInt();
-        stage_->setText(count > 0 ? QStringLiteral("%1 条训练样本已校验。设置批量和轮数，再点击「开始训练」。").arg(count)
-                                  : QStringLiteral("训练数据已就绪。设置批量和轮数，再点击「开始训练」。"));
+        stage_->setText(count > 0 ? QStringLiteral("%1 条训练样本已校验。确认显卡、批量和轮数后开始训练。").arg(count)
+                                  : QStringLiteral("训练数据已就绪。确认显卡、批量和轮数后开始训练。"));
     }
+    else if (project_.contains("annotation"))
+        stage_->setText(QStringLiteral("选中片段试听，双击「文本」校对。校对后点击「准备数据」，会自动保存标注。"));
     else if (project_.contains("clips"))
-        stage_->setText(QStringLiteral("切片已就绪。校对每条标注，保存后准备训练数据。"));
+        stage_->setText(QStringLiteral("切片已就绪。可自动转写、导入已有标注，或双击「文本」手动填写。"));
+    else if (project_.contains("raw"))
+        stage_->setText(QStringLiteral("原始录音已导入。点「切片」，将录音分成便于逐条标注的片段。"));
     else
         stage_->setText(QStringLiteral("导入原始录音进行切片，或直接导入已切好的 WAV 片段。"));
 }

@@ -59,11 +59,10 @@ def main():
     shutil.copytree(args.portable, portable, ignore=shutil.ignore_patterns("data", "outputs"))
     program = portable / "EZ-GPT-SoVITS.exe"
     data = portable / "data"
-    data.mkdir()
     database_path = data / "library.sqlite"
-    # A blank portable database isolates the check from any legacy AppData registry entry.
-    database_path.touch()
+    assert not data.exists(), "The portable copy must start without a pre-created data directory."
     run(program, "--smoke-test")
+    assert database_path.is_file(), "First launch must initialize the database next to the executable."
 
     fixture = json.loads(source.read_text(encoding="utf-8-sig"))
     for role in ("gpt", "sovits", "reference"):

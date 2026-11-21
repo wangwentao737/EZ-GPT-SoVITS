@@ -48,6 +48,7 @@ private:
     QMediaPlayer *player_ = nullptr;
     QPushButton *play_ = nullptr;
     QPushButton *export_ = nullptr;
+    QPushButton *folder_ = nullptr;
     QString audio_;
 };
 

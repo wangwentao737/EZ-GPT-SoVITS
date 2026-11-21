@@ -1,11 +1,13 @@
 #include "synthesis.h"
 #include "engine.h"
 #include "jobs.h"
+#include "ui.h"
 
 #include <QAudioOutput>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QCryptographicHash>
+#include <QDesktopServices>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -105,22 +107,44 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
     execute(query);
 
     auto *layout = new QVBoxLayout(this);
+    ui::pageHeader(layout, this, QStringLiteral("语音合成"),
+        QStringLiteral("选一个声音和台词语言，输入台词后点「生成语音」。首次使用可先导入权重和参考音频。"));
     auto *selectors = new QHBoxLayout;
     voices_ = new QComboBox(this);
     voices_->setPlaceholderText(QStringLiteral("先导入一个声音"));
+    voices_->setAccessibleName(QStringLiteral("声音预设"));
     language_ = new QComboBox(this);
     language_->addItems(languages);
+    language_->setAccessibleName(QStringLiteral("台词语言"));
     auto *import = new QPushButton(QStringLiteral("导入声音"), this);
+    auto *voiceLabel = new QLabel(QStringLiteral("声音"), this);
+    voiceLabel->setObjectName("fieldLabel");
+    selectors->addWidget(voiceLabel);
     selectors->addWidget(voices_, 1);
+    auto *languageLabel = new QLabel(QStringLiteral("台词语言"), this);
+    languageLabel->setObjectName("fieldLabel");
+    selectors->addWidget(languageLabel);
     selectors->addWidget(language_);
     selectors->addWidget(import);
     layout->addLayout(selectors);
 
     text_ = new QPlainTextEdit(this);
-    text_->setPlaceholderText(QStringLiteral("输入需要生成的台词"));
+    text_->setObjectName("scriptEditor");
+    text_->setAccessibleName(QStringLiteral("合成台词"));
+    text_->setPlaceholderText(QStringLiteral("在这里输入台词。批量生成时，每行输入一段。"));
     layout->addWidget(text_, 1);
     auto *parameters = new QHBoxLayout;
     batch_ = new QCheckBox(QStringLiteral("每行生成一条音频"), this);
+    parameters->addWidget(batch_);
+    auto *advanced = new QPushButton(QStringLiteral("高级参数"), this);
+    advanced->setCheckable(true);
+    parameters->addStretch(1);
+    parameters->addWidget(advanced);
+    layout->addLayout(parameters);
+    auto *advancedPanel = new QWidget(this);
+    advancedPanel->setObjectName("card");
+    auto *advancedLayout = new QHBoxLayout(advancedPanel);
+    advancedLayout->setContentsMargins(11, 8, 11, 8);
     speed_ = new QDoubleSpinBox(this);
     speed_->setRange(0.60, 1.65);
     speed_->setSingleStep(0.05);
@@ -129,27 +153,32 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
     seed_ = new QLineEdit(this);
     seed_->setPlaceholderText(QStringLiteral("随机种子（选填）"));
     seed_->setMaxLength(10);
-    parameters->addWidget(batch_);
-    parameters->addWidget(speed_);
-    parameters->addWidget(seed_);
-    parameters->addStretch();
-    layout->addLayout(parameters);
+    advancedLayout->addWidget(speed_);
+    advancedLayout->addWidget(seed_, 1);
+    layout->addWidget(advancedPanel);
+    advancedPanel->hide();
+    connect(advanced, &QPushButton::toggled, advancedPanel, &QWidget::setVisible);
+    connect(advanced, &QPushButton::toggled, this, [advanced](bool open) {
+        advanced->setText(open ? QStringLiteral("收起高级参数") : QStringLiteral("高级参数"));
+    });
 
     auto *actions = new QHBoxLayout;
     auto *generate = new QPushButton(QStringLiteral("生成语音"), this);
     generate->setObjectName("primary");
     play_ = new QPushButton(QStringLiteral("播放"), this);
     export_ = new QPushButton(QStringLiteral("另存 WAV"), this);
+    folder_ = new QPushButton(QStringLiteral("所在目录"), this);
     play_->setEnabled(false);
     export_->setEnabled(false);
+    folder_->setEnabled(false);
     actions->addWidget(generate);
+    actions->addStretch(1);
     actions->addWidget(play_);
     actions->addWidget(export_);
-    actions->addStretch();
+    actions->addWidget(folder_);
     layout->addLayout(actions);
 
-    status_ = new QLabel(this);
-    status_->setWordWrap(true);
+    status_ = ui::hint({}, this);
     layout->addWidget(status_);
     player_ = new QMediaPlayer(this);
     player_->setAudioOutput(new QAudioOutput(player_));
@@ -162,6 +191,15 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
             player_->pause();
         else
             player_->play();
+    });
+    connect(folder_, &QPushButton::clicked, this, [this] {
+        try {
+            const auto parent = QFileInfo(checkedPath(audio_)).absolutePath();
+            if (!QFileInfo(parent).isDir() || !QDesktopServices::openUrl(QUrl::fromLocalFile(parent)))
+                status_->setText(QStringLiteral("无法打开音频所在目录"));
+        } catch (const std::exception &error) {
+            status_->setText(QString::fromUtf8(error.what()));
+        }
     });
     connect(player_, &QMediaPlayer::playbackStateChanged, this, [this](QMediaPlayer::PlaybackState state) {
         play_->setText(state == QMediaPlayer::PlayingState ? QStringLiteral("暂停") : QStringLiteral("播放"));
@@ -224,6 +262,7 @@ void SynthesisPanel::playAudio(const QString &path)
     player_->setSource(QUrl::fromLocalFile(audio_));
     play_->setEnabled(true);
     export_->setEnabled(true);
+    folder_->setEnabled(true);
     player_->play();
 }
 
@@ -267,6 +306,7 @@ void SynthesisPanel::importVoice(QJsonObject defaults)
     dialog.setWindowTitle(QStringLiteral("导入声音"));
     dialog.resize(650, 430);
     auto *form = new QFormLayout(&dialog);
+    form->addRow(ui::hint(QStringLiteral("选择同一个声音的两份配套权重，再添加一段参考录音和对应原文。"), &dialog));
     auto *name = new QLineEdit(defaults.value("name").toString(), &dialog);
     auto *family = new QComboBox(&dialog);
     family->addItems({"v5turbo", "v5dev", "v2Pro", "v2ProPlus", "v2"});
@@ -407,6 +447,7 @@ void SynthesisPanel::receiveAudio(const QString &id, const QJsonObject &result)
     player_->setSource(QUrl::fromLocalFile(audio_));
     play_->setEnabled(true);
     export_->setEnabled(true);
+    folder_->setEnabled(true);
     status_->setText(QStringLiteral("语音已生成 · %1 秒").arg(result.value("duration").toDouble(), 0, 'f', 2));
     QSqlQuery query;
     query.prepare("SELECT launcher,request FROM jobs WHERE id=?");

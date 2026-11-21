@@ -14,7 +14,7 @@ cmake --build build --config Release --parallel
 cmake --install build --config Release --prefix (Join-Path $PWD "out/portable")
 ```
 
-从便携目录打开 `EZ-GPT-SoVITS.exe` 即进入工作台。新安装的素材和项目保存在 EXE 同级的 `data`，默认成品目录为 `data/outputs`。「设置」页可添加引擎启动路径及更改成品生成目录。开发联调可以通过 `--data-root` 指定独立的数据目录。
+从便携目录打开 `EZ-GPT-SoVITS.exe` 即进入工作台。程序在 EXE 同级的 `data` 保存数据库、素材、项目和任务日志，默认成品目录为 `data/outputs`。「设置」页可添加引擎启动路径、更改成品生成目录及打开数据目录。旧版 C 盘数据保留在原位置。开发联调可以通过 `--data-root` 指定独立的数据目录。
 
 运行 `pwsh -File tests/portable-smoke.ps1` 验证便携启动、SQLite 初始化、端口冲突与目录联接拒绝。运行时需让 9874 端口空闲，以便脚本创建临时监听器。
 

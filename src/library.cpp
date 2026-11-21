@@ -3,6 +3,7 @@
 #include "jobs.h"
 #include "settings.h"
 #include "synthesis.h"
+#include "ui.h"
 
 #include <QComboBox>
 #include <QDesktopServices>
@@ -260,6 +261,7 @@ private:
     QComboBox *voice_;
     QComboBox *project_;
     QTableWidget *table_;
+    QLabel *empty_;
     QPlainTextEdit *details_;
     QLabel *status_;
     QPushButton *rename_;
@@ -273,13 +275,20 @@ LibraryPage::LibraryPage(QString root, const QString &defaultOutput, TaskSchedul
     : QWidget(tabs), root_(std::move(root)), synthesis_(synthesis)
 {
     auto *layout = new QVBoxLayout(this);
+    ui::pageHeader(layout, this, QStringLiteral("声音与素材"),
+        QStringLiteral("按类型、项目或声音筛选。选中一项可查看文件位置、参考文本和关联任务。"));
     auto *filters = new QHBoxLayout;
     kind_ = new QComboBox(this);
     kind_->addItem(QStringLiteral("全部类型"), -1);
     for (int kind = 0; kind < typeNames.size(); ++kind)
         kind_->addItem(typeNames[kind], kind);
     voice_ = new QComboBox(this);
+    voice_->addItem(QStringLiteral("全部声音"));
     project_ = new QComboBox(this);
+    project_->addItem(QStringLiteral("全部项目"));
+    kind_->setAccessibleName(QStringLiteral("按素材类型筛选"));
+    voice_->setAccessibleName(QStringLiteral("按声音筛选"));
+    project_->setAccessibleName(QStringLiteral("按项目筛选"));
     filters->addWidget(kind_);
     filters->addWidget(project_, 1);
     filters->addWidget(voice_, 1);
@@ -291,9 +300,17 @@ LibraryPage::LibraryPage(QString root, const QString &defaultOutput, TaskSchedul
     table_->setSelectionMode(QAbstractItemView::SingleSelection);
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    ui::styleTable(table_);
     table_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
     table_->horizontalHeader()->setStretchLastSection(true);
     layout->addWidget(table_, 1);
+    empty_ = new QLabel(QStringLiteral("导入声音，或在训练完成后将新声音保存到这里。"), this);
+    empty_->setObjectName("emptyState");
+    empty_->setWordWrap(true);
+    empty_->setAlignment(Qt::AlignCenter);
+    layout->addWidget(empty_, 1);
+    table_->hide();
     details_ = new QPlainTextEdit(this);
     details_->setReadOnly(true);
     details_->setPlaceholderText(QStringLiteral("选择一项可查看文件和关联记录。"));
@@ -302,6 +319,7 @@ LibraryPage::LibraryPage(QString root, const QString &defaultOutput, TaskSchedul
 
     auto *actions = new QHBoxLayout;
     auto *importVoice = new QPushButton(QStringLiteral("导入声音"), this);
+    importVoice->setObjectName("primary");
     rename_ = new QPushButton(QStringLiteral("重命名声音"), this);
     play_ = new QPushButton(QStringLiteral("播放"), this);
     folder_ = new QPushButton(QStringLiteral("所在目录"), this);
@@ -311,8 +329,7 @@ LibraryPage::LibraryPage(QString root, const QString &defaultOutput, TaskSchedul
         actions->addWidget(button);
     actions->addStretch();
     layout->addLayout(actions);
-    status_ = new QLabel(this);
-    status_->setWordWrap(true);
+    status_ = ui::hint({}, this);
     layout->addWidget(status_);
 
     for (auto *box : {kind_, voice_, project_})
@@ -443,6 +460,7 @@ void LibraryPage::refill()
         table_->insertRow(row);
         for (int column = 0; column < fields.size(); ++column)
             table_->setItem(row, column, new QTableWidgetItem(fields[column]));
+        table_->item(row, 0)->setToolTip(fields.constFirst());
         table_->item(row, 0)->setData(Qt::UserRole, key);
         if (key == selected)
             table_->selectRow(row);
@@ -471,6 +489,12 @@ void LibraryPage::refill()
         }
     }
     table_->setUpdatesEnabled(true);
+    const bool empty = table_->rowCount() == 0;
+    table_->setVisible(!empty);
+    empty_->setVisible(empty);
+    empty_->setText(library_.voices.isEmpty() && library_.files.isEmpty()
+        ? QStringLiteral("导入声音，或在训练完成后将新声音保存到这里。")
+        : QStringLiteral("当前筛选没有结果，可更改类型、项目或声音。"));
     showDetails();
 }
 
