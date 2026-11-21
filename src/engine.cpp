@@ -234,6 +234,12 @@ void EngineManager::start(const QString &launcher, const QString &logPath)
     const QStorageInfo disk(QFileInfo(log).absolutePath());
     if (disk.isReady() && (disk.isReadOnly() || disk.bytesAvailable() == 0))
         fail(QStringLiteral("数据盘不可写或空间已满，请释放空间或更换可写目录"));
+    // ONNX Runtime GPU 1.18.0 throws on missing CUDA DLLs when CUDA_PATH is set.
+    // Clearing it in the child shell allows G2PW to fall back to CPU.
+    const auto ortGpuMetadata = checkedPath(dir + "/runtime/Lib/site-packages/onnxruntime_gpu-1.18.0.dist-info");
+    std::wstring command = QFileInfo(ortGpuMetadata).isDir()
+        ? L"cmd.exe /D /Q /V:OFF /C set CUDA_PATH=& .\\go-webui.bat"
+        : L"cmd.exe /D /Q /V:OFF /C .\\go-webui.bat";
     SECURITY_ATTRIBUTES inheritable{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
     const HANDLE output = CreateFileW(reinterpret_cast<LPCWSTR>(log.utf16()), GENERIC_WRITE,
         FILE_SHARE_READ, &inheritable, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -253,13 +259,12 @@ void EngineManager::start(const QString &launcher, const QString &logPath)
     startup.hStdInput = input;
     startup.hStdOutput = startup.hStdError = output;
     PROCESS_INFORMATION created{};
-    wchar_t command[] = L"cmd.exe /D /Q /V:OFF /C .\\go-webui.bat";
     wchar_t system[MAX_PATH]{};
     GetSystemDirectoryW(system, MAX_PATH);
     const std::wstring cmd = std::wstring(system) + L"\\cmd.exe";
     const auto cwd = QDir::toNativeSeparators(dir);
     const bool launched = jobReady && input != INVALID_HANDLE_VALUE
-        && CreateProcessW(cmd.c_str(), command, nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
+        && CreateProcessW(cmd.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
                           nullptr, reinterpret_cast<LPCWSTR>(cwd.utf16()), &startup, &created);
     const auto launchError = GetLastError();
     CloseHandle(output);

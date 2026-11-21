@@ -72,6 +72,7 @@ def main():
     parser.add_argument("--app", type=Path, default=workspace / "out" / "portable" / "EZ-GPT-SoVITS.exe")
     parser.add_argument("--engine", type=Path, default=scratch / "engine-20261006")
     parser.add_argument("--prepared", type=Path, default=scratch / "training" / "prepare.json")
+    parser.add_argument("--labels", type=Path, help="Use alternate annotated WAV files under .test.")
     parser.add_argument("--voice", type=Path, default=scratch / "synthesis" / "fixtures" / "synthesis.json")
     args = parser.parse_args()
     engine = args.engine.resolve(strict=True)
@@ -85,7 +86,7 @@ def main():
     project = data / "projects" / "训练样本 (校验)"
     clips = project / "clips"
     clips.mkdir(parents=True)
-    label_path = Path(fixture["annotation"]).resolve(strict=True)
+    label_path = (args.labels or Path(fixture["annotation"])).resolve(strict=True)
     assert label_path.is_relative_to(scratch), label_path
     lines = []
     for line in label_path.read_text(encoding="utf-8-sig").splitlines():
@@ -94,7 +95,7 @@ def main():
         assert origin.is_relative_to(scratch), origin
         clip = clips / origin.name
         clone(origin, clip)
-        lines.append(f"{clip.as_posix()}|{speaker}|{language}|{text}")
+        lines.append(f"{clip.as_posix()}|{speaker}|{language.lower()}|{text}")
     annotation = project / "annotations.list"
     annotation.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
