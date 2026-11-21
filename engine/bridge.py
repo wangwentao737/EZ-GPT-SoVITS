@@ -339,12 +339,15 @@ def read_dataset_index(path, width, cancel, header=None):
     with path.open(encoding="utf-8-sig") as stream:
         if header is not None and stream.readline().rstrip("\r\n") != header:
             raise ValueError(f"预处理索引表头无效：{path.name}")
-        for line in stream:
+        for line_number, line in enumerate(stream, start=2 if header is not None else 1):
             check_cancel(cancel)
-            fields = line.rstrip("\r\n").split("\t")
+            line = line.rstrip("\r\n")
+            if not line:
+                continue
+            fields = line.split("\t")
             name = fields[0]
             if len(fields) != width or not all(field.strip() for field in fields):
-                raise ValueError(f"预处理索引记录不完整：{path.name} · {name}")
+                raise ValueError(f"预处理索引记录不完整：{path.name} 第 {line_number} 行 · {name or '缺少样本名'}")
             if any(character in name for character in '/\\:|') or name.endswith((".", " ")):
                 raise ValueError(f"预处理索引包含无效的样本名：{name}")
             if name.casefold() in names:
@@ -354,6 +357,8 @@ def read_dataset_index(path, width, cancel, header=None):
                 raise ValueError(f"语义索引包含无效编号：{name}")
             rows[name] = fields[1:]
             names.add(name.casefold())
+    if not rows:
+        raise ValueError(f"预处理索引没有有效记录：{path.name}。请查看工作台的引擎日志。")
     return rows
 
 

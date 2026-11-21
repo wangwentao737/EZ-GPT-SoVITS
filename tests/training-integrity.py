@@ -124,6 +124,10 @@ def main():
     clone(old_checkpoint, old_copy)
     old_stat = old_copy.stat()
 
+    text_index = dataset / "2-name2text.txt"
+    text_rows = text_index.read_text(encoding="utf-8").splitlines()
+    text_index.write_text("\n".join(["", text_rows[0], "", *text_rows[1:], "", ""]), encoding="utf-8")
+
     train = {**prepare, "operation": "train_sovits"}
     rows = run(args.app, engine, data, [
         {**train, "experiment": missing_id},
@@ -148,7 +152,7 @@ def main():
         runs.append(output)
     assert runs[0]["checkpoints"] != runs[1]["checkpoints"]
     assert (old_copy.stat().st_size, old_copy.stat().st_mtime_ns) == (old_stat.st_size, old_stat.st_mtime_ns)
-    print("Missing features, duplicate rows, and changed labels rejected; both stages trained in fresh directories.", flush=True)
+    print("Invalid datasets rejected; both stages trained with blank text-index lines in fresh directories.", flush=True)
 
     source = Path(voice["reference"]).resolve(strict=True)
     assert source.is_relative_to(scratch)
