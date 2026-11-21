@@ -43,6 +43,7 @@ try {
     New-Item -ItemType Directory -Path $runtime -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $runtime 'python.exe') -Value 'test sentinel'
     Set-Content -LiteralPath (Join-Path $engine 'webui.py') -Value '# test sentinel'
+    Set-Content -LiteralPath (Join-Path $engine 'config.py') -Value '# test sentinel'
     $sentinel = Join-Path $engine 'unexpected-launch.txt'
     $launcher = Join-Path $engine 'go-webui.bat'
     Set-Content -LiteralPath $launcher -Value '@echo started>unexpected-launch.txt' -Encoding ascii

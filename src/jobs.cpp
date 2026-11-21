@@ -1,5 +1,6 @@
 #include "jobs.h"
 #include "engine.h"
+#include "resources.h"
 #include "settings.h"
 
 #include <QCryptographicHash>
@@ -13,6 +14,7 @@
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
+#include <QStorageInfo>
 #include <QUuid>
 #include <QtEndian>
 #include <stdexcept>
@@ -79,6 +81,36 @@ QString outputRootForRequest(const QString &dataRoot, const QJsonObject &request
     return checkedWorkspaceRoot(saved.isEmpty() ? dataRoot + "/outputs" : saved);
 }
 
+void checkOutputDirectory(const QString &path)
+{
+    QFileInfo directory(path);
+    while (!directory.exists()) {
+        const auto parent = directory.absolutePath();
+        if (parent == directory.absoluteFilePath())
+            fail(QStringLiteral("找不到生成目录所在的磁盘，请在「设置」更改生成目录"));
+        directory.setFile(parent);
+    }
+    const QStorageInfo disk(directory.absoluteFilePath());
+    if (!directory.isDir() || !directory.isWritable() || disk.isReadOnly())
+        fail(QStringLiteral("生成目录不可写，请在「设置」选择可写目录。\n%1").arg(path));
+    if (disk.isReady() && disk.bytesAvailable() == 0)
+        fail(QStringLiteral("生成目录所在磁盘空间已满，请释放空间或更改生成目录。\n%1").arg(path));
+}
+
+QString recoveryHint(const QString &message, const QString &logs, const QString &operation)
+{
+    const auto text = (message + '\n' + logs).toLower();
+    if ((text.contains("out of memory") && (text.contains("cuda") || text.contains("gpu")))
+        || text.contains(QStringLiteral("显存不足"))) {
+        const auto action = operation.startsWith("train_") ? QStringLiteral("请降低训练批量后重试。")
+                                                          : QStringLiteral("请释放显存后重试。");
+        return QStringLiteral("显存不足。%1\n%2").arg(action, message);
+    }
+    if (text.contains("no space left on device") || text.contains("disk full") || text.contains("winerror 112"))
+        return QStringLiteral("写入空间不足。请释放磁盘空间，或在「设置」更改生成目录后重新提交。\n%1").arg(message);
+    return message;
+}
+
 void publishWave(const QString &source, const QString &target)
 {
     QFile input(source);
@@ -99,7 +131,7 @@ void publishWave(const QString &source, const QString &target)
 }
 
 void startJobProcess(QProcess &worker, const QString &engine, const QString &root,
-                     const QString &job, QJsonObject request)
+                     const QString &job, QJsonObject request, quint32 webuiPid)
 {
     const auto directory = checkedPath(job);
     if (!QDir().mkpath(directory))
@@ -107,6 +139,7 @@ void startJobProcess(QProcess &worker, const QString &engine, const QString &roo
     request.insert("engine", engine);
     request.insert("data", root);
     request.insert("job", directory);
+    request.insert("webui_pid", static_cast<qint64>(webuiPid));
     save(directory + "/request.json", json(request));
     QFile embedded(":/engine/bridge.py");
     if (!embedded.open(QIODevice::ReadOnly))
@@ -244,8 +277,18 @@ void TaskScheduler::next()
         activeRequest_ = QJsonDocument::fromJson(query.value(1).toByteArray()).object();
         query.finish();
         jobPath_ = checkedPath(root_ + "/jobs/" + active_);
+        engineLogOffset_ = QFileInfo(checkedPath(root_ + "/engine-start.log")).size();
+        const auto operation = activeRequest_.value("operation").toString();
+        const auto interfaceIssue = engine_.interfaceIssue(operation);
+        if (!interfaceIssue.isEmpty())
+            fail(interfaceIssue);
+        const auto resourceIssue = jobResourceIssue(engine_.root(), root_, activeRequest_);
+        if (!resourceIssue.isEmpty())
+            fail(resourceIssue);
+        if (operation == "synthesize")
+            checkOutputDirectory(outputRootForRequest(root_, activeRequest_));
         update(active_, "running");
-        startJobProcess(worker_, engine_.root(), root_, jobPath_, activeRequest_);
+        startJobProcess(worker_, engine_.root(), root_, jobPath_, activeRequest_, engine_.webuiPid());
     } catch (const std::exception &error) {
         finish(false, QString::fromUtf8(error.what()));
     }
@@ -306,16 +349,23 @@ void TaskScheduler::finish(bool processSucceeded, QString message)
             update(id, "succeeded", {}, result);
             emit completed(id, result);
         } else {
+            QString detail;
             if (message.isEmpty()) {
                 QFile log(checkedPath(job + "/error.log"));
                 if (log.open(QIODevice::ReadOnly)) {
                     log.seek(qMax<qint64>(0, log.size() - 4096));
-                    const auto detail = QString::fromUtf8(log.readAll()).trimmed();
+                    detail = QString::fromUtf8(log.readAll()).trimmed();
                     message = detail.section('\n', -1);
+                }
+                QFile engineLog(checkedPath(root_ + "/engine-start.log"));
+                if (engineLog.open(QIODevice::ReadOnly) && engineLog.size() > engineLogOffset_) {
+                    engineLog.seek(qMax(engineLogOffset_, engineLog.size() - 16384));
+                    detail += '\n' + QString::fromUtf8(engineLog.readAll());
                 }
             }
             if (message.isEmpty())
                 message = QStringLiteral("任务中断，详情见任务日志");
+            message = recoveryHint(message, detail, request.value("operation").toString());
             update(id, "failed", message);
             emit failed(message);
         }

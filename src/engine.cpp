@@ -1,4 +1,5 @@
 #include "engine.h"
+#include "resources.h"
 
 #include <winsock2.h>
 #include <windows.h>
@@ -14,6 +15,7 @@
 #include <QNetworkAccessManager>
 #include <QNetworkProxy>
 #include <QNetworkReply>
+#include <QStorageInfo>
 #include <QtConcurrentRun>
 #include <stdexcept>
 #include <vector>
@@ -53,7 +55,7 @@ DWORD listener(quint16 port)
     return 0;
 }
 
-QString probeApi()
+EngineProbe probeApi()
 {
     QNetworkAccessManager network;
     network.setProxy(QNetworkProxy::NoProxy);
@@ -68,22 +70,39 @@ QString probeApi()
     if (reply->error() != QNetworkReply::NoError)
         return {};
     const auto config = QJsonDocument::fromJson(reply->readAll()).object();
-    if (config.value("version").toString() != "4.44.1")
-        return QStringLiteral("WebUI 响应成功，但 Gradio 版本与 20261006 适配契约不符");
-    const QMap<QString, int> expected{
-        {"change_tts_inference", 6}, {"open_slice", 10},
-        {"open1abc", 10}, {"open1Ba", 13}, {"open1Bb", 9}, {"switch_version", 1}
+    EngineProbe result;
+    result.responded = true;
+    if (config.value("version").toString() != "4.44.1") {
+        result.error = QStringLiteral("WebUI 响应成功，但 Gradio 版本与 20261006 适配契约不符");
+        return result;
+    }
+    const QMap<QString, QMap<QString, int>> expected{
+        {"synthesize", {{"switch_version", 1}, {"change_choices", 0}, {"change_tts_inference", 6},
+                        {"change_tts_inference_1", 6}}},
+        {"slice", {{"open_slice", 10}}},
+        {"prepare", {{"switch_version", 1}, {"open1abc", 10}}},
+        {"train_sovits", {{"switch_version", 1}, {"open1Ba", 13}}},
+        {"train_gpt", {{"switch_version", 1}, {"open1Bb", 9}}},
     };
     QMap<QString, int> published;
     for (const auto &dependency : config.value("dependencies").toArray()) {
         const auto endpoint = dependency.toObject();
-        published.insert(endpoint.value("api_name").toString(), endpoint.value("inputs").toArray().size());
+        const auto name = endpoint.value("api_name").toString();
+        const auto inputs = endpoint.value("inputs");
+        if (!name.isEmpty())
+            published.insert(name, !inputs.isArray() || published.contains(name) ? -1 : inputs.toArray().size());
     }
-    for (auto entry = expected.cbegin(); entry != expected.cend(); ++entry) {
-        if (published.value(entry.key(), -1) != entry.value())
-            return QStringLiteral("缺少适配接口 %1 或接口参数已变化").arg(entry.key());
+    for (auto operation = expected.cbegin(); operation != expected.cend(); ++operation) {
+        QStringList missing;
+        for (auto method = operation.value().cbegin(); method != operation.value().cend(); ++method) {
+            if (published.value(method.key(), -1) != method.value())
+                missing << method.key();
+        }
+        if (!missing.isEmpty())
+            result.unavailable.insert(operation.key(), QStringLiteral("%1接口缺失或参数已变化（%2）。请检查整合包版本。")
+                .arg(operationLabel(operation.key()), missing.join(QStringLiteral("、"))));
     }
-    return QStringLiteral("ready");
+    return result;
 }
 
 }
@@ -126,8 +145,7 @@ QString engineRoot(const QString &launcher)
     const QFileInfo info(checkedPath(launcher));
     const auto root = info.absolutePath();
     if (info.fileName().compare("go-webui.bat", Qt::CaseInsensitive) != 0 || !info.isFile()
-        || inside(protectedRoot, root) || !QFileInfo(checkedPath(root + "/runtime/python.exe")).isFile()
-        || !QFileInfo(checkedPath(root + "/webui.py")).isFile()) {
+        || inside(protectedRoot, root)) {
         fail(QStringLiteral("请选择独立 GPT-SoVITS Windows 整合包中的 go-webui.bat"));
     }
     checkedPath(root + "/TEMP");
@@ -146,46 +164,16 @@ QString checkedWorkspaceRoot(const QString &path)
 QStringList inspectEngine(const QString &launcher, const QString &family)
 {
     const auto root = engineRoot(launcher);
-    const QString models = "GPT_SoVITS/pretrained_models/";
-    const bool v5 = family == "v5dev" || family == "v5turbo";
-    const QString sovits = v5 ? "gsv-v5-pretrained/s2G" + family + ".pth"
-                              : family == "v2" ? "gsv-v2final-pretrained/s2G2333k.pth"
-                                               : "v2Pro/s2G" + family + ".pth";
-    const QString gpt = family == "v2" ? "gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt"
-                                        : "s1v3.ckpt";
     QStringList report;
-    const auto check = [&](const QString &name, const QStringList &resources) {
-        QStringList missing;
-        for (const auto &resource : resources) {
-            QFile file(checkedPath(root + '/' + resource));
-            if (!file.open(QIODevice::ReadOnly) || file.size() <= 0)
-                missing.append(resource);
+    const auto operations = QStringList{"start"} + engineOperations();
+    for (const auto &operation : operations) {
+        try {
+            const auto issue = resourceIssue(root, operation, family);
+            report << (issue.isEmpty() ? QStringLiteral("%1：文件可读").arg(operationLabel(operation)) : issue);
+        } catch (const std::exception &error) {
+            report << QStringLiteral("%1：%2").arg(operationLabel(operation), QString::fromUtf8(error.what()));
         }
-        report.append(missing.isEmpty() ? name + QStringLiteral("：文件可读")
-            : name + QStringLiteral("：缺少或无法读取\n  ") + missing.join("\n  "));
-    };
-    check(QStringLiteral("启动"), {"go-webui.bat", "runtime/python.exe", "webui.py", "config.py"});
-    auto synthesis = QStringList{"GPT_SoVITS/inference_webui_fast.py",
-        models + "chinese-roberta-wwm-ext-large/config.json", models + "chinese-hubert-base/config.json",
-        models + sovits};
-    if (v5)
-        synthesis.append(models + "gsv-v5-pretrained/vocoder.pth");
-    check(QStringLiteral("合成"), synthesis);
-    auto training = QStringList{"tools/slice_audio.py", "GPT_SoVITS/prepare_datasets/1-get-text.py",
-        "GPT_SoVITS/prepare_datasets/2-get-hubert-wav32k.py", "GPT_SoVITS/prepare_datasets/3-get-semantic.py",
-        "GPT_SoVITS/s1_train.py", v5 ? "GPT_SoVITS/s2_train_v3_lora.py" : "GPT_SoVITS/s2_train.py",
-        models + gpt, models + sovits};
-    if (!v5) {
-        auto discriminator = sovits;
-        discriminator.replace("/s2G", "/s2D");
-        training.append(models + discriminator);
     }
-    check(QStringLiteral("训练"), training);
-    const QString paraformer = "tools/asr/models/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch";
-    const QString vad = "tools/asr/models/speech_fsmn_vad_zh-cn-16k-common-pytorch";
-    const QString punctuation = "tools/asr/models/punc_ct-transformer_zh-cn-common-vocab272727-pytorch";
-    check(QStringLiteral("中文自动转写"), {paraformer + "/config.yaml", paraformer + "/model.pt",
-        vad + "/config.yaml", vad + "/model.pt", punctuation + "/config.yaml", punctuation + "/model.pt"});
     return report;
 }
 
@@ -217,19 +205,24 @@ EngineManager::EngineManager(QObject *parent) : QObject(parent)
 {
     timer_.setInterval(750);
     connect(&timer_, &QTimer::timeout, this, &EngineManager::poll);
-    connect(&probe_, &QFutureWatcher<QString>::finished, this, [this] {
+    connect(&probe_, &QFutureWatcher<EngineProbe>::finished, this, [this] {
         if (!process_ || ready_)
             return;
         const auto result = probe_.result();
-        if (result.isEmpty())
+        if (!result.responded)
             return;
-        if (result != "ready" || !ownsListener(mainPort)) {
+        if (!result.error.isEmpty() || !ownsListener(mainPort)) {
             stop();
-            emit statusChanged(result == "ready" ? QStringLiteral("引擎监听进程已变化") : result);
+            emit statusChanged(result.error.isEmpty() ? QStringLiteral("引擎监听进程已变化") : result.error);
             return;
         }
+        unavailable_ = result.unavailable;
         ready_ = true;
-        emit statusChanged(QStringLiteral("引擎可以使用 · %1").arg(root_));
+        QStringList limited;
+        for (const auto &operation : unavailable_.keys())
+            limited << operationLabel(operation);
+        emit statusChanged(limited.isEmpty() ? QStringLiteral("引擎可以使用 · %1").arg(root_)
+            : QStringLiteral("引擎已连接 · %1暂不可用。可在工作台检查具体接口。").arg(limited.join(QStringLiteral("、"))));
         emit readinessChanged(true);
     });
 }
@@ -246,11 +239,17 @@ void EngineManager::start(const QString &launcher, const QString &logPath)
     if (process_ || probe_.isRunning())
         fail(QStringLiteral("已有引擎正在启动或运行"));
     const auto dir = engineRoot(launcher);
+    const auto issue = resourceIssue(dir, "start", {});
+    if (!issue.isEmpty())
+        fail(issue);
     for (auto port : {mainPort, inferencePort}) {
         if (const auto pid = listener(port))
             fail(QStringLiteral("端口 %1 已被进程 %2 占用").arg(port).arg(pid));
     }
     const auto log = QDir::toNativeSeparators(checkedPath(logPath));
+    const QStorageInfo disk(QFileInfo(log).absolutePath());
+    if (disk.isReady() && (disk.isReadOnly() || disk.bytesAvailable() == 0))
+        fail(QStringLiteral("数据盘不可写或空间已满，请释放空间或更换可写目录"));
     SECURITY_ATTRIBUTES inheritable{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
     const HANDLE output = CreateFileW(reinterpret_cast<LPCWSTR>(log.utf16()), GENERIC_WRITE,
         FILE_SHARE_READ, &inheritable, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -305,6 +304,7 @@ void EngineManager::stop()
     timer_.stop();
     process_.reset();
     ready_ = false;
+    unavailable_.clear();
     emit readinessChanged(false);
     emit statusChanged(QStringLiteral("引擎未启动"));
 }
@@ -327,6 +327,24 @@ void EngineManager::poll()
 bool EngineManager::ready() const { return ready_; }
 bool EngineManager::active() const { return bool(process_); }
 QString EngineManager::root() const { return root_; }
+
+QString EngineManager::interfaceIssue(const QString &operation) const
+{
+    return unavailable_.value(operation);
+}
+
+QStringList EngineManager::interfaceReport() const
+{
+    return unavailable_.values();
+}
+
+quint32 EngineManager::webuiPid() const
+{
+    const auto pid = listener(mainPort);
+    if (!ready_ || !pid || !process_ || !process_->owns(pid))
+        fail(QStringLiteral("引擎监听进程已变化，请重启引擎"));
+    return pid;
+}
 
 bool EngineManager::ownsListener(quint16 port) const
 {

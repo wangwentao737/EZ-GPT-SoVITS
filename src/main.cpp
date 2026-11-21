@@ -5,6 +5,7 @@
 #include "training.h"
 
 #include <QApplication>
+#include <QClipboard>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QCommandLineParser>
@@ -79,7 +80,7 @@ void initDatabase(const QString &root)
     ez::initWorkspaceSettings();
 }
 
-void startProbeJob(QProcess &worker, const QString &engine, const QString &root, const QString &requestPath)
+void startProbeJob(QProcess &worker, const ez::EngineManager &engine, const QString &root, const QString &requestPath)
 {
     QFile source(ez::checkedPath(requestPath));
     if (!source.open(QIODevice::ReadOnly))
@@ -88,7 +89,7 @@ void startProbeJob(QProcess &worker, const QString &engine, const QString &root,
     if (request.value("operation").toString().isEmpty())
         throw std::runtime_error("The test request must name an operation.");
 
-    ez::startJobProcess(worker, engine, root, root + "/probe-job", request);
+    ez::startJobProcess(worker, engine.root(), root, root + "/probe-job", request, engine.webuiPid());
 }
 
 class Workspace final : public QWidget {
@@ -171,6 +172,9 @@ public:
 
         auto *settings = createSettings(tabs);
         scheduler_ = new ez::TaskScheduler(root_, defaultOutput_, engine_, this);
+        connect(scheduler_, &ez::TaskScheduler::failed, this, [this](const QString &message) {
+            status_->setText(message.section('\n', 0, 0));
+        });
         auto *synthesis = new ez::SynthesisPanel(root_, *scheduler_, [this] { return currentLauncher(); }, tabs);
         tabs->addTab(synthesis, QStringLiteral("语音合成"));
         auto *training = new ez::TrainingPanel(root_, *scheduler_, [this] { return currentLauncher(); },
@@ -469,11 +473,13 @@ private:
         auto *open = new QPushButton(QStringLiteral("打开产物或日志目录"), page);
         auto *play = new QPushButton(QStringLiteral("播放成品"), page);
         auto *reuse = new QPushButton(QStringLiteral("复用合成参数"), page);
+        auto *copyResult = new QPushButton(QStringLiteral("复制结果"), page);
         actions->addWidget(cancel);
         actions->addWidget(retry);
         actions->addWidget(open);
         actions->addWidget(play);
         actions->addWidget(reuse);
+        actions->addWidget(copyResult);
         actions->addStretch();
         layout->addLayout(actions);
         const auto selection = [table] {
@@ -506,12 +512,17 @@ private:
                     table->setItem(row, column, new QTableWidgetItem(columns[column]));
                 table->item(row, 0)->setData(Qt::UserRole, id);
                 table->item(row, 3)->setData(Qt::UserRole, audio);
+                table->item(row, 3)->setToolTip(columns[3]);
                 if (id == selected)
                     table->selectRow(row);
             }
         };
         refresh();
         connect(scheduler_, &ez::TaskScheduler::changed, page, refresh);
+        connect(copyResult, &QPushButton::clicked, page, [table] {
+            if (const auto *result = table->item(table->currentRow(), 3); result && !result->text().isEmpty())
+                QApplication::clipboard()->setText(result->text());
+        });
         connect(cancel, &QPushButton::clicked, page, [this, selection] {
             if (const auto id = selection(); !id.isEmpty()) {
                 try {
@@ -637,9 +648,11 @@ private:
         const auto launcher = currentLauncher();
         const auto family = family_->currentText();
         const auto root = root_;
-        inspection_.setFuture(QtConcurrent::run([launcher, family, root] {
+        const auto interfaceReport = engine_.interfaceReport();
+        inspection_.setFuture(QtConcurrent::run([launcher, family, root, interfaceReport] {
             try {
                 auto report = ez::inspectEngine(launcher, family);
+                report.append(interfaceReport);
                 const QStorageInfo disk(root);
                 report.append(QStringLiteral("数据磁盘：可用 %1 GiB").arg(disk.bytesAvailable() / 1073741824.0, 0, 'f', 1));
                 return report.join("\n\n");
@@ -721,16 +734,26 @@ int main(int argc, char **argv)
                 const auto requests = document.isArray() ? document.array() : QJsonArray{document.object()};
                 if (requests.isEmpty())
                     return 3;
-                auto remaining = requests.size();
-                QObject::connect(&scheduler, &ez::TaskScheduler::completed, &app, [&] {
-                    if (--remaining == 0)
-                        app.exit(0);
-                });
-                QObject::connect(&scheduler, &ez::TaskScheduler::cancelled, &app, [&] {
-                    if (--remaining == 0)
-                        app.exit(0);
-                });
-                QObject::connect(&scheduler, &ez::TaskScheduler::failed, &app, [&app] { app.exit(3); });
+                QStringList submitted;
+                const auto checkBatch = [&app, &submitted] {
+                    bool failed = false;
+                    QSqlQuery query;
+                    query.prepare("SELECT state FROM jobs WHERE id=?");
+                    for (const auto &id : submitted) {
+                        query.bindValue(0, id);
+                        if (!query.exec() || !query.next()) {
+                            app.exit(3);
+                            return;
+                        }
+                        const auto state = query.value(0).toString();
+                        query.finish();
+                        if (state == "queued" || state == "running")
+                            return;
+                        failed |= state != "succeeded" && state != "cancelled";
+                    }
+                    if (!submitted.isEmpty())
+                        app.exit(failed ? 3 : 0);
+                };
                 QObject::connect(&engine, &ez::EngineManager::statusChanged, &app, [&] {
                     if (!engine.active() && !scheduler.running())
                         app.exit(2);
@@ -740,10 +763,11 @@ int main(int argc, char **argv)
                     const auto request = value.toObject();
                     if (request.value("operation").toString().isEmpty())
                         return 3;
-                    const auto id = scheduler.enqueue(parser.value(probeOption), request);
-                    if (first.isEmpty())
-                        first = id;
+                    submitted << scheduler.enqueue(parser.value(probeOption), request);
                 }
+                first = submitted.first();
+                QObject::connect(&scheduler, &ez::TaskScheduler::changed, &app, checkBatch, Qt::QueuedConnection);
+                QTimer::singleShot(0, &app, checkBatch);
                 QTimer cancellation;
                 if (parser.isSet(cancelOption)) {
                     const auto marker = ez::checkedPath(parser.value(cancelOption));
@@ -776,7 +800,7 @@ int main(int argc, char **argv)
                         return;
                     }
                     try {
-                        startProbeJob(worker, engine.root(), root, parser.value(jobOption));
+                        startProbeJob(worker, engine, root, parser.value(jobOption));
                     } catch (const std::exception &error) {
                         if (result.isOpen())
                             result.write(failureMessage(error).toUtf8() + '\n');

@@ -10,7 +10,7 @@ namespace ez {
 class EngineManager;
 
 void startJobProcess(QProcess &worker, const QString &engine, const QString &root,
-                     const QString &job, QJsonObject request);
+                     const QString &job, QJsonObject request, quint32 webuiPid);
 
 class TaskScheduler final : public QObject {
     Q_OBJECT
@@ -40,6 +40,7 @@ private:
     QString defaultOutputRoot_;
     QString active_;
     QString jobPath_;
+    qint64 engineLogOffset_ = 0;
     QJsonObject activeRequest_;
     EngineManager &engine_;
     QProcess worker_;

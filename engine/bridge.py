@@ -12,6 +12,7 @@ from concurrent.futures import TimeoutError
 from pathlib import Path
 
 from gradio_client import Client, handle_file
+import psutil
 import soundfile
 
 
@@ -149,6 +150,43 @@ def copy_with_cancel(source, target, cancel):
         raise
 
 
+def wait_for_inference(webui_pid, job, cancel):
+    started = time.monotonic()
+    seen = False
+    parent = psutil.Process(webui_pid)
+    while time.monotonic() - started < 150:
+        check_cancel(cancel)
+        children = []
+        try:
+            descendants = parent.children(recursive=True)
+        except psutil.NoSuchProcess as error:
+            raise RuntimeError("主引擎进程已退出，请重启引擎") from error
+        for child in descendants:
+            try:
+                if child.name().lower() == "python.exe" and any(
+                    arg.replace("\\", "/").endswith("/inference_webui_fast.py") for arg in child.cmdline()
+                ):
+                    children.append(child)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        if not children and (seen or time.monotonic() - started >= 5):
+            raise RuntimeError("快速推理进程在就绪前退出。请核对 GPT 和 SoVITS 权重，详见引擎启动日志。")
+        seen |= bool(children)
+        for child in children:
+            try:
+                listening = any(socket.status == psutil.CONN_LISTEN and socket.laddr.port == PORT_TTS
+                                for socket in child.net_connections(kind="tcp4"))
+                if listening:
+                    return connect(PORT_TTS, download_files=job)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            except Exception:
+                # The listener may exist before the Gradio configuration is ready.
+                continue
+        time.sleep(0.2)
+    raise RuntimeError("推理服务启动超时。请查看引擎启动日志。")
+
+
 def synthesize(client, engine, data, job, request, cancel):
     family = request["family"]
     if family not in FAMILIES:
@@ -175,16 +213,7 @@ def synthesize(client, engine, data, job, request, cancel):
         invoke(client, "change_tts_inference", *args)
         start_requested = True
 
-        deadline = time.monotonic() + 150
-        while True:
-            check_cancel(cancel)
-            try:
-                tts = connect(PORT_TTS, download_files=job)
-                break
-            except Exception:
-                if time.monotonic() >= deadline:
-                    raise RuntimeError("推理服务启动超时。请查看引擎启动日志") from None
-                time.sleep(1)
+        tts = wait_for_inference(request["webui_pid"], job, cancel)
 
         seed = int(request.get("seed", -1))
         result = invoke(
