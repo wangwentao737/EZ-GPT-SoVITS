@@ -24,6 +24,8 @@ cmake --install build --config Release --prefix (Join-Path $PWD "out/portable")
 
 同一套夹具可用 `python -X utf8 -B tests/resource-preflight.py` 验证缺少启动资源、接口变化和损坏权重的处理，以及失败后的真实合成。
 
+`python -X utf8 -B tests/training-integrity.py` 使用独立引擎实测预处理、样本错配拦截、两阶段训练和新权重试听。训练中断后可以从最后成功的阶段继续，重跑该阶段会建立独立检查点目录。
+
 ## 开发接入
 
 - 在「设置」手动添加独立整合包的 `go-webui.bat`，再在「工作台」检查模型家族并启动引擎。EZ 使用本机 Gradio 接口。目标整合包是 GPT-SoVITS-v5-20261006，主服务使用 9874，快速推理服务使用 9872。

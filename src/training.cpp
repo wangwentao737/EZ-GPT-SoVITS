@@ -54,7 +54,7 @@ QString directory(const QString &path)
 
 void invalidate(QJsonObject &project)
 {
-    for (const auto &key : {"dataset", "gpt", "sovits", "engine"})
+    for (const auto &key : {"dataset", "sampleCount", "gpt", "sovits", "engine"})
         project.remove(key);
 }
 
@@ -428,6 +428,9 @@ void TrainingPanel::complete(const QString &id, const QJsonObject &result, bool 
         invalidate(state);
         state["experiment"] = request.value("experiment");
         state["dataset"] = result.value("dataset");
+        const int sampleCount = result.value("sample_count").toInt();
+        if (sampleCount > 0)
+            state["sampleCount"] = sampleCount;
         state["engine"] = launcher;
     } else if (operation == "train_sovits" || operation == "train_gpt") {
         state[operation == "train_sovits" ? "sovits" : "gpt"] = result.value("weight");
@@ -486,8 +489,11 @@ void TrainingPanel::showState()
         stage_->setText(QStringLiteral("模型已训练完成。选择参考片段，点击「试听并入库」。"));
     else if (project_.contains("sovits"))
         stage_->setText(QStringLiteral("SoVITS 阶段已完成。点击「开始训练」继续 GPT 阶段。"));
-    else if (project_.contains("dataset"))
-        stage_->setText(QStringLiteral("训练数据已就绪。设置批量和轮数，再点击「开始训练」。"));
+    else if (project_.contains("dataset")) {
+        const int count = project_.value("sampleCount").toInt();
+        stage_->setText(count > 0 ? QStringLiteral("%1 条训练样本已校验。设置批量和轮数，再点击「开始训练」。").arg(count)
+                                  : QStringLiteral("训练数据已就绪。设置批量和轮数，再点击「开始训练」。"));
+    }
     else if (project_.contains("clips"))
         stage_->setText(QStringLiteral("切片已就绪。校对每条标注，保存后准备训练数据。"));
     else

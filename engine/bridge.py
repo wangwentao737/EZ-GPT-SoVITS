@@ -8,6 +8,7 @@ import re
 import sys
 import time
 import uuid
+import zipfile
 from concurrent.futures import TimeoutError
 from pathlib import Path
 
@@ -101,12 +102,15 @@ def invoke(client, endpoint, *arguments, cancel=None, stop=None):
     return pending.result()
 
 
-def inspect_wav(path, reference=False):
+def inspect_wav(path, reference=False, cancel=None):
     info = soundfile.info(path)
     if info.frames <= 0 or info.samplerate <= 0:
         raise ValueError(f"音频长度无效：{path}")
     # Read all frames in blocks so a truncated output fails before publication.
-    frames = sum(len(block) for block in soundfile.blocks(path, blocksize=65536))
+    frames = 0
+    for block in soundfile.blocks(path, blocksize=65536):
+        check_cancel(cancel)
+        frames += len(block)
     if frames != info.frames:
         raise ValueError(f"音频未完整写入：{path}")
     if reference and not 3 <= info.duration <= 10:
@@ -307,6 +311,115 @@ def transcribe(engine, project, request, gpu, cancel):
     publish(annotation=str(annotation))
 
 
+def annotated_samples(annotation, clips, cancel, inspect_audio):
+    content = annotation.read_bytes()
+    languages = {}
+    names = set()
+    for number, line in enumerate(content.decode("utf-8-sig").splitlines(), 1):
+        check_cancel(cancel)
+        fields = line.split("|", maxsplit=3)
+        if len(fields) != 4:
+            raise ValueError(f"第 {number} 行标注缺少路径、说话人、语言或文本")
+        source, speaker, language, text = fields
+        clip = safe_path(source, clips)
+        language = language.lower()
+        if not speaker.strip() or language not in {"zh", "en", "ja", "yue", "ko"} or not text.strip():
+            raise ValueError(f"标注缺少说话人、文本或有效语言：{clip.name}")
+        if clip.name.casefold() in names:
+            raise ValueError(f"训练片段文件名重复：{clip.name}。请移除重复项或重命名片段后重新标注。")
+        if inspect_audio:
+            inspect_wav(clip, cancel=cancel)
+        names.add(clip.name.casefold())
+        languages[clip.name] = language
+    if len(languages) < 2:
+        raise ValueError("至少需要两个有效录音片段")
+    return {"annotation_sha256": hashlib.sha256(content).hexdigest(), "samples": languages}
+
+
+def read_dataset_index(path, width, cancel, header=None):
+    if not path.is_file():
+        raise FileNotFoundError(f"缺少预处理索引：{path.name}。请重新准备训练数据。")
+    rows = {}
+    names = set()
+    with path.open(encoding="utf-8-sig") as stream:
+        if header is not None and stream.readline().rstrip("\r\n") != header:
+            raise ValueError(f"预处理索引表头无效：{path.name}")
+        for line in stream:
+            check_cancel(cancel)
+            fields = line.rstrip("\r\n").split("\t")
+            name = fields[0]
+            if len(fields) != width or not all(field.strip() for field in fields):
+                raise ValueError(f"预处理索引记录不完整：{path.name} · {name}")
+            if any(character in name for character in '/\\:|') or name.endswith((".", " ")):
+                raise ValueError(f"预处理索引包含无效的样本名：{name}")
+            if name.casefold() in names:
+                raise ValueError(f"预处理索引包含重复样本：{path.name} · {name}")
+            if header is not None and any(not token.isascii() or not token.isdecimal()
+                                          for token in fields[1].split()):
+                raise ValueError(f"语义索引包含无效编号：{name}")
+            rows[name] = fields[1:]
+            names.add(name.casefold())
+    return rows
+
+
+def verify_dataset(directory, family, snapshot, cancel):
+    text_index = safe_path(directory / "2-name2text.txt", directory)
+    semantic_index = safe_path(directory / "6-name2semantic.tsv", directory)
+    phones = read_dataset_index(text_index, 4, cancel)
+    semantics = read_dataset_index(semantic_index, 2, cancel, header="item_name\tsemantic_audio")
+    languages = snapshot["samples"] if snapshot is not None else {}
+    expected = set(languages) if snapshot is not None else set(phones)
+    for filename, found in ((text_index.name, phones), (semantic_index.name, semantics)):
+        missing = sorted(expected - set(found))
+        unexpected = sorted(set(found) - expected)
+        if missing or unexpected:
+            samples = [f"缺少 {name}" for name in missing[:3]] + [f"多出 {name}" for name in unexpected[:3]]
+            raise ValueError(f"预处理样本不匹配：{filename} · {'、'.join(samples)}")
+    if len(expected) < 2:
+        raise ValueError("预处理数据至少需要两个有效样本")
+
+    artifacts = [Path("2-name2text.txt"), Path("6-name2semantic.tsv")]
+    for name in sorted(expected):
+        check_cancel(cancel)
+        wave = safe_path(directory / "5-wav32k" / name, directory)
+        if not wave.is_file():
+            raise FileNotFoundError(f"缺少重采样音频：{name}")
+        inspect_wav(wave, cancel=cancel)
+        artifacts.append(Path("5-wav32k") / name)
+
+        features = ["4-cnhubert"]
+        if family in {"v2Pro", "v2ProPlus"}:
+            features.append("7-sv_cn")
+        bert = safe_path(directory / "3-bert" / f"{name}.pt", directory)
+        if languages.get(name) == "zh" or bert.is_file():
+            features.append("3-bert")
+        for group in features:
+            feature = safe_path(directory / group / f"{name}.pt", directory)
+            if not feature.is_file() or not zipfile.is_zipfile(feature):
+                raise ValueError(f"特征缺失或文件不完整：{group}/{name}.pt。请重新准备训练数据。")
+            artifacts.append(Path(group) / f"{name}.pt")
+    return artifacts, len(expected)
+
+
+def new_training_run(engine, dataset, artifacts, cancel):
+    run = safe_path(engine / "logs" / f"ez_{uuid.uuid4().hex}", engine)
+    run.mkdir()
+    for relative in artifacts:
+        check_cancel(cancel)
+        source = safe_path(dataset / relative, dataset)
+        target = safe_path(run / relative, run)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.suffix in {".wav", ".pt"}:
+            try:
+                # The pinned engine reads these features without modifying them.
+                os.link(source, target)
+                continue
+            except OSError:
+                pass
+        copy_with_cancel(source, target, cancel)
+    return run
+
+
 def run_training(client, engine, data, job, request, cancel):
     stage = request["operation"]
     project = safe_path(request["project"], data)
@@ -339,53 +452,62 @@ def run_training(client, engine, data, job, request, cancel):
     experiment = request["experiment"]
     if not re.fullmatch(r"ez_[0-9a-f]{32}", experiment):
         raise ValueError("项目实验标识无效")
-    invoke(client, "switch_version", family)
     experiment_dir = safe_path(engine / "logs" / experiment, engine)
     if stage == "prepare":
         annotation = safe_path(request["annotation"], project)
         clips = safe_path(request["source"], project)
-        seen = set()
-        for line in annotation.read_text(encoding="utf-8-sig").splitlines():
-            check_cancel(cancel)
-            source, speaker, language, text = line.split("|", maxsplit=3)
-            clip = safe_path(source, clips)
-            if not speaker or not language or not text.strip() or clip in seen:
-                raise ValueError(f"标注缺少内容或重复引用片段：{clip.name}")
-            inspect_wav(clip)
-            seen.add(clip)
-        if len(seen) < 2:
-            raise ValueError("至少需要两个有效录音片段")
+        snapshot = annotated_samples(annotation, clips, cancel, inspect_audio=True)
+        snapshot["family"] = family
+        if experiment_dir.exists():
+            raise ValueError("此预处理实验已存在，请从项目重新准备训练数据")
+        invoke(client, "switch_version", family)
         invoke(client, "open1abc", family, shell_path(annotation, project), shell_path(clips, project),
                experiment, gpu, gpu, gpu,
                BERT, HUBERT, sovits, cancel=cancel, stop="close1abc")
-        names = experiment_dir / "2-name2text.txt"
-        semantic = experiment_dir / "6-name2semantic.tsv"
-        for file, header in ((names, 0), (semantic, 1)):
-            if not file.is_file() or len(file.read_text(encoding="utf-8").strip().splitlines()) <= header:
-                raise RuntimeError(f"预处理产物不完整：{file.name}")
-        publish(dataset=str(experiment_dir))
+        if hashlib.sha256(annotation.read_bytes()).hexdigest() != snapshot["annotation_sha256"]:
+            raise ValueError("预处理时标注发生变更，请重新准备训练数据")
+        _, sample_count = verify_dataset(experiment_dir, family, snapshot, cancel)
+        receipt = safe_path(experiment_dir / "ez-dataset.json", experiment_dir)
+        temporary = safe_path(experiment_dir / "ez-dataset.json.partial", experiment_dir)
+        temporary.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+        check_cancel(cancel)
+        os.replace(temporary, receipt)
+        publish(dataset=str(experiment_dir), sample_count=sample_count)
         return
 
+    if stage not in {"train_sovits", "train_gpt"}:
+        raise ValueError(f"未知训练阶段：{stage}")
+    manifest = safe_path(experiment_dir / "ez-dataset.json", experiment_dir)
+    snapshot = json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else None
+    if snapshot is not None and snapshot["family"] != family:
+        raise ValueError("训练数据使用了其他模型家族，请重新准备训练数据")
+    if request.get("annotation"):
+        annotation = safe_path(request["annotation"], project)
+        labels = annotated_samples(annotation, safe_path(request["source"], project), cancel, inspect_audio=False)
+        if snapshot is not None and labels["annotation_sha256"] != snapshot["annotation_sha256"]:
+            raise ValueError("当前标注与预处理版本不同，请重新准备训练数据")
+        snapshot = labels
+    artifacts, sample_count = verify_dataset(experiment_dir, family, snapshot, cancel)
+    run = new_training_run(engine, experiment_dir, artifacts, cancel)
     batch = int(request.get("batch", 1))
     epochs = int(request.get("epochs", 2))
+    attempt = safe_path(job / "training-run.json", job)
+    attempt.write_text(json.dumps({
+        "operation": stage, "family": family, "gpu": gpu, "batch": batch, "epochs": epochs,
+        "dataset": str(experiment_dir), "checkpoints": str(run), "sample_count": sample_count,
+    }, ensure_ascii=False), encoding="utf-8")
+    invoke(client, "switch_version", family)
     kind, extension = ("SoVITS", "pth") if stage == "train_sovits" else ("GPT", "ckpt")
     weights = safe_path(engine / weight_directory(kind, family), engine)
-    pattern = f"{experiment}*.{extension}"
-    before = {path.name: path.stat().st_mtime_ns for path in weights.glob(pattern) if path.is_file()}
+    pattern = f"{run.name}*.{extension}"
     if stage == "train_sovits":
         discriminator = "" if family.startswith("v5") else sovits.replace("/s2G", "/s2D")
-        invoke(client, "open1Ba", family, batch, epochs, experiment, 0.4, True, True, epochs,
+        invoke(client, "open1Ba", family, batch, epochs, run.name, 0.4, True, True, epochs,
                gpu, sovits, discriminator, family.startswith("v5"), 32, cancel=cancel, stop="close1Ba")
-    elif stage == "train_gpt":
-        invoke(client, "open1Bb", batch, epochs, experiment, False, True, True, epochs, gpu, gpt,
-               cancel=cancel, stop="close1Bb")
     else:
-        raise ValueError(f"未知训练阶段：{stage}")
-    changed = [path for path in require_outputs(weights, pattern, stage)
-               if path.stat().st_mtime_ns != before.get(path.name)]
-    if not changed:
-        raise RuntimeError("训练没有生成新权重，请检查本次引擎日志")
-    weight = max(changed, key=lambda path: path.stat().st_mtime_ns)
+        invoke(client, "open1Bb", batch, epochs, run.name, False, True, True, epochs, gpu, gpt,
+               cancel=cancel, stop="close1Bb")
+    weight = max(require_outputs(weights, pattern, stage), key=lambda path: path.stat().st_mtime_ns)
     saved = safe_path(project / "weights" / experiment / weight.name, project)
     saved.parent.mkdir(parents=True, exist_ok=True)
     temporary = safe_path(job / f"weight-{uuid.uuid4().hex}.partial", job)
@@ -395,7 +517,7 @@ def run_training(client, engine, data, job, request, cancel):
         os.replace(temporary, saved)
     finally:
         temporary.unlink(missing_ok=True)
-    publish(weight=str(saved), checkpoints=str(experiment_dir))
+    publish(weight=str(saved), checkpoints=str(run), dataset=str(experiment_dir), sample_count=sample_count)
 
 
 def main(request_file):
