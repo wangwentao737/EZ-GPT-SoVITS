@@ -10,7 +10,6 @@
 namespace ez {
 
 QString checkedPath(const QString &path);
-QString checkedWorkspaceRoot(const QString &path);
 QString engineRoot(const QString &launcher);
 QStringList inspectEngine(const QString &launcher, const QString &family);
 

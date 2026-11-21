@@ -136,7 +136,7 @@ QString resourceIssue(const QString &engine, const QString &operation, const QSt
     if (missing.isEmpty())
         return {};
     const auto action = operation == "asr" ? QStringLiteral("可导入标注或手工录入，补齐模型后可重试转写。")
-                                           : QStringLiteral("请补齐资源或在「设置」中选择完整的独立整合包。");
+                                           : QStringLiteral("请补齐资源或在「设置」中选择完整的 GPT-SoVITS 安装。");
     return QStringLiteral("%1缺少资源或文件不可读。%2\n%3")
         .arg(operationLabel(operation), action, missing.join('\n'));
 }

@@ -17,7 +17,6 @@ import psutil
 import soundfile
 
 
-PROTECTED = Path(r"E:\GPT-SoVITS-v5-20261005\GPT-SoVITS-v5-20261006")
 MODELS = "GPT_SoVITS/pretrained_models"
 BERT = f"{MODELS}/chinese-roberta-wwm-ext-large"
 HUBERT = f"{MODELS}/chinese-hubert-base"
@@ -39,11 +38,7 @@ def safe_path(value, root=None):
     original = Path(value)
     if not original.is_absolute():
         raise ValueError(f"需要绝对路径：{original}")
-    if original == PROTECTED or PROTECTED in original.parents:
-        raise ValueError("该路径位于受保护的原始安装目录")
     path = original.resolve()
-    if path == PROTECTED or PROTECTED in path.parents:
-        raise ValueError("该路径位于受保护的原始安装目录")
     if root is not None and not path.is_relative_to(root):
         raise ValueError(f"路径超出任务目录：{path}")
     return path

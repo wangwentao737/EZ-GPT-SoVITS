@@ -23,19 +23,12 @@
 namespace ez {
 namespace {
 
-const QString protectedRoot = QStringLiteral("E:/GPT-SoVITS-v5-20261005/GPT-SoVITS-v5-20261006");
 constexpr quint16 mainPort = 9874;
 constexpr quint16 inferencePort = 9872;
 
 [[noreturn]] void fail(const QString &message)
 {
     throw std::runtime_error(message.toStdString());
-}
-
-bool inside(const QString &path, const QString &root)
-{
-    return path.compare(root, Qt::CaseInsensitive) == 0
-        || path.startsWith(root.endsWith('/') ? root : root + '/', Qt::CaseInsensitive);
 }
 
 DWORD listener(quint16 port)
@@ -112,7 +105,7 @@ QString checkedPath(const QString &path)
     const QString input = QDir::fromNativeSeparators(path);
     const QString absolute = QDir::cleanPath(input);
     if (absolute.size() < 3 || !absolute[0].isLetter() || absolute.mid(1, 2) != ":/"
-        || input.contains("//") || input.mid(2).contains(':') || inside(absolute, protectedRoot)) {
+        || input.contains("//") || input.mid(2).contains(':')) {
         fail(QStringLiteral("路径不可使用：%1").arg(path));
     }
     wchar_t device[32768]{};
@@ -144,21 +137,12 @@ QString engineRoot(const QString &launcher)
 {
     const QFileInfo info(checkedPath(launcher));
     const auto root = info.absolutePath();
-    if (info.fileName().compare("go-webui.bat", Qt::CaseInsensitive) != 0 || !info.isFile()
-        || inside(protectedRoot, root)) {
-        fail(QStringLiteral("请选择独立 GPT-SoVITS Windows 整合包中的 go-webui.bat"));
+    if (info.fileName().compare("go-webui.bat", Qt::CaseInsensitive) != 0 || !info.isFile()) {
+        fail(QStringLiteral("请选择已安装的 GPT-SoVITS 中的 go-webui.bat"));
     }
     checkedPath(root + "/TEMP");
     checkedPath(root + "/logs");
     return root;
-}
-
-QString checkedWorkspaceRoot(const QString &path)
-{
-    const auto absolute = checkedPath(path);
-    if (inside(protectedRoot, absolute))
-        fail(QStringLiteral("请选择独立的数据目录，当前位置包含受保护的引擎安装目录"));
-    return absolute;
 }
 
 QStringList inspectEngine(const QString &launcher, const QString &family)

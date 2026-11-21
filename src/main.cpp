@@ -60,7 +60,7 @@ void checkQuery(const QSqlQuery &query)
 
 QString prepareDataRoot(const QString &requested)
 {
-    const auto path = ez::checkedWorkspaceRoot(requested);
+    const auto path = ez::checkedPath(requested);
     if (!QDir().mkpath(path))
         throw std::runtime_error(QStringLiteral("无法创建数据目录：%1").arg(path).toStdString());
     return path;
@@ -335,7 +335,7 @@ private:
         auto *form = new QFormLayout(page);
         auto *options = new QHBoxLayout;
         profiles_ = new QComboBox(page);
-        profiles_->setPlaceholderText(QStringLiteral("尚未配置独立引擎"));
+        profiles_->setPlaceholderText(QStringLiteral("尚未配置引擎"));
         addEngine_ = new QPushButton(QStringLiteral("添加启动路径"), page);
         options->addWidget(profiles_, 1);
         options->addWidget(addEngine_);
@@ -343,8 +343,12 @@ private:
 
         enginePath_ = new QLineEdit(page);
         enginePath_->setReadOnly(true);
-        enginePath_->setPlaceholderText(QStringLiteral("请选择独立整合包中的 go-webui.bat"));
+        enginePath_->setPlaceholderText(QStringLiteral("请选择已安装的 GPT-SoVITS 中的 go-webui.bat"));
         form->addRow(QStringLiteral("引擎启动文件"), enginePath_);
+        auto *engineHint = new QLabel(QStringLiteral("启动后，GPT-SoVITS 会在所选安装目录中写入运行文件。"), page);
+        engineHint->setObjectName("muted");
+        engineHint->setWordWrap(true);
+        form->addRow(engineHint);
         const auto savedOutput = ez::workspaceSetting("outputRoot");
         auto *output = new QLineEdit(QDir::toNativeSeparators(savedOutput.isEmpty() ? defaultOutput_ : savedOutput), page);
         output->setReadOnly(true);
@@ -365,7 +369,7 @@ private:
 
         const auto saveOutput = [this, output](const QString &selected) {
             try {
-                const auto path = ez::checkedWorkspaceRoot(selected.isEmpty() ? defaultOutput_ : selected);
+                const auto path = ez::checkedPath(selected.isEmpty() ? defaultOutput_ : selected);
                 if (!QDir().mkpath(path) || !QFileInfo(path).isWritable())
                     throw std::runtime_error(QStringLiteral("此目录无法写入，请选择可写目录").toStdString());
                 ez::setWorkspaceSetting("outputRoot", selected.isEmpty() ? QStringLiteral("") : path);
@@ -394,7 +398,7 @@ private:
 
     void openFolder(const QString &location)
     {
-        const auto path = ez::checkedWorkspaceRoot(location);
+        const auto path = ez::checkedPath(location);
         if (!QDir().mkpath(path) || !QDesktopServices::openUrl(QUrl::fromLocalFile(path)))
             throw std::runtime_error(QStringLiteral("无法打开目录：%1").arg(path).toStdString());
     }
@@ -619,7 +623,7 @@ private:
 
     void addEngine()
     {
-        const auto launcher = QFileDialog::getOpenFileName(this, QStringLiteral("选择独立整合包的 go-webui.bat"),
+        const auto launcher = QFileDialog::getOpenFileName(this, QStringLiteral("选择 GPT-SoVITS 的 go-webui.bat"),
                                                           {}, QStringLiteral("启动入口 (go-webui.bat)"));
         if (launcher.isEmpty())
             return;
@@ -709,7 +713,7 @@ int main(int argc, char **argv)
             const auto previous = QSettings().value("dataRoot").toString();
             if (!previous.isEmpty()) {
                 try {
-                    const auto legacy = ez::checkedWorkspaceRoot(previous);
+                    const auto legacy = ez::checkedPath(previous);
                     if (QFileInfo::exists(ez::checkedPath(legacy + "/library.sqlite")))
                         requested = legacy;
                 } catch (const std::exception &) {

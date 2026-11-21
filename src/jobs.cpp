@@ -78,7 +78,7 @@ bool isArchivedWave(const QString &path, const QJsonObject &receipt)
 QString outputRootForRequest(const QString &dataRoot, const QJsonObject &request)
 {
     const auto saved = request.value("output_root").toString();
-    return checkedWorkspaceRoot(saved.isEmpty() ? dataRoot + "/outputs" : saved);
+    return checkedPath(saved.isEmpty() ? dataRoot + "/outputs" : saved);
 }
 
 void checkOutputDirectory(const QString &path)

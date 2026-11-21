@@ -45,7 +45,7 @@ void setWorkspaceSetting(const QString &key, const QString &value)
 QString configuredOutputRoot(const QString &defaultRoot)
 {
     const auto configured = workspaceSetting("outputRoot");
-    return checkedWorkspaceRoot(configured.isEmpty() ? defaultRoot : configured);
+    return checkedPath(configured.isEmpty() ? defaultRoot : configured);
 }
 
 }
