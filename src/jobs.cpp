@@ -20,6 +20,9 @@
 namespace ez {
 namespace {
 
+constexpr int cancelledExitCode = 10;
+constexpr int cancelGraceMs = 5000;
+
 void fail(const QString &message)
 {
     throw std::runtime_error(message.toStdString());
@@ -126,6 +129,8 @@ TaskScheduler::TaskScheduler(QString dataRoot, EngineManager &engine, QObject *p
     }
     query.prepare("UPDATE jobs SET state='interrupted' WHERE state='running'");
     execute(query);
+    cancelTimeout_.setSingleShot(true);
+    connect(&cancelTimeout_, &QTimer::timeout, this, &TaskScheduler::forceCancel);
     connect(&engine_, &EngineManager::readinessChanged, this, [this](bool ready) {
         if (ready)
             next();
@@ -133,11 +138,16 @@ TaskScheduler::TaskScheduler(QString dataRoot, EngineManager &engine, QObject *p
             worker_.kill();
     });
     connect(&worker_, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
+        if (running() && cancelling_ && (status != QProcess::NormalExit || (code != 0 && code != cancelledExitCode)))
+            forceCancel();
         finish(code == 0 && status == QProcess::NormalExit, {});
     });
     connect(&worker_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
-        if (error == QProcess::FailedToStart)
+        if (error == QProcess::FailedToStart) {
+            if (cancelling_)
+                forceCancel();
             finish(false, worker_.errorString());
+        }
     });
 }
 
@@ -217,10 +227,22 @@ void TaskScheduler::finish(bool processSucceeded, QString message)
     const auto job = std::exchange(jobPath_, {});
     const auto request = std::exchange(activeRequest_, {});
     const bool cancelled = std::exchange(cancelling_, false);
+    cancelTimeout_.stop();
     QJsonObject result;
     try {
         if (cancelled) {
-            update(id, "cancelled");
+            removeStagedWeights(id, request);
+            const auto message = restartEngine_ ? QStringLiteral("已停止本程序启动的引擎进程")
+                                                : QStringLiteral("当前任务已停止");
+            update(id, "cancelled", message);
+            if (!stopping_) {
+                if (restartEngine_)
+                    QTimer::singleShot(750, this, &TaskScheduler::continueAfterCancellation);
+                else
+                    QTimer::singleShot(0, this, &TaskScheduler::next);
+            }
+            restartEngine_ = false;
+            emit this->cancelled(id);
             return;
         }
         if (processSucceeded) {
@@ -288,17 +310,75 @@ void TaskScheduler::update(const QString &id, const QString &state, const QStrin
 
 void TaskScheduler::cancel(const QString &id)
 {
+    if (id.isEmpty())
+        return;
     if (active_ == id) {
+        if (cancelling_)
+            return;
         cancelling_ = true;
-        engine_.stop();
-        worker_.kill();
+        try {
+            save(jobPath_ + "/cancel.requested", {});
+            cancelTimeout_.start(cancelGraceMs);
+            update(id, "running", QStringLiteral("正在取消任务…"));
+        } catch (const std::exception &) {
+            forceCancel();
+        }
         return;
     }
     QSqlQuery query;
     query.prepare("UPDATE jobs SET state='cancelled' WHERE id=? AND state='queued'");
     query.addBindValue(id);
     execute(query);
-    emit changed();
+    if (query.numRowsAffected() == 1) {
+        emit changed();
+        emit cancelled(id);
+    }
+}
+
+void TaskScheduler::forceCancel()
+{
+    if (!cancelling_ || !running())
+        return;
+    cancelTimeout_.stop();
+    if (engine_.active()) {
+        restartEngine_ = true;
+        engine_.stop();
+    }
+    if (worker_.state() != QProcess::NotRunning)
+        worker_.kill();
+}
+
+void TaskScheduler::continueAfterCancellation()
+{
+    if (stopping_ || running() || engine_.active())
+        return;
+    try {
+        QSqlQuery query;
+        query.prepare("SELECT launcher FROM jobs WHERE state='queued' AND launcher=? COLLATE NOCASE LIMIT 1");
+        query.addBindValue(engine_.root() + "/go-webui.bat");
+        execute(query);
+        if (query.next())
+            engine_.start(query.value(0).toString(), root_ + "/engine-start.log");
+    } catch (const std::exception &error) {
+        emit failed(QStringLiteral("无法恢复排队任务。可在工作台重启引擎。%1").arg(QString::fromUtf8(error.what())));
+    }
+}
+
+void TaskScheduler::removeStagedWeights(const QString &id, const QJsonObject &request)
+{
+    const QStringList families{"v2", "v2Pro", "v2ProPlus", "v5dev", "v5turbo"};
+    const auto family = request.value("family").toString();
+    const auto token = QUuid(id).toString(QUuid::Id128);
+    if (request.value("operation") != "synthesize" || !families.contains(family) || QUuid(id).isNull())
+        return;
+    for (const auto &file : {"/GPT_weights_" + family + "/ez_" + token + ".ckpt",
+                             "/SoVITS_weights_" + family + "/ez_" + token + ".pth"}) {
+        try {
+            QFile::remove(checkedPath(engine_.root() + file));
+        } catch (const std::exception &) {
+            // Avoid following a path that changed while the task was running.
+        }
+    }
 }
 
 void TaskScheduler::stop()
@@ -306,7 +386,10 @@ void TaskScheduler::stop()
     stopping_ = true;
     if (running()) {
         cancel(active_);
-        worker_.waitForFinished(3000);
+        if (!worker_.waitForFinished(cancelGraceMs)) {
+            forceCancel();
+            worker_.waitForFinished(1000);
+        }
     }
 }
 

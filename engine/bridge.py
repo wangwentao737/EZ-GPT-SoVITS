@@ -5,10 +5,10 @@ import importlib.util
 import json
 import os
 import re
-import shutil
 import sys
 import time
 import uuid
+from concurrent.futures import TimeoutError
 from pathlib import Path
 
 from gradio_client import Client, handle_file
@@ -67,11 +67,37 @@ def connect(port, download_files=False):
     )
 
 
-def invoke(client, endpoint, *arguments):
+class Cancelled(Exception):
+    pass
+
+
+def check_cancel(marker):
+    if marker is not None and marker.exists():
+        raise Cancelled
+
+
+def invoke(client, endpoint, *arguments, cancel=None, stop=None):
     matches = [item for item in client.config["dependencies"] if item["api_name"] == endpoint]
     if len(matches) != 1 or len(matches[0]["inputs"]) != len(arguments):
         raise ValueError(f"目标引擎接口与适配契约不一致：{endpoint}")
-    return client.predict(*arguments, api_name=f"/{endpoint}")
+    if cancel is None:
+        return client.predict(*arguments, api_name=f"/{endpoint}")
+    check_cancel(cancel)
+    pending = client.submit(*arguments, api_name=f"/{endpoint}")
+    while not pending.done():
+        try:
+            pending.result(timeout=0.2)
+        except TimeoutError:
+            if not cancel.exists():
+                continue
+            if stop is not None:
+                # Wait for the original callback as well, since a stop result alone
+                # does not confirm that the original operation released the engine.
+                invoke(client, stop)
+                pending.result(timeout=2)
+            raise Cancelled from None
+    check_cancel(cancel)
+    return pending.result()
 
 
 def inspect_wav(path, reference=False):
@@ -91,22 +117,39 @@ def weight_directory(kind, family):
     return f"{kind}_weights_{family}"
 
 
-def stage_weight(source, root, kind, family):
+def stage_weight(source, root, kind, family, job, cancel):
     extension = ".ckpt" if kind == "GPT" else ".pth"
     if source.suffix.lower() != extension or source.stat().st_size <= 0:
         raise ValueError(f"{kind} 权重格式无效：{source.name}")
     directory = safe_path(root / weight_directory(kind, family), root)
     directory.mkdir(exist_ok=True)
-    relative = f"{directory.name}/ez_{uuid.uuid4().hex}{extension}"
+    token = job.name.replace("-", "")
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        token = uuid.uuid4().hex
+    relative = f"{directory.name}/ez_{token}{extension}"
     target = safe_path(root / relative, root)
     try:
         os.link(source, target)
+    except FileExistsError:
+        raise
     except OSError:
-        shutil.copyfile(source, target)
+        copy_with_cancel(source, target, cancel)
     return relative
 
 
-def synthesize(client, engine, data, job, request):
+def copy_with_cancel(source, target, cancel):
+    writer = target.open("xb")
+    try:
+        with writer, source.open("rb") as reader:
+            while block := reader.read(1024 * 1024):
+                check_cancel(cancel)
+                writer.write(block)
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
+
+
+def synthesize(client, engine, data, job, request, cancel):
     family = request["family"]
     if family not in FAMILIES:
         raise ValueError("当前模型家族尚未适配")
@@ -123,15 +166,18 @@ def synthesize(client, engine, data, job, request):
         raise ValueError("请选择有效的显卡编号")
     try:
         for kind, key in (("GPT", "gpt"), ("SoVITS", "sovits")):
-            staged.append(stage_weight(safe_path(request[key], data), engine, kind, family))
+            check_cancel(cancel)
+            staged.append(stage_weight(safe_path(request[key], data), engine, kind, family, job, cancel))
         invoke(client, "switch_version", family)
         invoke(client, "change_choices")
-        start_requested = True
+        check_cancel(cancel)
         args = (BERT, HUBERT, gpu, *staged, True)
         invoke(client, "change_tts_inference", *args)
+        start_requested = True
 
         deadline = time.monotonic() + 150
         while True:
+            check_cancel(cancel)
             try:
                 tts = connect(PORT_TTS, download_files=job)
                 break
@@ -147,7 +193,7 @@ def synthesize(client, engine, data, job, request):
             15, 1.0, 1.0, request.get("split", "凑四句一切"), 1,
             float(request.get("speed", 1)), False, True, 0.3, seed, seed < 0,
             False, False, 1.35, 4 if family == "v5turbo" else 32, False,
-            1.30 if family == "v5dev" else 0.0,
+            1.30 if family == "v5dev" else 0.0, cancel=cancel,
         )
         audio_path, actual_seed = result
         path = safe_path(audio_path, job)
@@ -160,9 +206,11 @@ def synthesize(client, engine, data, job, request):
                 temporary, mode="w", samplerate=source.samplerate, channels=source.channels
             ) as destination:
                 for block in source.blocks(blocksize=65536):
+                    check_cancel(cancel)
                     destination.write(block)
         with temporary.open("rb") as audio:
             digest = hashlib.file_digest(audio, "sha256").hexdigest()
+        check_cancel(cancel)
         publish(audio=str(temporary), seed=int(actual_seed), duration=info.duration,
                 bytes=temporary.stat().st_size, sha256=digest)
     finally:
@@ -181,7 +229,7 @@ def require_outputs(folder, glob, stage):
     return files
 
 
-def transcribe(engine, project, request, gpu):
+def transcribe(engine, project, request, gpu, cancel):
     # The embedded Python distribution omits site initialization and its .pth hooks.
     if importlib.util.find_spec("distutils") is None:
         from _distutils_hack import add_shim
@@ -216,19 +264,21 @@ def transcribe(engine, project, request, gpu):
     )
     labels = []
     for candidate in require_outputs(source, "*.wav", "切片"):
+        check_cancel(cancel)
         clip = safe_path(candidate, source)
         inspect_wav(clip)
         response = model.generate(input=str(clip))
         text = response[0].get("text", "").strip() if response else ""
         text = text.replace("|", "｜").replace("\n", " ")
         labels.append(f"{clip}|{source.name}|{language.upper()}|{text}")
+    check_cancel(cancel)
     destination.mkdir()
     annotation = safe_path(destination / f"{source.name}.list", project)
     annotation.write_text("\n".join(labels) + "\n", encoding="utf-8")
     publish(annotation=str(annotation))
 
 
-def run_training(client, engine, data, request):
+def run_training(client, engine, data, job, request, cancel):
     stage = request["operation"]
     project = safe_path(request["project"], data)
     project.mkdir(parents=True, exist_ok=True)
@@ -241,15 +291,16 @@ def run_training(client, engine, data, request):
         destination = safe_path(request["destination"], project)
         destination.mkdir()
         invoke(client, "open_slice", source, shell_path(destination, project),
-               -34, 4000, 300, 10, 500, 0.9, 0.25, 1)
+               -34, 4000, 300, 10, 500, 0.9, 0.25, 1, cancel=cancel, stop="close_slice")
         clips = require_outputs(destination, "*.wav", "切片")
         for clip in clips:
+            check_cancel(cancel)
             inspect_wav(clip)
         publish(clips=[str(clip) for clip in clips])
         return
 
     if stage == "asr":
-        transcribe(engine, project, request, gpu)
+        transcribe(engine, project, request, gpu, cancel)
         return
 
     family = request["family"]
@@ -266,6 +317,7 @@ def run_training(client, engine, data, request):
         clips = safe_path(request["source"], project)
         seen = set()
         for line in annotation.read_text(encoding="utf-8-sig").splitlines():
+            check_cancel(cancel)
             source, speaker, language, text = line.split("|", maxsplit=3)
             clip = safe_path(source, clips)
             if not speaker or not language or not text.strip() or clip in seen:
@@ -276,7 +328,7 @@ def run_training(client, engine, data, request):
             raise ValueError("至少需要两个有效录音片段")
         invoke(client, "open1abc", family, shell_path(annotation, project), shell_path(clips, project),
                experiment, gpu, gpu, gpu,
-               BERT, HUBERT, sovits)
+               BERT, HUBERT, sovits, cancel=cancel, stop="close1abc")
         names = experiment_dir / "2-name2text.txt"
         semantic = experiment_dir / "6-name2semantic.tsv"
         for file, header in ((names, 0), (semantic, 1)):
@@ -294,9 +346,10 @@ def run_training(client, engine, data, request):
     if stage == "train_sovits":
         discriminator = "" if family.startswith("v5") else sovits.replace("/s2G", "/s2D")
         invoke(client, "open1Ba", family, batch, epochs, experiment, 0.4, True, True, epochs,
-               gpu, sovits, discriminator, family.startswith("v5"), 32)
+               gpu, sovits, discriminator, family.startswith("v5"), 32, cancel=cancel, stop="close1Ba")
     elif stage == "train_gpt":
-        invoke(client, "open1Bb", batch, epochs, experiment, False, True, True, epochs, gpu, gpt)
+        invoke(client, "open1Bb", batch, epochs, experiment, False, True, True, epochs, gpu, gpt,
+               cancel=cancel, stop="close1Bb")
     else:
         raise ValueError(f"未知训练阶段：{stage}")
     changed = [path for path in require_outputs(weights, pattern, stage)
@@ -306,9 +359,10 @@ def run_training(client, engine, data, request):
     weight = max(changed, key=lambda path: path.stat().st_mtime_ns)
     saved = safe_path(project / "weights" / experiment / weight.name, project)
     saved.parent.mkdir(parents=True, exist_ok=True)
-    temporary = saved.with_name(saved.name + ".partial")
+    temporary = safe_path(job / f"weight-{uuid.uuid4().hex}.partial", job)
     try:
-        shutil.copyfile(safe_path(weight, engine), temporary)
+        copy_with_cancel(safe_path(weight, engine), temporary, cancel)
+        check_cancel(cancel)
         os.replace(temporary, saved)
     finally:
         temporary.unlink(missing_ok=True)
@@ -320,13 +374,18 @@ def main(request_file):
     engine = safe_path(request["engine"])
     data = safe_path(request["data"])
     job = safe_path(request["job"], data)
+    cancel = safe_path(job / "cancel.requested", job)
     os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
     client = connect(PORT_WEBUI)
+    check_cancel(cancel)
     if request["operation"] == "synthesize":
-        synthesize(client, engine, data, job, request)
+        synthesize(client, engine, data, job, request, cancel)
     else:
-        run_training(client, engine, data, request)
+        run_training(client, engine, data, job, request, cancel)
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    try:
+        main(sys.argv[1])
+    except Cancelled:
+        sys.exit(10)

@@ -3,6 +3,7 @@
 #include <QJsonObject>
 #include <QObject>
 #include <QProcess>
+#include <QTimer>
 
 namespace ez {
 
@@ -23,11 +24,15 @@ public:
 signals:
     void changed();
     void completed(const QString &id, const QJsonObject &result);
+    void cancelled(const QString &id);
     void failed(const QString &message);
 
 private:
     void next();
     void finish(bool processSucceeded, QString message);
+    void forceCancel();
+    void continueAfterCancellation();
+    void removeStagedWeights(const QString &id, const QJsonObject &request);
     void update(const QString &id, const QString &state, const QString &message = {},
                 const QJsonObject &result = {});
 
@@ -37,8 +42,10 @@ private:
     QJsonObject activeRequest_;
     EngineManager &engine_;
     QProcess worker_;
+    QTimer cancelTimeout_;
     bool cancelling_ = false;
     bool stopping_ = false;
+    bool restartEngine_ = false;
 };
 
 }

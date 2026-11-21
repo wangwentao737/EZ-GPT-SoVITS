@@ -590,8 +590,9 @@ int main(int argc, char **argv)
     const QCommandLineOption probeOption("probe-engine", "Start, check and stop a test engine.", "go-webui.bat");
     const QCommandLineOption jobOption("probe-job", "Run a test job using a started test engine.", "request.json");
     const QCommandLineOption queueOption("probe-queue", "Run the persistent scheduler in command-line verification.");
+    const QCommandLineOption cancelOption("probe-cancel-file", "Cancel the first queue job when this verification file is created.", "path");
     const QCommandLineOption smokeOption("smoke-test", "Show the workspace and quit after startup.");
-    parser.addOptions({dataOption, probeOption, jobOption, queueOption, smokeOption});
+    parser.addOptions({dataOption, probeOption, jobOption, queueOption, cancelOption, smokeOption});
     parser.process(app);
 
     try {
@@ -634,16 +635,39 @@ int main(int argc, char **argv)
                     if (--remaining == 0)
                         app.exit(0);
                 });
+                QObject::connect(&scheduler, &ez::TaskScheduler::cancelled, &app, [&] {
+                    if (--remaining == 0)
+                        app.exit(0);
+                });
                 QObject::connect(&scheduler, &ez::TaskScheduler::failed, &app, [&app] { app.exit(3); });
                 QObject::connect(&engine, &ez::EngineManager::statusChanged, &app, [&] {
                     if (!engine.active() && !scheduler.running())
                         app.exit(2);
                 });
+                QString first;
                 for (const auto &value : requests) {
                     const auto request = value.toObject();
                     if (request.value("operation").toString().isEmpty())
                         return 3;
-                    scheduler.enqueue(parser.value(probeOption), request);
+                    const auto id = scheduler.enqueue(parser.value(probeOption), request);
+                    if (first.isEmpty())
+                        first = id;
+                }
+                QTimer cancellation;
+                if (parser.isSet(cancelOption)) {
+                    const auto marker = ez::checkedPath(parser.value(cancelOption));
+                    QObject::connect(&cancellation, &QTimer::timeout, &app, [&, marker] {
+                        if (!QFileInfo::exists(marker))
+                            return;
+                        cancellation.stop();
+                        try {
+                            scheduler.cancel(first);
+                        } catch (const std::exception &error) {
+                            QTextStream(stderr) << failureMessage(error) << Qt::endl;
+                            app.exit(3);
+                        }
+                    });
+                    cancellation.start(50);
                 }
                 return app.exec();
             }
