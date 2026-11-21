@@ -200,6 +200,13 @@ QString jobResourceIssue(const QString &engine, const QString &data, const QJson
     return {};
 }
 
+bool readableTrainingCheckpoint(const QString &path)
+{
+    QFile file(checkedPath(path));
+    return QFileInfo(file).isFile() && file.open(QIODevice::ReadOnly)
+        && file.peek(4) == "PK\x03\x04" && checkpointHeader(file, false);
+}
+
 QList<ResourceCheck> inspectResources(const QString &launcher, const QString &family, const QString &data,
                                       const QString &output, const QJsonObject &voice,
                                       const QMap<QString, QString> &interfaces, const QString &only,

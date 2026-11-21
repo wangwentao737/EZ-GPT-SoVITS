@@ -12,6 +12,7 @@ QString operationLabel(const QString &operation);
 QString resourceIssue(const QString &engine, const QString &operation, const QString &family,
                       const QString &asrLanguage = QStringLiteral("zh"), const std::atomic_bool *cancelled = nullptr);
 QString jobResourceIssue(const QString &engine, const QString &data, const QJsonObject &request);
+bool readableTrainingCheckpoint(const QString &path);
 
 struct ResourceCheck {
     QString id;

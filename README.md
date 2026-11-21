@@ -24,7 +24,7 @@ cmake --install build --config Release --prefix (Join-Path $PWD "out/portable")
 
 同一套夹具可用 `python -X utf8 -B tests/resource-preflight.py` 验证缺少启动资源、接口变化和损坏权重的处理，以及失败后的真实合成。
 
-`python -X utf8 -B tests/training-integrity.py` 使用独立引擎实测预处理、样本错配拦截、两阶段训练和新权重试听。训练中断后可以从最后成功的阶段继续，重跑该阶段会建立独立检查点目录。
+`python -X utf8 -B tests/training-integrity.py` 使用独立引擎实测预处理、样本错配拦截、两阶段训练和新权重试听。`python -X utf8 -B tests/training-resume.py` 验证 v5turbo 的 GPT 和 SoVITS 在完成一轮后中断、恢复，以及配置不匹配时的拦截。
 
 ## 开发接入
 
@@ -33,6 +33,7 @@ cmake --install build --config Release --prefix (Join-Path $PWD "out/portable")
 - 在「语音合成」导入配套的 GPT 和 SoVITS 权重、参考音频和参考文本。选择声音并输入台词，生成后的 WAV 可试听或另存。
 - 在「声音与素材」按类型、项目或声音筛选。选择一项可查看文件位置和关联任务，也可以重命名声音预设。未被引用的素材库副本可以移至回收站。
 - 在「训练项目」创建项目、导入录音、切片及校对。保存标注并准备数据后，启动 SoVITS 和 GPT 训练。选中片段可用作训练后试听的参考音频。
+- 训练中断后重新打开项目。若上次的 v5turbo 任务已保存检查点，且显卡、批量和轮数一致，可点「从检查点继续」。点击「开始训练」则重新运行当前阶段。训练完成的阶段会保留。
 - 「任务记录」保存任务状态、参数与日志路径。取消时会先请求停止当前任务，超时后关闭本程序启动的引擎进程。队列里仍有任务时会尝试重启引擎并继续执行。失败的合成可重试，训练任务从项目内重新提交。
 
 引擎副本、测试样本、Qt 开发依赖及发行产物均由 Git 忽略。开发联调使用独立的引擎副本，原始安装只用于只读核对。

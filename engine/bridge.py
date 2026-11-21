@@ -32,6 +32,13 @@ FAMILIES = {
     "v5dev": ("s1v3.ckpt", "gsv-v5-pretrained/s2Gv5dev.pth"),
     "v5turbo": ("s1v3.ckpt", "gsv-v5-pretrained/s2Gv5turbo.pth"),
 }
+RESUME_WEBUI = "fb351d2094f48b3fef480a6bc2377043a91bbdd9a30cca1ba4b1e8da3d762330"
+RESUME_TRAINERS = {
+    "train_sovits": ("GPT_SoVITS/s2_train_v3_lora.py",
+                     "9e1aa4a3b2f3450032831ca4a490dcfd13342f60c83ea2eaba36e4c987d99f4a"),
+    "train_gpt": ("GPT_SoVITS/s1_train.py",
+                  "fa499153871d8ba79dd9e07a4494c5844bfb67875c2791718ea0fd787353bbbe"),
+}
 
 
 def safe_path(value, root=None):
@@ -420,6 +427,104 @@ def new_training_run(engine, dataset, artifacts, cancel):
     return run
 
 
+def sha256_file(path, cancel):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while block := stream.read(1024 * 1024):
+            check_cancel(cancel)
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def resume_signature(engine, dataset, artifacts, snapshot, settings, base, cancel):
+    if settings["family"] != "v5turbo" or snapshot is None:
+        return None
+    stage = settings["operation"]
+    trainer, expected = RESUME_TRAINERS[stage]
+    if (sha256_file(safe_path(engine / "webui.py", engine), cancel) != RESUME_WEBUI
+            or sha256_file(safe_path(engine / trainer, engine), cancel) != expected):
+        return None
+    config = ("s2.json" if stage == "train_sovits" else "s1longer-v2.yaml")
+    inputs = hashlib.sha256()
+    for path in artifacts:
+        inputs.update(path.as_posix().encode("utf-8") + b"\0")
+        inputs.update(bytes.fromhex(sha256_file(safe_path(dataset / path, dataset), cancel)))
+    return {
+        "version": 1,
+        "annotation": snapshot["annotation_sha256"],
+        "inputs": inputs.hexdigest(),
+        "config": sha256_file(safe_path(engine / "config.py", engine), cancel),
+        "train_config": sha256_file(safe_path(engine / "GPT_SoVITS/configs" / config, engine), cancel),
+        "base": sha256_file(safe_path(engine / base, engine), cancel),
+    }
+
+
+def find_resume_checkpoint(data, job, engine, settings, signature, parent_id, cancel):
+    if signature is None:
+        raise ValueError("此引擎版本或数据集暂不支持从检查点继续，请重跑当前阶段。")
+    if not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", parent_id) or parent_id == job.name:
+        raise ValueError("续训任务编号无效")
+    previous = safe_path(data / "jobs" / parent_id / "training-run.json", data)
+    receipt = json.loads(previous.read_text(encoding="utf-8"))
+    if any(receipt.get(key) != value for key, value in settings.items()) or receipt.get("resume_signature") != signature:
+        raise ValueError("训练设置、数据或引擎文件已变更，请重跑当前阶段。")
+    logs = safe_path(engine / "logs", engine)
+    original = safe_path(receipt["checkpoints"], logs)
+    if original.parent != logs or not re.fullmatch(r"ez_[0-9a-f]{32}", original.name):
+        raise ValueError("原任务检查点目录无效")
+    is_sovits = settings["operation"] == "train_sovits"
+    if is_sovits:
+        checkpoint = safe_path(original / "logs_s2_v5turbo_lora_32/G_233333333333.pth", original)
+    else:
+        directory = safe_path(original / "logs_s1_v5turbo/ckpt", original)
+        candidates = []
+        for path in directory.glob("epoch=*-step=*.ckpt"):
+            match = re.fullmatch(r"epoch=(\d+)-step=(\d+)\.ckpt", path.name)
+            if match:
+                candidates.append((int(match[1]), int(match[2]), path))
+        if not candidates:
+            raise ValueError("找不到可恢复的 GPT 检查点")
+        candidates.sort(reverse=True)
+        checkpoint = next((path for _, _, file in candidates
+                           if zipfile.is_zipfile(path := safe_path(file, directory))), None)
+        if checkpoint is None:
+            raise ValueError("GPT 检查点尚未写完，请重跑当前阶段。")
+    if not checkpoint.is_file() or not zipfile.is_zipfile(checkpoint):
+        raise ValueError("检查点缺失或尚未写完，请重跑当前阶段。")
+    check_cancel(cancel)
+    try:
+        import torch
+        from pathlib import WindowsPath
+
+        with torch.serialization.safe_globals([WindowsPath]):
+            state = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
+        if is_sovits:
+            epoch = state["iteration"]
+            valid = bool(state["model"] and state["optimizer"]["state"])
+        else:
+            epoch = state["epoch"] + 1
+            valid = bool(state["state_dict"] and state["optimizer_states"] and state["loops"])
+    except Exception as error:
+        raise ValueError("检查点无法读取训练状态，请重跑当前阶段。") from error
+    if not valid or not 0 < epoch < settings["epochs"]:
+        raise ValueError("检查点的训练轮次或优化器状态不可用于继续训练")
+    check_cancel(cancel)
+    return checkpoint, checkpoint.relative_to(original), epoch, None if is_sovits else state
+
+
+def require_resume_trace(log, offset, stage, run, epoch):
+    with log.open("rb") as stream:
+        stream.seek(offset)
+        for raw in stream:
+            line = raw.replace(b"\0", b"").strip()
+            if stage == "train_sovits" and line == f"start training from epoch {epoch + 1}".encode():
+                return
+            if (stage == "train_gpt" and b"Restored all states from the checkpoint at " in line
+                    and run.name.encode() in line):
+                return
+    raise ValueError("引擎没有确认从检查点恢复，未采用本次权重。请查看启动日志或重跑该阶段。")
+
+
 def run_training(client, engine, data, job, request, cancel):
     stage = request["operation"]
     project = safe_path(request["project"], data)
@@ -488,25 +593,62 @@ def run_training(client, engine, data, job, request, cancel):
             raise ValueError("当前标注与预处理版本不同，请重新准备训练数据")
         snapshot = labels
     artifacts, sample_count = verify_dataset(experiment_dir, family, snapshot, cancel)
-    run = new_training_run(engine, experiment_dir, artifacts, cancel)
     batch = int(request.get("batch", 1))
     epochs = int(request.get("epochs", 2))
+    settings = {"operation": stage, "family": family, "gpu": gpu, "batch": batch, "epochs": epochs,
+                "dataset": str(experiment_dir), "project": str(project)}
+    signature = resume_signature(engine, experiment_dir, artifacts, snapshot, settings,
+                                 sovits if stage == "train_sovits" else gpt, cancel)
+    parent = request.get("resume_job")
+    resume = find_resume_checkpoint(data, job, engine, settings, signature, parent, cancel) if parent else None
+    completed_epoch = 0
+    run = new_training_run(engine, experiment_dir, artifacts, cancel)
+    if resume:
+        source, relative, completed_epoch, state = resume
+        del resume
+        target = safe_path(run / relative, run)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if state is None:
+            copy_with_cancel(source, target, cancel)
+        else:
+            import torch
+
+            # Lightning records output_dir as a WindowsPath, which its default
+            # weights-only loader rejects. Point the copied state at the new run.
+            state["hyper_parameters"]["output_dir"] = str(target.parent.parent)
+            with target.open("xb") as stream:
+                torch.save(state, stream)
+            check_cancel(cancel)
+        del state
+
     attempt = safe_path(job / "training-run.json", job)
-    attempt.write_text(json.dumps({
-        "operation": stage, "family": family, "gpu": gpu, "batch": batch, "epochs": epochs,
-        "dataset": str(experiment_dir), "checkpoints": str(run), "sample_count": sample_count,
+    partial = safe_path(job / "training-run.json.partial", job)
+    partial.write_text(json.dumps({
+        **settings, "checkpoints": str(run), "sample_count": sample_count, "resume_signature": signature,
+        "resume_job": parent, "resume_epoch": completed_epoch,
     }, ensure_ascii=False), encoding="utf-8")
+    os.replace(partial, attempt)
     invoke(client, "switch_version", family)
     kind, extension = ("SoVITS", "pth") if stage == "train_sovits" else ("GPT", "ckpt")
     weights = safe_path(engine / weight_directory(kind, family), engine)
-    pattern = f"{run.name}*.{extension}"
+    interval = 1 if signature is not None else epochs
+    engine_log = safe_path(data / "engine-start.log", data)
+    offset = engine_log.stat().st_size if completed_epoch else 0
     if stage == "train_sovits":
         discriminator = "" if family.startswith("v5") else sovits.replace("/s2G", "/s2D")
-        invoke(client, "open1Ba", family, batch, epochs, run.name, 0.4, True, True, epochs,
+        invoke(client, "open1Ba", family, batch, epochs, run.name, 0.4, True, True, interval,
                gpu, sovits, discriminator, family.startswith("v5"), 32, cancel=cancel, stop="close1Ba")
     else:
-        invoke(client, "open1Bb", batch, epochs, run.name, False, True, True, epochs, gpu, gpt,
+        invoke(client, "open1Bb", batch, epochs, run.name, False, True, True, interval, gpu, gpt,
                cancel=cancel, stop="close1Bb")
+    if completed_epoch:
+        require_resume_trace(engine_log, offset, stage, run, completed_epoch)
+    if signature is None:
+        pattern = f"{run.name}*.{extension}"
+    elif stage == "train_sovits":
+        pattern = f"{run.name}_e{epochs}_s*_l32.pth"
+    else:
+        pattern = f"{run.name}-e{epochs}.ckpt"
     weight = max(require_outputs(weights, pattern, stage), key=lambda path: path.stat().st_mtime_ns)
     saved = safe_path(project / "weights" / experiment / weight.name, project)
     saved.parent.mkdir(parents=True, exist_ok=True)
@@ -517,7 +659,8 @@ def run_training(client, engine, data, job, request, cancel):
         os.replace(temporary, saved)
     finally:
         temporary.unlink(missing_ok=True)
-    publish(weight=str(saved), checkpoints=str(run), dataset=str(experiment_dir), sample_count=sample_count)
+    publish(weight=str(saved), checkpoints=str(run), dataset=str(experiment_dir), sample_count=sample_count,
+            resume_epoch=completed_epoch)
 
 
 def main(request_file):

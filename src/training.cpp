@@ -1,6 +1,7 @@
 #include "training.h"
 #include "engine.h"
 #include "jobs.h"
+#include "resources.h"
 
 #include <QAudioOutput>
 #include <QComboBox>
@@ -16,7 +17,9 @@
 #include <QLineEdit>
 #include <QMediaPlayer>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QSaveFile>
+#include <QShowEvent>
 #include <QSpinBox>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -90,6 +93,7 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
                 status_->setText(QString::fromUtf8(error.what()));
             }
         });
+        return control;
     };
     button(selection, QStringLiteral("新建项目"), [this] { addProject(); });
     auto *files = new QHBoxLayout;
@@ -148,8 +152,14 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     epochs_->setValue(4);
     training->addWidget(epochs_);
     button(training, QStringLiteral("开始训练"), [this] {
-        submit(project_.value("sovits").toString().isEmpty() ? "train_sovits" : "train_gpt");
+        submit(nextTrainingStage());
     });
+    resume_ = button(training, QStringLiteral("从检查点继续"), [this] {
+        submit(nextTrainingStage(), true);
+    });
+    resume_->setVisible(false);
+    for (auto *control : {gpu_, batch_, epochs_})
+        connect(control, &QSpinBox::valueChanged, this, [this] { showState(); });
     button(training, QStringLiteral("试听并入库"), [this] { importVoice(); });
     training->addStretch();
     layout->addLayout(training);
@@ -251,6 +261,12 @@ void TrainingPanel::loadProject()
     readClips();
     if (project_.contains("annotation"))
         loadLabels(project_.value("annotation").toString());
+    const auto settings = project_.value("training_settings").toObject();
+    if (!settings.isEmpty()) {
+        gpu_->setValue(settings.value("gpu").toString().toInt());
+        batch_->setValue(settings.value("batch").toInt(1));
+        epochs_->setValue(settings.value("epochs").toInt(4));
+    }
     status_->clear();
     showState();
 }
@@ -366,11 +382,14 @@ void TrainingPanel::saveLabels()
     showState();
 }
 
-void TrainingPanel::submit(const QString &operation)
+void TrainingPanel::submit(const QString &operation, bool resume)
 {
     require(!project_.isEmpty() && !busy(), QStringLiteral("请选择项目并等待当前任务结束"));
     const auto launcher = launcher_();
     require(!launcher.isEmpty(), QStringLiteral("请在「设置」中添加并选择引擎"));
+    const auto training = operation == "train_sovits" || operation == "train_gpt";
+    if (training && labels_->rowCount() > 0)
+        saveLabels();
     auto request = project_;
     request["operation"] = operation;
     request["project"] = project_.value("directory");
@@ -389,7 +408,18 @@ void TrainingPanel::submit(const QString &operation)
         require(project_.contains("dataset") && project_.value("engine") == launcher,
                 QStringLiteral("请先用当前引擎准备数据"));
     }
-    const auto task = scheduler_.enqueue(launcher, request, project_);
+    if (resume) {
+        const auto previous = resumeJob(operation);
+        require(!previous.isEmpty(), QStringLiteral("没有与当前设置匹配的可读检查点，请重跑当前阶段"));
+        request["resume_job"] = previous;
+    }
+    auto state = project_;
+    if (training) {
+        state["training_settings"] = QJsonObject{{"gpu", request.value("gpu")}, {"batch", request.value("batch")},
+                                                  {"epochs", request.value("epochs")}};
+    }
+    const auto task = scheduler_.enqueue(launcher, request, state);
+    project_ = state;
     project_["pending"] = task;
     showState();
 }
@@ -444,6 +474,7 @@ void TrainingPanel::complete(const QString &id, const QJsonObject &result, bool 
     if (live && operation == "train_sovits") {
         auto next = request;
         next["operation"] = "train_gpt";
+        next.remove("resume_job");
         state["pending"] = scheduler_.enqueue(launcher, next, state);
         if (current)
             project_ = state;
@@ -475,8 +506,76 @@ bool TrainingPanel::busy() const
     return query.exec() && query.next();
 }
 
+QString TrainingPanel::nextTrainingStage() const
+{
+    return project_.value("sovits").toString().isEmpty() ? "train_sovits" : "train_gpt";
+}
+
+QString TrainingPanel::resumeJob(const QString &operation) const
+{
+    const auto launcher = launcher_();
+    if (launcher.isEmpty() || project_.value("family") != "v5turbo" || project_.value("engine") != launcher
+        || project_.value("dataset").toString().isEmpty() || project_.contains("gpt"))
+        return {};
+    QSqlQuery query;
+    query.prepare("SELECT id,state,request FROM jobs WHERE launcher=? AND operation=? ORDER BY rowid DESC");
+    query.addBindValue(launcher);
+    query.addBindValue(operation);
+    if (!query.exec())
+        return {};
+    const QRegularExpression jobId("^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$");
+    const QRegularExpression runId("^ez_[0-9a-f]{32}$");
+    while (query.next()) {
+        const auto request = QJsonDocument::fromJson(query.value(2).toByteArray()).object();
+        if (request.value("id") != project_.value("id") || request.value("experiment") != project_.value("experiment"))
+            continue;
+        const auto id = query.value(0).toString();
+        const auto state = query.value(1).toString();
+        if (state == "succeeded" || state == "queued" || state == "running")
+            return {};
+        if (!jobId.match(id).hasMatch() || request.value("gpu").toString() != QString::number(gpu_->value())
+            || request.value("batch").toInt() != batch_->value() || request.value("epochs").toInt() != epochs_->value()
+            || request.value("annotation") != project_.value("annotation"))
+            continue;
+        try {
+            QFile record(checkedPath(root_ + "/jobs/" + id + "/training-run.json"));
+            if (!record.open(QIODevice::ReadOnly) || record.size() > 8 * 1024 * 1024)
+                continue;
+            const auto metadata = QJsonDocument::fromJson(record.readAll()).object();
+            if (!metadata.value("resume_signature").isObject())
+                continue;
+            const auto logs = engineRoot(launcher) + "/logs";
+            const QFileInfo run(checkedPath(metadata.value("checkpoints").toString()));
+            if (run.absolutePath().compare(logs, Qt::CaseInsensitive) != 0 || !runId.match(run.fileName()).hasMatch())
+                continue;
+            const auto directory = run.absoluteFilePath();
+            if (operation == "train_sovits") {
+                if (readableTrainingCheckpoint(directory + "/logs_s2_v5turbo_lora_32/G_233333333333.pth"))
+                    return id;
+            } else {
+                const auto folder = checkedPath(directory + "/logs_s1_v5turbo/ckpt");
+                const auto files = QDir(folder).entryInfoList({"epoch=*-step=*.ckpt"}, QDir::Files);
+                for (const auto &checkpoint : files) {
+                    if (readableTrainingCheckpoint(checkpoint.absoluteFilePath()))
+                        return id;
+                }
+            }
+        } catch (const std::exception &) {
+            // An inaccessible attempt cannot supply a checkpoint.
+        }
+    }
+    return {};
+}
+
+void TrainingPanel::showEvent(QShowEvent *event)
+{
+    QWidget::showEvent(event);
+    showState();
+}
+
 void TrainingPanel::showState()
 {
+    resume_->setVisible(!busy() && !resumeJob(nextTrainingStage()).isEmpty());
     if (project_.isEmpty()) {
         stage_->setText(QStringLiteral("新建项目后，导入录音或已切好的 WAV 片段。"));
         return;

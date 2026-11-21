@@ -7,6 +7,8 @@
 class QComboBox;
 class QLabel;
 class QMediaPlayer;
+class QPushButton;
+class QShowEvent;
 class QSpinBox;
 class QTableWidget;
 
@@ -27,11 +29,14 @@ private:
     void readClips();
     void loadLabels(const QString &path);
     void saveLabels();
-    void submit(const QString &operation);
+    void submit(const QString &operation, bool resume = false);
     void complete(const QString &id, const QJsonObject &result, bool live = true);
     void importVoice();
     void showState();
     bool busy() const;
+    QString nextTrainingStage() const;
+    QString resumeJob(const QString &operation) const;
+    void showEvent(QShowEvent *event) override;
 
     QString root_;
     TaskScheduler &scheduler_;
@@ -43,6 +48,7 @@ private:
     QSpinBox *gpu_ = nullptr;
     QSpinBox *batch_ = nullptr;
     QSpinBox *epochs_ = nullptr;
+    QPushButton *resume_ = nullptr;
     QLabel *status_ = nullptr;
     QLabel *stage_ = nullptr;
     QMediaPlayer *player_ = nullptr;
