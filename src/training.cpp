@@ -24,6 +24,7 @@
 #include <QSpinBox>
 #include <QSqlError>
 #include <QSqlQuery>
+#include <QStyle>
 #include <QTableWidget>
 #include <QUuid>
 #include <stdexcept>
@@ -98,12 +99,12 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
         });
         return control;
     };
-    button(selection, QStringLiteral("新建项目"), [this] { addProject(); });
+    create_ = button(selection, QStringLiteral("新建项目"), [this] { addProject(); });
     auto *files = new QHBoxLayout;
-    button(files, QStringLiteral("导入原始录音"), [this] { importAudio(false); });
-    button(files, QStringLiteral("切片"), [this] { submit("slice"); });
+    recordings_ = button(files, QStringLiteral("导入原始录音"), [this] { importAudio(false); });
+    slice_ = button(files, QStringLiteral("切片"), [this] { submit("slice"); });
     button(files, QStringLiteral("导入已切片录音"), [this] { importAudio(true); });
-    button(files, QStringLiteral("中文自动转写"), [this] { submit("asr"); });
+    transcribe_ = button(files, QStringLiteral("中文自动转写"), [this] { submit("asr"); });
     button(files, QStringLiteral("导入标注"), [this] {
         require(!busy(), QStringLiteral("请等待当前阶段完成"));
         const auto path = QFileDialog::getOpenFileName(this, QStringLiteral("导入已有标注"), {}, "List (*.list *.txt)");
@@ -137,7 +138,7 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
         labels_->removeRow(labels_->currentRow());
     });
     button(labelsActions, QStringLiteral("保存标注"), [this] { saveLabels(); });
-    button(labelsActions, QStringLiteral("准备数据"), [this] {
+    prepare_ = button(labelsActions, QStringLiteral("准备数据"), [this] {
         saveLabels();
         submit("prepare");
     });
@@ -158,16 +159,16 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     epochs_->setRange(2, 50);
     epochs_->setValue(4);
     training->addWidget(epochs_);
-    button(training, QStringLiteral("开始训练"), [this] {
+    train_ = button(training, QStringLiteral("开始训练"), [this] {
         submit(nextTrainingStage());
-    })->setObjectName("primary");
+    });
     resume_ = button(training, QStringLiteral("从检查点继续"), [this] {
         submit(nextTrainingStage(), true);
     });
     resume_->setVisible(false);
     for (auto *control : {gpu_, batch_, epochs_})
         connect(control, &QSpinBox::valueChanged, this, [this] { showState(); });
-    button(training, QStringLiteral("试听并入库"), [this] { importVoice(); });
+    preview_ = button(training, QStringLiteral("试听并入库"), [this] { importVoice(); });
     training->addStretch();
     layout->addLayout(training);
     layout->addWidget(status_);
@@ -583,32 +584,48 @@ void TrainingPanel::showEvent(QShowEvent *event)
 
 void TrainingPanel::showState()
 {
-    resume_->setVisible(!busy() && !resumeJob(nextTrainingStage()).isEmpty());
+    const auto active = busy();
+    const auto canResume = !active && !resumeJob(nextTrainingStage()).isEmpty();
+    resume_->setVisible(canResume);
+    const auto advise = [this](QPushButton *action, const QString &message) {
+        stage_->setText(message);
+        if (action == suggested_)
+            return;
+        const auto highlight = [](QPushButton *button, bool selected) {
+            if (!button)
+                return;
+            button->setObjectName(selected ? QStringLiteral("primary") : QString());
+            button->style()->unpolish(button);
+            button->style()->polish(button);
+            button->update();
+        };
+        highlight(suggested_, false);
+        suggested_ = action;
+        highlight(suggested_, true);
+    };
     if (project_.isEmpty()) {
-        stage_->setText(QStringLiteral("下一步：点「新建项目」，再导入原始录音或已切好的 WAV。"));
-        return;
-    }
-    if (busy()) {
-        stage_->setText(QStringLiteral("当前阶段已提交。可在「任务记录」查看结果、错误详情或取消任务。"));
-        return;
-    }
-    if (project_.contains("gpt") && project_.contains("sovits"))
-        stage_->setText(QStringLiteral("两份模型权重已完成。选一段清晰的参考录音，点「试听并入库」。"));
-    else if (project_.contains("sovits"))
-        stage_->setText(QStringLiteral("SoVITS 阶段已完成。点击「开始训练」继续 GPT 阶段。"));
-    else if (project_.contains("dataset")) {
+        advise(create_, QStringLiteral("下一步：点「新建项目」，再导入原始录音或已切好的 WAV。"));
+    } else if (active) {
+        advise(nullptr, QStringLiteral("当前阶段已提交。可在「任务记录」查看结果、错误详情或取消任务。"));
+    } else if (project_.contains("gpt") && project_.contains("sovits")) {
+        advise(preview_, QStringLiteral("两份模型权重已完成。选一段清晰的参考录音，点「试听并入库」。"));
+    } else if (canResume) {
+        advise(resume_, QStringLiteral("已找到匹配的检查点，可点「从检查点继续」。"));
+    } else if (project_.contains("sovits")) {
+        advise(train_, QStringLiteral("SoVITS 阶段已完成。点击「开始训练」继续 GPT 阶段。"));
+    } else if (project_.contains("dataset")) {
         const int count = project_.value("sampleCount").toInt();
-        stage_->setText(count > 0 ? QStringLiteral("%1 条训练样本已校验。确认显卡、批量和轮数后开始训练。").arg(count)
-                                  : QStringLiteral("训练数据已就绪。确认显卡、批量和轮数后开始训练。"));
+        advise(train_, count > 0 ? QStringLiteral("%1 条训练样本已校验。确认显卡、批量和轮数后开始训练。").arg(count)
+                                 : QStringLiteral("训练数据已就绪。确认显卡、批量和轮数后开始训练。"));
+    } else if (project_.contains("annotation")) {
+        advise(prepare_, QStringLiteral("选中片段试听，双击「文本」校对。校对后点击「准备数据」，会自动保存标注。"));
+    } else if (project_.contains("clips")) {
+        advise(transcribe_, QStringLiteral("切片已就绪。可自动转写、导入已有标注，或双击「文本」手动填写。"));
+    } else if (project_.contains("raw")) {
+        advise(slice_, QStringLiteral("原始录音已导入。点「切片」，将录音分成便于逐条标注的片段。"));
+    } else {
+        advise(recordings_, QStringLiteral("导入原始录音进行切片，或直接导入已切好的 WAV 片段。"));
     }
-    else if (project_.contains("annotation"))
-        stage_->setText(QStringLiteral("选中片段试听，双击「文本」校对。校对后点击「准备数据」，会自动保存标注。"));
-    else if (project_.contains("clips"))
-        stage_->setText(QStringLiteral("切片已就绪。可自动转写、导入已有标注，或双击「文本」手动填写。"));
-    else if (project_.contains("raw"))
-        stage_->setText(QStringLiteral("原始录音已导入。点「切片」，将录音分成便于逐条标注的片段。"));
-    else
-        stage_->setText(QStringLiteral("导入原始录音进行切片，或直接导入已切好的 WAV 片段。"));
 }
 
 }

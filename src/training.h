@@ -48,7 +48,15 @@ private:
     QSpinBox *gpu_ = nullptr;
     QSpinBox *batch_ = nullptr;
     QSpinBox *epochs_ = nullptr;
+    QPushButton *create_ = nullptr;
+    QPushButton *recordings_ = nullptr;
+    QPushButton *slice_ = nullptr;
+    QPushButton *transcribe_ = nullptr;
+    QPushButton *prepare_ = nullptr;
+    QPushButton *train_ = nullptr;
     QPushButton *resume_ = nullptr;
+    QPushButton *preview_ = nullptr;
+    QPushButton *suggested_ = nullptr;
     QLabel *status_ = nullptr;
     QLabel *stage_ = nullptr;
     QMediaPlayer *player_ = nullptr;

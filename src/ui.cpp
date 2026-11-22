@@ -64,7 +64,14 @@ QString stylesheet()
             border: 0;
             outline: none;
         }
-        QListWidget#navigation::item { padding: 10px 12px; min-height: 22px; margin: 2px 0; }
+        QListWidget#navigation::item {
+            background: transparent;
+            border-left: 3px solid transparent;
+            border-radius: 8px;
+            padding: 10px 12px;
+            min-height: 22px;
+            margin: 2px 0;
+        }
         QListWidget#navigation::item:hover { color: #ffffff; background: #202e40; border-radius: 8px; }
         QListWidget#navigation::item:selected {
             color: #b0f5e3;

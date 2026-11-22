@@ -397,6 +397,7 @@ private:
         auto *engineForm = section(QStringLiteral("GPT-SoVITS 引擎"),
             QStringLiteral("点「添加启动路径」，选择整合包目录中的 go-webui.bat，再回工作台启动。"));
         auto *options = new QHBoxLayout;
+        options->setSpacing(8);
         profiles_ = new QComboBox(page);
         profiles_->setPlaceholderText(QStringLiteral("尚未配置引擎"));
         addEngine_ = new QPushButton(QStringLiteral("添加启动路径"), page);
@@ -417,6 +418,7 @@ private:
         outputForm->addRow(QStringLiteral("成品生成目录"), output);
 
         auto *actions = new QHBoxLayout;
+        actions->setSpacing(8);
         auto *choose = new QPushButton(QStringLiteral("更改目录"), page);
         auto *reset = new QPushButton(QStringLiteral("恢复默认目录"), page);
         auto *open = new QPushButton(QStringLiteral("打开成品目录"), page);
@@ -428,9 +430,12 @@ private:
         auto *dataFolder = new QLineEdit(QDir::toNativeSeparators(root_), page);
         dataFolder->setReadOnly(true);
         dataFolder->setToolTip(dataFolder->text());
-        outputForm->addRow(QStringLiteral("素材和项目数据"), dataFolder);
         auto *openData = new QPushButton(QStringLiteral("打开数据目录"), page);
-        outputForm->addRow(openData);
+        auto *dataActions = new QHBoxLayout;
+        dataActions->setSpacing(8);
+        dataActions->addWidget(dataFolder, 1);
+        dataActions->addWidget(openData);
+        outputForm->addRow(QStringLiteral("素材和项目数据"), dataActions);
         layout->addStretch(1);
 
         const auto saveOutput = [this, output](const QString &selected) {
