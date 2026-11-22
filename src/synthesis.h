@@ -20,6 +20,7 @@ namespace ez {
 class TaskScheduler;
 
 class SynthesisPanel final : public QWidget {
+    Q_OBJECT
 public:
     SynthesisPanel(QString root, TaskScheduler &scheduler, std::function<QString()> launcher,
                    QWidget *parent = nullptr);
@@ -30,8 +31,12 @@ public:
     void refreshVoices(const QString &selected = {});
     bool importing() const { return importing_; }
 
+signals:
+    void viewBatchRequested(const QString &batch);
+
 private:
     void generate();
+    void refreshSubmission();
     void receiveAudio(const QString &id, const QJsonObject &result);
     void applyVoiceDefaults();
     void applySynthesisOptions(const QJsonObject &options);
@@ -57,11 +62,15 @@ private:
     QDoubleSpinBox *temperature_ = nullptr;
     QLineEdit *seed_ = nullptr;
     QLabel *status_ = nullptr;
+    QLabel *batchSummary_ = nullptr;
+    QPushButton *viewBatch_ = nullptr;
     QMediaPlayer *player_ = nullptr;
     QPushButton *play_ = nullptr;
     QPushButton *export_ = nullptr;
     QPushButton *folder_ = nullptr;
     QString audio_;
+    QString submittedBatch_;
+    QString submittedJob_;
 };
 
 }

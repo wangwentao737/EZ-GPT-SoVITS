@@ -190,8 +190,7 @@ EngineManager::EngineManager(QObject *parent) : QObject(parent)
         if (!result.responded)
             return;
         if (!result.error.isEmpty() || !ownsListener(mainPort)) {
-            stop();
-            emit statusChanged(result.error.isEmpty() ? QStringLiteral("引擎监听进程已变化") : result.error);
+            failInstance(result.error.isEmpty() ? QStringLiteral("引擎监听进程已变化") : result.error);
             return;
         }
         unavailable_ = result.unavailable;
@@ -307,14 +306,20 @@ void EngineManager::poll()
     if (!process_)
         return;
     if (WaitForSingleObject(process_->handle, 0) == WAIT_OBJECT_0 || (!ready_ && ++ticks_ > 240)) {
-        stop();
-        emit statusChanged(QStringLiteral("引擎启动超时或已经退出。查看日志：%1").arg(logPath_));
+        failInstance(QStringLiteral("引擎启动超时或已经退出。查看日志：%1").arg(logPath_));
         return;
     }
     if (ready_ || probe_.isRunning())
         return;
     if (ownsListener(mainPort))
         probe_.setFuture(QtConcurrent::run(probeApi));
+}
+
+void EngineManager::failInstance(const QString &message)
+{
+    emit instanceFailed(root_ + "/go-webui.bat", message);
+    stop();
+    emit statusChanged(message);
 }
 
 bool EngineManager::ready() const { return ready_; }

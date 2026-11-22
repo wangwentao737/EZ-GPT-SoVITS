@@ -196,6 +196,11 @@ TaskScheduler::TaskScheduler(QString dataRoot, QString defaultOutputRoot, Engine
         else if (running() && !cancelling_)
             worker_.kill();
     });
+    connect(&engine_, &EngineManager::instanceFailed, this, [this](const QString &launcher, const QString &message) {
+        if (running() && !cancelling_)
+            engineFailure_ = message;
+        failQueued(launcher, message);
+    });
     connect(&worker_, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
         if (running() && cancelling_ && (status != QProcess::NormalExit || (code != 0 && code != cancelledExitCode)))
             forceCancel();
@@ -210,31 +215,68 @@ TaskScheduler::TaskScheduler(QString dataRoot, QString defaultOutputRoot, Engine
     });
 }
 
-QString TaskScheduler::enqueue(const QString &launcher, const QJsonObject &request, QJsonObject project)
+QString TaskScheduler::enqueue(const QString &launcher, QJsonObject request, const QJsonObject &project)
 {
-    const auto root = engineRoot(launcher);
-    auto snapshot = request;
-    if (snapshot.value("operation") == "synthesize") {
-        const auto output = snapshot.value("output_root").toString().isEmpty()
-            ? configuredOutputRoot(defaultOutputRoot_) : outputRootForRequest(root_, snapshot);
-        snapshot.insert("output_root", output);
+    request.remove("batch_id");
+    request.remove("batch_index");
+    request.remove("batch_size");
+    return enqueueRequests(launcher, {request}, project).constFirst();
+}
+
+QStringList TaskScheduler::enqueueBatch(const QString &launcher, const QList<QJsonObject> &requests)
+{
+    return enqueueRequests(launcher, requests);
+}
+
+QString TaskScheduler::enqueueSynthesisBatch(const QString &launcher, QList<QJsonObject> requests)
+{
+    const auto batch = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    for (qsizetype index = 0; index < requests.size(); ++index) {
+        requests[index]["batch_id"] = batch;
+        requests[index]["batch_index"] = index + 1;
+        requests[index]["batch_size"] = requests.size();
     }
-    const auto id = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    QSqlQuery query;
-    query.prepare("INSERT INTO jobs(id, created, launcher, operation, state, request)"
-                  "VALUES (?, ?, ?, ?, 'queued', ?)");
-    query.addBindValue(id);
-    query.addBindValue(QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
-    query.addBindValue(root + "/go-webui.bat");
-    query.addBindValue(request.value("operation").toString());
-    query.addBindValue(json(snapshot));
+    enqueueRequests(launcher, requests);
+    return batch;
+}
+
+QStringList TaskScheduler::enqueueRequests(const QString &launcher, const QList<QJsonObject> &requests, QJsonObject project)
+{
+    if (requests.isEmpty())
+        fail(QStringLiteral("没有可提交的任务"));
+    const auto root = engineRoot(launcher);
+    if (engine_.active() && engine_.root().compare(root, Qt::CaseInsensitive) != 0)
+        fail(QStringLiteral("另一个引擎正在运行，请在「工作台」停止后再提交。"));
+    const auto entry = root + "/go-webui.bat";
+    const auto created = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+    QStringList submitted;
     auto database = QSqlDatabase::database();
     if (!database.transaction())
         fail(database.lastError().text());
     try {
-        execute(query);
+        QSqlQuery query;
+        query.prepare("INSERT INTO jobs(id, created, launcher, operation, state, request)"
+                      "VALUES (?, ?, ?, ?, 'queued', ?)");
+        for (auto snapshot : requests) {
+            const auto id = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            const auto operation = snapshot.value("operation").toString();
+            if (operation.isEmpty())
+                fail(QStringLiteral("任务缺少操作类型"));
+            if (operation == "synthesize") {
+                const auto output = snapshot.value("output_root").toString().isEmpty()
+                    ? configuredOutputRoot(defaultOutputRoot_) : outputRootForRequest(root_, snapshot);
+                snapshot["output_root"] = output;
+            }
+            query.bindValue(0, id);
+            query.bindValue(1, created);
+            query.bindValue(2, entry);
+            query.bindValue(3, operation);
+            query.bindValue(4, json(snapshot));
+            execute(query);
+            submitted.append(id);
+        }
         if (!project.isEmpty()) {
-            project.insert("pending", id);
+            project.insert("pending", submitted.constFirst());
             query.prepare("UPDATE projects SET state=? WHERE id=?");
             query.addBindValue(json(project));
             query.addBindValue(project.value("id").toString());
@@ -249,16 +291,37 @@ QString TaskScheduler::enqueue(const QString &launcher, const QJsonObject &reque
         throw;
     }
     emit changed();
-    if (!engine_.active()) {
-        try {
-            engine_.start(launcher, root_ + "/engine-start.log");
-        } catch (const std::exception &error) {
-            update(id, "failed", QString::fromUtf8(error.what()));
-            throw;
-        }
-    }
+    if (!engine_.active())
+        startEngine(entry);
     next();
-    return id;
+    return submitted;
+}
+
+void TaskScheduler::startEngine(const QString &launcher)
+{
+    try {
+        engine_.start(launcher, root_ + "/engine-start.log");
+    } catch (const std::exception &error) {
+        failQueued(launcher, QString::fromUtf8(error.what()));
+    }
+}
+
+void TaskScheduler::failQueued(const QString &launcher, const QString &message)
+{
+    const auto reason = QStringLiteral("引擎不可用：%1\n请检查引擎设置或启动日志，修复后重试。").arg(message);
+    try {
+        QSqlQuery query;
+        query.prepare("UPDATE jobs SET state='failed',message=?,result='{}'"
+                      " WHERE state='queued' AND launcher=? COLLATE NOCASE");
+        query.addBindValue(reason);
+        query.addBindValue(launcher);
+        execute(query);
+        if (query.numRowsAffected() > 0)
+            emit changed();
+        emit failed(reason);
+    } catch (const std::exception &error) {
+        emit failed(QStringLiteral("无法更新等待引擎的任务：%1").arg(QString::fromUtf8(error.what())));
+    }
 }
 
 void TaskScheduler::next()
@@ -301,6 +364,7 @@ void TaskScheduler::finish(bool processSucceeded, QString message)
     const auto id = std::exchange(active_, {});
     const auto job = std::exchange(jobPath_, {});
     const auto request = std::exchange(activeRequest_, {});
+    const auto engineFailure = std::exchange(engineFailure_, {});
     const bool cancelled = std::exchange(cancelling_, false);
     cancelTimeout_.stop();
     QJsonObject result;
@@ -363,6 +427,8 @@ void TaskScheduler::finish(bool processSucceeded, QString message)
                     detail += '\n' + QString::fromUtf8(engineLog.readAll());
                 }
             }
+            if (!engineFailure.isEmpty())
+                message = engineFailure;
             if (message.isEmpty())
                 message = QStringLiteral("任务中断，详情见任务日志");
             message = recoveryHint(message, detail, request.value("operation").toString());
@@ -421,6 +487,20 @@ void TaskScheduler::cancel(const QString &id)
     }
 }
 
+void TaskScheduler::cancelQueuedBatch(const QString &batch)
+{
+    if (batch.isEmpty())
+        return;
+    QSqlQuery query;
+    query.prepare("UPDATE jobs SET state='cancelled',message=? WHERE state='queued'"
+                  " AND json_extract(CAST(request AS TEXT),'$.batch_id')=?");
+    query.addBindValue(QStringLiteral("已取消本批等待项。"));
+    query.addBindValue(batch);
+    execute(query);
+    if (query.numRowsAffected() > 0)
+        emit changed();
+}
+
 void TaskScheduler::forceCancel()
 {
     if (!cancelling_ || !running())
@@ -443,8 +523,11 @@ void TaskScheduler::continueAfterCancellation()
         query.prepare("SELECT launcher FROM jobs WHERE state='queued' AND launcher=? COLLATE NOCASE LIMIT 1");
         query.addBindValue(engine_.root() + "/go-webui.bat");
         execute(query);
-        if (query.next())
-            engine_.start(query.value(0).toString(), root_ + "/engine-start.log");
+        if (query.next()) {
+            const auto launcher = query.value(0).toString();
+            query.finish();
+            startEngine(launcher);
+        }
     } catch (const std::exception &error) {
         emit failed(QStringLiteral("无法恢复排队任务。可在工作台重启引擎。%1").arg(QString::fromUtf8(error.what())));
     }

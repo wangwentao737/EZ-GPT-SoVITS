@@ -19,6 +19,7 @@
 #include <QJsonDocument>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMap>
 #include <QMediaPlayer>
 #include <QMessageBox>
 #include <QPlainTextEdit>
@@ -51,6 +52,17 @@ constexpr auto voiceSettingsRole = Qt::UserRole + 1;
 QString supportedLanguage(const QString &language)
 {
     return languages.contains(language) ? language : languages.constFirst();
+}
+
+QStringList synthesisLines(const QString &text)
+{
+    QStringList lines;
+    for (const auto &line : text.split('\n', Qt::SkipEmptyParts)) {
+        const auto trimmed = line.trimmed();
+        if (!trimmed.isEmpty())
+            lines.append(trimmed);
+    }
+    return lines;
 }
 
 void execute(QSqlQuery &query)
@@ -152,6 +164,10 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
     auto *parameters = new QHBoxLayout;
     batch_ = new QCheckBox(QStringLiteral("每行生成一条音频"), this);
     parameters->addWidget(batch_);
+    auto *lineCount = ui::hint({}, this);
+    lineCount->setObjectName("batchLineCount");
+    lineCount->setWordWrap(false);
+    parameters->addWidget(lineCount);
     advanced_ = new QPushButton(QStringLiteral("高级参数"), this);
     advanced_->setCheckable(true);
     parameters->addStretch(1);
@@ -217,6 +233,17 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
     auto *actions = new QHBoxLayout;
     auto *generate = new QPushButton(QStringLiteral("生成语音"), this);
     generate->setObjectName("primary");
+    const auto updateMode = [this, lineCount, generate] {
+        const bool batch = batch_->isChecked();
+        const auto count = batch ? synthesisLines(text_->toPlainText()).size() : 0;
+        lineCount->setVisible(batch);
+        lineCount->setText(QStringLiteral("%1 条台词，空行会跳过").arg(count));
+        generate->setText(batch ? QStringLiteral("提交批量任务") : QStringLiteral("生成语音"));
+        generate->setEnabled(batch ? count > 0 : !text_->toPlainText().trimmed().isEmpty());
+    };
+    updateMode();
+    connect(batch_, &QCheckBox::toggled, this, updateMode);
+    connect(text_, &QPlainTextEdit::textChanged, this, updateMode);
     play_ = new QPushButton(QStringLiteral("播放"), this);
     export_ = new QPushButton(QStringLiteral("另存 WAV"), this);
     folder_ = new QPushButton(QStringLiteral("所在目录"), this);
@@ -230,14 +257,26 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
     actions->addWidget(folder_);
     layout->addLayout(actions);
 
+    auto *batchControls = new QHBoxLayout;
+    batchSummary_ = ui::hint({}, this);
+    batchSummary_->setObjectName("stageHint");
+    viewBatch_ = new QPushButton(QStringLiteral("查看本批任务"), this);
+    batchControls->addWidget(batchSummary_, 1);
+    batchControls->addWidget(viewBatch_);
+    layout->addLayout(batchControls);
+    batchSummary_->hide();
+    viewBatch_->hide();
+    connect(viewBatch_, &QPushButton::clicked, this, [this] { emit viewBatchRequested(submittedBatch_); });
+
     status_ = ui::hint({}, this);
+    status_->setObjectName("synthesisStatus");
     layout->addWidget(status_);
     player_ = new QMediaPlayer(this);
     player_->setAudioOutput(new QAudioOutput(player_));
     connect(import, &QPushButton::clicked, this, [this] { importVoice(); });
     connect(generate, &QPushButton::clicked, this, &SynthesisPanel::generate);
     connect(&scheduler_, &TaskScheduler::completed, this, &SynthesisPanel::receiveAudio);
-    connect(&scheduler_, &TaskScheduler::failed, status_, &QLabel::setText);
+    connect(&scheduler_, &TaskScheduler::changed, this, &SynthesisPanel::refreshSubmission);
     connect(play_, &QPushButton::clicked, this, [this] {
         if (player_->playbackState() == QMediaPlayer::PlayingState)
             player_->pause();
@@ -313,6 +352,7 @@ void SynthesisPanel::playAudio(const QString &path)
         throw std::runtime_error(QStringLiteral("历史音频文件已移动或删除").toStdString());
     player_->setSource(QUrl::fromLocalFile(audio_));
     play_->setEnabled(true);
+    play_->setToolTip({});
     export_->setEnabled(true);
     folder_->setEnabled(true);
     player_->play();
@@ -538,19 +578,81 @@ void SynthesisPanel::generate()
         request["operation"] = "synthesize";
         request["voice_id"] = voice;
         request["language"] = language_->currentText();
-        const auto text = text_->toPlainText();
-        const auto lines = batch_->isChecked() ? text.split('\n', Qt::SkipEmptyParts) : QStringList{text};
-        int count = 0;
-        for (const auto &line : lines) {
-            if (line.trimmed().isEmpty())
-                continue;
-            request["text"] = line.trimmed();
-            scheduler_.enqueue(launcher, request);
-            ++count;
+        if (batch_->isChecked()) {
+            QList<QJsonObject> requests;
+            for (const auto &line : synthesisLines(text_->toPlainText())) {
+                request["text"] = line;
+                requests.append(request);
+            }
+            submittedBatch_ = scheduler_.enqueueSynthesisBatch(launcher, requests);
+            submittedJob_.clear();
+            status_->clear();
+        } else {
+            request["text"] = text_->toPlainText().trimmed();
+            submittedJob_ = scheduler_.enqueue(launcher, request);
+            submittedBatch_.clear();
         }
-        status_->setText(QStringLiteral("已排队 %1 条台词，可在任务记录查看进度。").arg(count));
+        audio_.clear();
+        player_->setSource({});
+        play_->setEnabled(false);
+        play_->setToolTip({});
+        export_->setEnabled(false);
+        folder_->setEnabled(false);
+        status_->setToolTip({});
+        refreshSubmission();
     } catch (const std::exception &error) {
         status_->setText(QString::fromUtf8(error.what()));
+    }
+}
+
+void SynthesisPanel::refreshSubmission()
+{
+    const bool batch = !submittedBatch_.isEmpty();
+    batchSummary_->setVisible(batch);
+    viewBatch_->setVisible(batch);
+    if (!batch && submittedJob_.isEmpty())
+        return;
+    QSqlQuery query;
+    if (!batch) {
+        query.prepare("SELECT state,message FROM jobs WHERE id=?");
+        query.addBindValue(submittedJob_);
+        if (!query.exec() || !query.next())
+            return;
+        const auto state = query.value(0).toString();
+        if (state == "queued")
+            status_->setText(QStringLiteral("已加入队列，等待引擎或前面的任务。"));
+        else if (state == "running")
+            status_->setText(query.value(1).toString().isEmpty() ? QStringLiteral("正在生成语音…") : query.value(1).toString());
+        else if (state == "failed")
+            status_->setText(query.value(1).toString());
+        else if (state == "cancelled")
+            status_->setText(QStringLiteral("任务已取消。"));
+        return;
+    }
+
+    query.prepare("SELECT state,message FROM jobs WHERE json_extract(CAST(request AS TEXT),'$.batch_id')=? ORDER BY rowid");
+    query.addBindValue(submittedBatch_);
+    if (!query.exec())
+        return;
+    QMap<QString, int> counts;
+    QString failure;
+    int total = 0;
+    while (query.next()) {
+        const auto state = query.value(0).toString();
+        ++counts[state];
+        ++total;
+        if (state == "failed" && failure.isEmpty())
+            failure = query.value(1).toString();
+    }
+    const int failed = counts.value("failed");
+    const int interrupted = counts.value("interrupted");
+    const auto summary = QStringLiteral("本批 %1 条 · 成功 %2 · 失败 %3 · 排队 %4 · 运行 %5 · 已取消 %6")
+        .arg(total).arg(counts.value("succeeded")).arg(failed)
+        .arg(counts.value("queued")).arg(counts.value("running")).arg(counts.value("cancelled"));
+    batchSummary_->setText(interrupted > 0 ? summary + QStringLiteral(" · 中断 %1").arg(interrupted) : summary);
+    if (!failure.isEmpty()) {
+        status_->setText(failure.section('\n', 0, 1));
+        status_->setToolTip(failure);
     }
 }
 
@@ -558,19 +660,28 @@ void SynthesisPanel::receiveAudio(const QString &id, const QJsonObject &result)
 {
     if (!result.contains("audio"))
         return;
-    audio_ = result.value("audio").toString();
-    player_->setSource(QUrl::fromLocalFile(audio_));
-    play_->setEnabled(true);
-    export_->setEnabled(true);
-    folder_->setEnabled(true);
-    status_->setText(QStringLiteral("语音已生成 · %1 秒").arg(result.value("duration").toDouble(), 0, 'f', 2));
     QSqlQuery query;
     query.prepare("SELECT launcher,request FROM jobs WHERE id=?");
     query.addBindValue(id);
     if (!query.exec() || !query.next())
         return;
     const auto launcher = query.value(0).toString();
-    const auto voice = QJsonDocument::fromJson(query.value(1).toByteArray()).object().value("voice_id").toString();
+    const auto request = QJsonDocument::fromJson(query.value(1).toByteArray()).object();
+    const auto voice = request.value("voice_id").toString();
+    const bool batch = !submittedBatch_.isEmpty();
+    const bool visibleResult = batch ? request.value("batch_id").toString() == submittedBatch_
+        : submittedJob_.isEmpty() || id == submittedJob_;
+    if (visibleResult) {
+        audio_ = result.value("audio").toString();
+        player_->setSource(QUrl::fromLocalFile(audio_));
+        play_->setEnabled(true);
+        play_->setToolTip(batch ? QStringLiteral("播放本批最近生成的成品 · 第 %1 条")
+            .arg(request.value("batch_index").toInt()) : QString());
+        export_->setEnabled(true);
+        folder_->setEnabled(true);
+        if (!batch)
+            status_->setText(QStringLiteral("语音已生成 · %1 秒").arg(result.value("duration").toDouble(), 0, 'f', 2));
+    }
     query.finish();
     query.prepare("UPDATE voices SET verified_engine=? WHERE id=?");
     query.addBindValue(launcher);

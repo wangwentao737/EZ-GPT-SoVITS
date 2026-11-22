@@ -40,6 +40,7 @@ public:
 signals:
     void statusChanged(const QString &message);
     void readinessChanged(bool ready);
+    void instanceFailed(const QString &launcher, const QString &message);
 
 private:
     struct Process;
@@ -53,6 +54,7 @@ private:
     int ticks_ = 0;
     bool ready_ = false;
     void poll();
+    void failInstance(const QString &message);
 };
 
 }

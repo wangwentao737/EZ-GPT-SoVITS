@@ -40,6 +40,40 @@ def check_startup(program, workspace):
     print("Startup: missing bundled Python identified before the launcher ran.", flush=True)
 
 
+def check_batch_startup_failures(program, workspace):
+    engine = workspace / "batch-startup-engine"
+    engine.mkdir()
+    launcher = engine / "go-webui.bat"
+    launcher.write_text("@echo deliberate startup failure\n@exit /b 7\n", encoding="ascii")
+    requests = [{"operation": "synthesize", "text": f"Line {index}"} for index in range(1, 4)]
+
+    for case, match in (("missing-runtime", "runtime/python.exe"), ("early-exit", "引擎启动超时或已经退出")):
+        if case == "early-exit":
+            (engine / "runtime").mkdir()
+            for name in ("runtime/python.exe", "webui.py", "config.py"):
+                (engine / name).write_text("Startup-only test fixture.", encoding="ascii")
+        data = workspace / case
+        data.mkdir()
+        invoke(program, data, launcher, requests, expected=3)
+        with sqlite3.connect(data / "library.sqlite") as database:
+            rows = database.execute("SELECT state,request,message,result FROM jobs ORDER BY rowid").fetchall()
+        assert len(rows) == 3, rows
+        for (state, request, message, result), original in zip(rows, requests, strict=True):
+            assert state == "failed" and match in message.replace("\\", "/"), (state, message)
+            assert json.loads(request)["text"] == original["text"]
+            assert json.loads(result) == {}
+        assert not (data / "jobs").exists()
+
+    data = workspace / "invalid-batch"
+    data.mkdir()
+    invoke(program, data, launcher, [requests[0], {**requests[1], "output_root": "relative/output"}], expected=1)
+    with sqlite3.connect(data / "library.sqlite") as database:
+        assert database.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+    assert not (data / "engine-start.log").exists()
+    print("Batch: immediate and asynchronous startup failures reached all three jobs; invalid submission rolled back.",
+          flush=True)
+
+
 def check_interface_isolation(program, workspace):
     engine = workspace / "partial-interfaces"
     runtime = engine / "runtime"
@@ -171,6 +205,7 @@ def main():
     workspace = scratch / f"resources-{uuid.uuid4().hex}"
     workspace.mkdir()
     check_startup(program, workspace)
+    check_batch_startup_failures(program, workspace)
     check_interface_isolation(program, workspace)
     fixture = json.loads(source.read_text(encoding="utf-8-sig"))
     check_real_batch(program, engine, fixture, workspace / "real-batch", scratch)

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(EZ_GPT_SoVITS VERSION 0.1.16 LANGUAGES CXX)
+project(EZ_GPT_SoVITS VERSION 0.1.17 LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "EZ-GPT-SoVITS requires Windows x64")
@@ -33,6 +33,7 @@ qt_add_resources(EZ-GPT-SoVITS "engine_bridge"
 )
 install(TARGETS EZ-GPT-SoVITS RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 install(FILES README.md THIRD_PARTY.md 开发文档.md DESTINATION .)
+install(FILES engine/20261006.md DESTINATION engine)
 get_filename_component(qt_sdk_root "${Qt6_DIR}/../../.." ABSOLUTE)
 if(IS_DIRECTORY "${qt_sdk_root}/sbom")
     install(DIRECTORY "${qt_sdk_root}/sbom/" DESTINATION licenses/qt-sbom

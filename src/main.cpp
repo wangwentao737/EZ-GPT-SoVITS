@@ -489,6 +489,16 @@ private:
         auto *layout = new QVBoxLayout(page);
         ez::ui::pageHeader(layout, page, QStringLiteral("任务记录"),
             QStringLiteral("左键选中一条任务。右键可查看产物或日志，并按任务状态选择播放、复用、重试或取消。"));
+        auto *filters = new QHBoxLayout;
+        auto *batches = new QComboBox(page);
+        batches->setAccessibleName(QStringLiteral("按批次筛选任务"));
+        batches->addItem(QStringLiteral("全部任务"));
+        auto *retryBatch = new QPushButton(QStringLiteral("重试本批失败项"), page);
+        auto *cancelBatch = new QPushButton(QStringLiteral("取消本批排队项"), page);
+        filters->addWidget(batches, 1);
+        filters->addWidget(retryBatch);
+        filters->addWidget(cancelBatch);
+        layout->addLayout(filters);
         auto *table = new QTableWidget(0, 4, page);
         table->setHorizontalHeaderLabels({QStringLiteral("创建时间"), QStringLiteral("操作"),
                                           QStringLiteral("状态"), QStringLiteral("结果")});
@@ -498,7 +508,7 @@ private:
         table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
         table->horizontalHeader()->setStretchLastSection(true);
         layout->addWidget(table, 1);
-        auto *empty = new QLabel(QStringLiteral("生成语音或开始训练后，任务会出现在这里。"), page);
+        auto *empty = new QLabel(page);
         empty->setObjectName("emptyState");
         empty->setAlignment(Qt::AlignCenter);
         empty->setWordWrap(true);
@@ -514,6 +524,7 @@ private:
         auto *menu = new QMenu(more);
         auto *copyResult = menu->addAction(QStringLiteral("复制结果"));
         auto *exportJob = menu->addAction(QStringLiteral("导出所选任务诊断"));
+        auto *filterBatch = menu->addAction(QStringLiteral("只看此批任务"));
         more->setMenu(menu);
         actions->addWidget(play);
         actions->addWidget(open);
@@ -527,9 +538,33 @@ private:
             const auto *item = table->item(ez::ui::selectedRow(table), 0);
             return item ? item->data(Qt::UserRole).toString() : QString();
         };
-        const auto refresh = [table, empty, selection] {
+        const auto loadBatches = [batches] {
+            const auto previous = batches->currentData().toString();
+            const QSignalBlocker block(batches);
+            batches->clear();
+            batches->addItem(QStringLiteral("全部任务"));
+            QSqlQuery query("SELECT json_extract(CAST(request AS TEXT),'$.batch_id') AS batch, MIN(created), COUNT(*)"
+                            " FROM jobs WHERE operation='synthesize' GROUP BY batch HAVING batch IS NOT NULL"
+                            " ORDER BY MIN(rowid) DESC");
+            while (query.next()) {
+                const auto time = QDateTime::fromString(query.value(1).toString(), Qt::ISODateWithMs).toLocalTime();
+                batches->addItem(QStringLiteral("批次 %1 · %2 条")
+                    .arg(time.toString("MM-dd HH:mm:ss")).arg(query.value(2).toInt()), query.value(0));
+            }
+            batches->setCurrentIndex(qMax(0, batches->findData(previous)));
+        };
+        const auto refresh = [=] {
             const auto selected = selection();
-            QSqlQuery query("SELECT id,created,operation,state,message,result FROM jobs ORDER BY created DESC,rowid DESC");
+            const auto batch = batches->currentData().toString();
+            QSqlQuery query;
+            const QString select = "SELECT id,created,operation,state,message,result,request FROM jobs";
+            if (batch.isEmpty()) {
+                query.exec(select + " ORDER BY created DESC,rowid DESC");
+            } else {
+                query.prepare(select + " WHERE json_extract(CAST(request AS TEXT),'$.batch_id')=? ORDER BY rowid");
+                query.addBindValue(batch);
+                query.exec();
+            }
             const QMap<QString, QString> names{{"synthesize", QStringLiteral("语音合成")},
                 {"slice", QStringLiteral("音频切片")}, {"asr", QStringLiteral("自动转写")},
                 {"prepare", QStringLiteral("准备数据")}, {"train_gpt", QStringLiteral("训练 GPT")},
@@ -537,7 +572,10 @@ private:
             const QMap<QString, QString> states{{"queued", QStringLiteral("排队")}, {"running", QStringLiteral("运行")},
                 {"succeeded", QStringLiteral("成功")}, {"failed", QStringLiteral("失败")},
                 {"cancelled", QStringLiteral("已取消")}, {"interrupted", QStringLiteral("中断")}};
+            const QSignalBlocker block(table);
             table->setRowCount(0);
+            bool hasQueued = false;
+            bool hasFailed = false;
             while (query.next()) {
                 const auto id = query.value(0).toString();
                 const int row = table->rowCount();
@@ -546,12 +584,28 @@ private:
                 const auto state = query.value(3).toString();
                 const auto result = QJsonDocument::fromJson(query.value(5).toByteArray()).object();
                 const auto audio = result.value("audio").toString();
+                const auto request = QJsonDocument::fromJson(query.value(6).toByteArray()).object();
+                const auto taskBatch = request.value("batch_id").toString();
+                const auto message = query.value(4).toString();
+                auto operationText = names.value(operation, operation);
+                auto details = audio.isEmpty() ? message : audio;
+                auto tooltip = details;
+                if (!taskBatch.isEmpty()) {
+                    operationText += QStringLiteral(" · %1/%2")
+                        .arg(request.value("batch_index").toInt()).arg(request.value("batch_size").toInt());
+                    const auto text = request.value("text").toString();
+                    const auto outcome = audio.isEmpty() ? message : QFileInfo(audio).fileName();
+                    tooltip = details.isEmpty() ? text : text + '\n' + details;
+                    details = outcome.isEmpty() ? text : text + QStringLiteral(" · ") + outcome;
+                }
+                hasQueued |= state == "queued";
+                hasFailed |= state == "failed" || state == "interrupted";
                 table->insertRow(row);
-                const QStringList columns{time.toString("yyyy-MM-dd HH:mm:ss"), names.value(operation, operation),
-                                          states.value(state, state), audio.isEmpty() ? query.value(4).toString() : audio};
+                const QStringList columns{time.toString("yyyy-MM-dd HH:mm:ss"), operationText, states.value(state, state), details};
                 for (int column = 0; column < columns.size(); ++column)
                     table->setItem(row, column, new QTableWidgetItem(columns[column]));
                 table->item(row, 0)->setData(Qt::UserRole, id);
+                table->item(row, 0)->setData(Qt::UserRole + 1, taskBatch);
                 table->item(row, 1)->setData(Qt::UserRole, operation);
                 table->item(row, 2)->setData(Qt::UserRole, state);
                 if (state == "succeeded")
@@ -559,16 +613,24 @@ private:
                 else if (state == "failed" || state == "interrupted")
                     table->item(row, 2)->setForeground(QColor("#ffb6a6"));
                 table->item(row, 3)->setData(Qt::UserRole, audio);
-                table->item(row, 3)->setToolTip(columns[3]);
+                table->item(row, 3)->setData(Qt::UserRole + 1, message);
+                table->item(row, 3)->setToolTip(tooltip);
                 if (id == selected)
                     table->selectRow(row);
             }
             table->setVisible(table->rowCount() > 0);
             empty->setVisible(table->rowCount() == 0);
+            empty->setText(QStringLiteral("生成语音或开始训练后，任务会出现在这里。"));
+            retryBatch->setVisible(!batch.isEmpty());
+            retryBatch->setEnabled(hasFailed);
+            cancelBatch->setVisible(!batch.isEmpty());
+            cancelBatch->setEnabled(hasQueued);
         };
+        loadBatches();
         refresh();
         const auto updateActions = [=] {
             const int row = ez::ui::selectedRow(table);
+            const auto *identity = table->item(row, 0);
             const auto *operation = table->item(row, 1);
             const auto *status = table->item(row, 2);
             const auto *result = table->item(row, 3);
@@ -581,16 +643,67 @@ private:
             more->setEnabled(status != nullptr);
             copyResult->setEnabled(result && !result->text().isEmpty());
             exportJob->setEnabled(status != nullptr);
+            filterBatch->setEnabled(identity && !identity->data(Qt::UserRole + 1).toString().isEmpty());
+        };
+        const auto showBatch = [=](const QString &batch) {
+            loadBatches();
+            const int index = batches->findData(batch);
+            if (index > 0)
+                batches->setCurrentIndex(index);
+            parent->setCurrentWidget(page);
         };
         updateActions();
         connect(table, &QTableWidget::itemSelectionChanged, page, updateActions);
-        connect(scheduler_, &ez::TaskScheduler::changed, page, [refresh, updateActions] {
+        connect(batches, &QComboBox::currentIndexChanged, page, [refresh, updateActions] {
             refresh();
             updateActions();
         });
+        connect(scheduler_, &ez::TaskScheduler::changed, page, [loadBatches, refresh, updateActions] {
+            loadBatches();
+            refresh();
+            updateActions();
+        });
+        connect(synthesis, &ez::SynthesisPanel::viewBatchRequested, page, showBatch);
+        connect(filterBatch, &QAction::triggered, page, [table, showBatch] {
+            if (const auto *item = table->item(ez::ui::selectedRow(table), 0))
+                showBatch(item->data(Qt::UserRole + 1).toString());
+        });
+        connect(cancelBatch, &QPushButton::clicked, page, [this, batches] {
+            try {
+                scheduler_->cancelQueuedBatch(batches->currentData().toString());
+            } catch (const std::exception &error) {
+                status_->setText(failureMessage(error));
+            }
+        });
+        connect(retryBatch, &QPushButton::clicked, page, [this, batches, showBatch] {
+            try {
+                QSqlQuery query;
+                query.prepare("SELECT launcher,request FROM jobs WHERE operation='synthesize'"
+                              " AND state IN ('failed','interrupted')"
+                              " AND json_extract(CAST(request AS TEXT),'$.batch_id')=? ORDER BY rowid");
+                query.addBindValue(batches->currentData().toString());
+                query.exec();
+                checkQuery(query);
+                QString launcher;
+                QList<QJsonObject> requests;
+                while (query.next()) {
+                    launcher = query.value(0).toString();
+                    requests.append(QJsonDocument::fromJson(query.value(1).toByteArray()).object());
+                }
+                query.finish();
+                if (!requests.isEmpty())
+                    showBatch(scheduler_->enqueueSynthesisBatch(launcher, requests));
+            } catch (const std::exception &error) {
+                status_->setText(failureMessage(error));
+            }
+        });
         connect(copyResult, &QAction::triggered, page, [table] {
-            if (const auto *result = table->item(ez::ui::selectedRow(table), 3); result && !result->text().isEmpty())
-                QApplication::clipboard()->setText(result->text());
+            if (const auto *result = table->item(ez::ui::selectedRow(table), 3)) {
+                const auto audio = result->data(Qt::UserRole).toString();
+                const auto message = result->data(Qt::UserRole + 1).toString();
+                const auto text = !audio.isEmpty() ? audio : message;
+                QApplication::clipboard()->setText(text.isEmpty() ? result->text() : text);
+            }
         });
         connect(exportJob, &QAction::triggered, page, [this, selection] {
             if (const auto id = selection(); !id.isEmpty())
@@ -628,11 +741,19 @@ private:
             const auto id = selection();
             if (id.isEmpty())
                 return;
-            const auto audio = table->item(ez::ui::selectedRow(table), 3)->data(Qt::UserRole).toString();
+            const auto *result = table->item(ez::ui::selectedRow(table), 3);
+            const auto audio = result->data(Qt::UserRole).toString();
             try {
                 const auto path = ez::checkedPath(audio.isEmpty() ? root_ + "/jobs/" + id : QFileInfo(audio).absolutePath());
                 if (QFileInfo(path).isDir())
                     QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+                else if (const auto message = result->data(Qt::UserRole + 1).toString(); !message.isEmpty()) {
+                    QMessageBox box(QMessageBox::Information, QStringLiteral("任务结果"), message, QMessageBox::Ok, this);
+                    box.setTextFormat(Qt::PlainText);
+                    box.exec();
+                } else {
+                    status_->setText(QStringLiteral("此任务暂无可打开的产物或日志。"));
+                }
             } catch (const std::exception &error) {
                 status_->setText(failureMessage(error));
             }
@@ -657,7 +778,7 @@ private:
                 parent->setCurrentWidget(synthesis);
             }
         });
-        ez::ui::enableRowMenu(table, {play, open, reuse, retry, cancel}, {copyResult, exportJob});
+        ez::ui::enableRowMenu(table, {play, open, reuse, retry, cancel}, {filterBatch, copyResult, exportJob});
         return page;
     }
 
@@ -888,7 +1009,7 @@ private:
             return;
         }
         try {
-            engine_.start(currentLauncher(), logPath());
+            scheduler_->startEngine(currentLauncher());
         } catch (const std::exception &error) {
             status_->setText(failureMessage(error));
         }
@@ -937,7 +1058,14 @@ int main(int argc, char **argv)
                 const auto requests = document.isArray() ? document.array() : QJsonArray{document.object()};
                 if (requests.isEmpty())
                     return 3;
-                QStringList submitted;
+                QList<QJsonObject> batch;
+                for (const auto &value : requests) {
+                    const auto request = value.toObject();
+                    if (request.value("operation").toString().isEmpty())
+                        return 3;
+                    batch.append(request);
+                }
+                const auto submitted = scheduler.enqueueBatch(parser.value(probeOption), batch);
                 const auto checkBatch = [&app, &submitted] {
                     bool failed = false;
                     QSqlQuery query;
@@ -957,18 +1085,7 @@ int main(int argc, char **argv)
                     if (!submitted.isEmpty())
                         app.exit(failed ? 3 : 0);
                 };
-                QObject::connect(&engine, &ez::EngineManager::statusChanged, &app, [&] {
-                    if (!engine.active() && !scheduler.running())
-                        app.exit(2);
-                });
-                QString first;
-                for (const auto &value : requests) {
-                    const auto request = value.toObject();
-                    if (request.value("operation").toString().isEmpty())
-                        return 3;
-                    submitted << scheduler.enqueue(parser.value(probeOption), request);
-                }
-                first = submitted.first();
+                const auto first = submitted.constFirst();
                 QObject::connect(&scheduler, &ez::TaskScheduler::changed, &app, checkBatch, Qt::QueuedConnection);
                 QTimer::singleShot(0, &app, checkBatch);
                 QTimer cancellation;

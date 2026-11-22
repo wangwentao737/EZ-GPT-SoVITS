@@ -16,8 +16,12 @@ class TaskScheduler final : public QObject {
     Q_OBJECT
 public:
     TaskScheduler(QString dataRoot, QString defaultOutputRoot, EngineManager &engine, QObject *parent = nullptr);
-    QString enqueue(const QString &launcher, const QJsonObject &request, QJsonObject project = {});
+    QString enqueue(const QString &launcher, QJsonObject request, const QJsonObject &project = {});
+    QStringList enqueueBatch(const QString &launcher, const QList<QJsonObject> &requests);
+    QString enqueueSynthesisBatch(const QString &launcher, QList<QJsonObject> requests);
+    void startEngine(const QString &launcher);
     void cancel(const QString &id);
+    void cancelQueuedBatch(const QString &batch);
     void stop();
     bool running() const;
 
@@ -29,6 +33,8 @@ signals:
 
 private:
     void next();
+    QStringList enqueueRequests(const QString &launcher, const QList<QJsonObject> &requests, QJsonObject project = {});
+    void failQueued(const QString &launcher, const QString &message);
     void finish(bool processSucceeded, QString message);
     void forceCancel();
     void continueAfterCancellation();
@@ -40,6 +46,7 @@ private:
     QString defaultOutputRoot_;
     QString active_;
     QString jobPath_;
+    QString engineFailure_;
     qint64 engineLogOffset_ = 0;
     QJsonObject activeRequest_;
     EngineManager &engine_;
