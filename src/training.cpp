@@ -4,8 +4,11 @@
 #include "resources.h"
 #include "ui.h"
 
+#include <QAction>
+#include <QAudioDevice>
 #include <QAudioOutput>
 #include <QComboBox>
+#include <QDesktopServices>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -16,6 +19,7 @@
 #include <QJsonDocument>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMediaDevices>
 #include <QMediaPlayer>
 #include <QPushButton>
 #include <QRegularExpression>
@@ -123,13 +127,78 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     labels_->horizontalHeader()->setStretchLastSection(true);
     layout->addWidget(labels_, 1);
     player_ = new QMediaPlayer(this);
-    player_->setAudioOutput(new QAudioOutput(player_));
+    auto *audioOutput = new QAudioOutput(player_);
+    player_->setAudioOutput(audioOutput);
+    auto *devices = new QMediaDevices(this);
+    auto *outputChoice = new QComboBox(this);
+    outputChoice->setAccessibleName(QStringLiteral("试听输出设备"));
+    outputChoice->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    outputChoice->setMinimumContentsLength(14);
+    outputChoice->setToolTip(QStringLiteral("选择试听片段使用的扬声器或耳机。下次播放时生效。"));
+    const auto updateDevices = [outputChoice] {
+        const auto previous = outputChoice->currentData();
+        outputChoice->clear();
+        outputChoice->addItem(QStringLiteral("系统默认输出"), QByteArray());
+        for (const auto &device : QMediaDevices::audioOutputs())
+            outputChoice->addItem(device.description(), device.id());
+        outputChoice->setCurrentIndex(qMax(0, outputChoice->findData(previous)));
+    };
+    updateDevices();
+    connect(devices, &QMediaDevices::audioOutputsChanged, this, updateDevices);
+
+    auto *playback = ui::hint(QStringLiteral("选中一条片段可试听。"), this);
+    playback->setObjectName("clipPlayback");
+    playback->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     auto *labelsActions = new QHBoxLayout;
-    auto *playClip = button(labelsActions, QStringLiteral("试听片段"), [this] {
+    const auto selectedClip = [this] {
         const auto *item = labels_->item(ui::selectedRow(labels_), 0);
-        if (item) {
-            player_->setSource(QUrl::fromLocalFile(checkedPath(item->data(Qt::UserRole).toString())));
+        return item ? item->data(Qt::UserRole).toString() : QString();
+    };
+    const auto playableClip = [selectedClip] {
+        const auto path = checkedPath(selectedClip());
+        const QFileInfo file(path);
+        require(file.isFile() && file.isReadable() && file.size() > 0,
+                QStringLiteral("无法读取片段：%1。请重新导入该片段或重新切片。").arg(file.fileName()));
+        return QUrl::fromLocalFile(path);
+    };
+    auto *playClip = button(labelsActions, QStringLiteral("试听片段"), [=, this] {
+        try {
+            const auto source = playableClip();
+            if (player_->source() == source && player_->playbackState() == QMediaPlayer::PlayingState) {
+                player_->stop();
+                playback->setText(QStringLiteral("已停止试听。"));
+                return;
+            }
+            player_->stop();
+            auto device = QMediaDevices::defaultAudioOutput();
+            const auto choice = outputChoice->currentData().toByteArray();
+            if (!choice.isEmpty()) {
+                for (const auto &output : QMediaDevices::audioOutputs()) {
+                    if (output.id() == choice) {
+                        device = output;
+                        break;
+                    }
+                }
+            }
+            require(!device.isNull(), QStringLiteral("没有可用的音频输出设备。请连接耳机或扬声器后重试。"));
+            audioOutput->setDevice(device);
+            playback->setText(QStringLiteral("正在加载片段 · %1").arg(source.fileName()));
+            player_->setSource({});
+            player_->setSource(source);
             player_->play();
+        } catch (const std::exception &error) {
+            playback->setText(QString::fromUtf8(error.what()));
+        }
+    });
+    auto *openClip = new QAction(QStringLiteral("用系统播放器打开"), this);
+    connect(openClip, &QAction::triggered, this, [=, this] {
+        try {
+            const auto source = playableClip();
+            player_->stop();
+            require(QDesktopServices::openUrl(source), QStringLiteral("无法打开系统播放器。"));
+            playback->setText(QStringLiteral("已发送到系统播放器 · %1").arg(source.fileName()));
+        } catch (const std::exception &error) {
+            playback->setText(QString::fromUtf8(error.what()));
         }
     });
     auto *editClip = button(labelsActions, QStringLiteral("编辑文本"), [this] {
@@ -145,17 +214,40 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
         if (row >= 0)
             labels_->removeRow(row);
     });
-    const auto updateClipActions = [this, playClip, editClip, excludeClip] {
-        const bool selected = ui::selectedRow(labels_) >= 0;
+    const auto updateClipActions = [=, this] {
+        const auto path = selectedClip();
+        const bool selected = !path.isEmpty();
         const bool canEdit = selected && !busy();
+        const bool playing = player_->playbackState() == QMediaPlayer::PlayingState
+            && player_->source() == QUrl::fromLocalFile(path);
+        playClip->setText(playing ? QStringLiteral("停止试听") : QStringLiteral("试听片段"));
         playClip->setEnabled(selected);
+        openClip->setEnabled(selected);
         editClip->setEnabled(canEdit);
         excludeClip->setEnabled(canEdit);
     };
     updateClipActions();
     connect(labels_, &QTableWidget::itemSelectionChanged, this, updateClipActions);
     connect(&scheduler_, &TaskScheduler::changed, this, updateClipActions);
-    ui::enableRowMenu(labels_, {playClip, editClip, excludeClip});
+    connect(player_, &QMediaPlayer::playbackStateChanged, this, [=, this](QMediaPlayer::PlaybackState state) {
+        updateClipActions();
+        if (state == QMediaPlayer::PlayingState) {
+            playback->setText(QStringLiteral("正在试听 · %1").arg(player_->source().fileName()));
+            playback->setToolTip(audioOutput->device().description());
+        }
+    });
+    connect(player_, &QMediaPlayer::mediaStatusChanged, this, [playback](QMediaPlayer::MediaStatus state) {
+        if (state == QMediaPlayer::EndOfMedia)
+            playback->setText(QStringLiteral("试听结束。"));
+    });
+    connect(player_, &QMediaPlayer::errorOccurred, this, [playback](QMediaPlayer::Error, const QString &detail) {
+        playback->setText(QStringLiteral("无法试听：%1。可右键选择「用系统播放器打开」。").arg(detail));
+    });
+    connect(projects_, &QComboBox::currentIndexChanged, this, [=, this] {
+        player_->setSource({});
+        playback->setText(QStringLiteral("选中一条片段可试听。"));
+    });
+    ui::enableRowMenu(labels_, {playClip, editClip, excludeClip}, {openClip});
     button(labelsActions, QStringLiteral("保存标注"), [this] { saveLabels(); });
     prepare_ = button(labelsActions, QStringLiteral("准备数据"), [this] {
         saveLabels();
@@ -163,6 +255,10 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     });
     labelsActions->addStretch();
     layout->addLayout(labelsActions);
+    auto *playbackRow = new QHBoxLayout;
+    playbackRow->addWidget(playback, 1);
+    playbackRow->addWidget(outputChoice);
+    layout->addLayout(playbackRow);
 
     auto *training = new QHBoxLayout;
     gpu_ = new QSpinBox(this);
