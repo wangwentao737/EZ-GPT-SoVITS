@@ -487,12 +487,10 @@ private:
         auto *page = new QWidget(parent);
         auto *layout = new QVBoxLayout(page);
         ez::ui::pageHeader(layout, page, QStringLiteral("任务记录"),
-            QStringLiteral("选中任务可查看成品和日志。合成失败可以重试，训练失败可回项目重跑当前阶段。"));
+            QStringLiteral("右键单击任务，可查看产物或日志，也可按任务状态选择播放、复用、重试或取消。"));
         auto *table = new QTableWidget(0, 4, page);
         table->setHorizontalHeaderLabels({QStringLiteral("创建时间"), QStringLiteral("操作"),
                                           QStringLiteral("状态"), QStringLiteral("结果")});
-        table->setSelectionBehavior(QAbstractItemView::SelectRows);
-        table->setSelectionMode(QAbstractItemView::SingleSelection);
         table->setEditTriggers(QAbstractItemView::NoEditTriggers);
         ez::ui::styleTable(table);
         table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
@@ -579,6 +577,8 @@ private:
             cancel->setEnabled(state == "queued" || state == "running");
             retry->setEnabled(state == "failed" || state == "interrupted" || state == "cancelled");
             more->setEnabled(status != nullptr);
+            copyResult->setEnabled(result && !result->text().isEmpty());
+            exportJob->setEnabled(status != nullptr);
         };
         updateActions();
         connect(table, &QTableWidget::currentCellChanged, page, updateActions);
@@ -655,6 +655,7 @@ private:
                 parent->setCurrentWidget(synthesis);
             }
         });
+        ez::ui::enableRowMenu(table, {play, open, reuse, retry, cancel}, {copyResult, exportJob});
         return page;
     }
 

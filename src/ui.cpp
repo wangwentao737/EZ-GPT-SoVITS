@@ -1,11 +1,88 @@
 #include "ui.h"
 
+#include <QAbstractButton>
+#include <QAction>
+#include <QContextMenuEvent>
 #include <QHeaderView>
 #include <QLabel>
+#include <QMap>
+#include <QMenu>
+#include <QPersistentModelIndex>
+#include <QPointer>
 #include <QTableWidget>
 #include <QVBoxLayout>
+#include <functional>
 
 namespace ez::ui {
+namespace {
+
+class TableRowMenu final : public QObject {
+public:
+    TableRowMenu(QTableWidget *table, const QList<QAbstractButton *> &buttons, const QList<QAction *> &actions)
+        : QObject(table), table_(table), buttons_(buttons), actions_(actions)
+    {
+        table_->installEventFilter(this);
+        table_->viewport()->installEventFilter(this);
+    }
+
+private:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (event->type() != QEvent::ContextMenu)
+            return QObject::eventFilter(watched, event);
+
+        auto *context = static_cast<QContextMenuEvent *>(event);
+        const auto keyboard = context->reason() == QContextMenuEvent::Keyboard;
+        const auto index = keyboard ? table_->currentIndex()
+            : table_->indexAt(table_->viewport()->mapFromGlobal(context->globalPos()));
+        if (!index.isValid())
+            return true;
+
+        table_->setCurrentCell(index.row(), index.column(), QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+        const QPersistentModelIndex selected(index);
+        QMenu menu(table_);
+        QMap<QAction *, std::function<void()>> operations;
+        for (auto *button : buttons_) {
+            if (button->isEnabled() && button->isVisible()) {
+                const QPointer<QAbstractButton> control(button);
+                operations.insert(menu.addAction(button->text()), [control] {
+                    if (control)
+                        control->click();
+                });
+            }
+        }
+        for (auto *action : actions_) {
+            if (action->isEnabled() && action->isVisible()) {
+                const QPointer<QAction> control(action);
+                operations.insert(menu.addAction(action->text()), [control] {
+                    if (control && control->isEnabled())
+                        control->trigger();
+                });
+            }
+        }
+        if (operations.isEmpty())
+            return true;
+
+        // A background refresh can rebuild the table while the menu is open.
+        connect(table_->model(), &QAbstractItemModel::rowsAboutToBeRemoved, &menu, &QMenu::close);
+        connect(table_->model(), &QAbstractItemModel::modelAboutToBeReset, &menu, &QMenu::close);
+        if (keyboard)
+            table_->scrollTo(index);
+        const auto anchor = keyboard ? table_->viewport()->mapToGlobal(table_->visualRect(index).bottomLeft())
+                                     : context->globalPos();
+        const auto chosen = menu.exec(anchor);
+        const auto operation = operations.constFind(chosen);
+        if (operation != operations.cend() && selected.isValid() && table_->currentRow() == selected.row())
+            operation.value()();
+        return true;
+    }
+
+    QTableWidget *table_;
+    QList<QAbstractButton *> buttons_;
+    QList<QAction *> actions_;
+};
+
+}
 
 QString stylesheet()
 {
@@ -115,13 +192,23 @@ QString stylesheet()
         QTableWidget {
             background: #131d2b;
             alternate-background-color: #182433;
-            selection-background-color: #244a55;
-            selection-color: #eefcf9;
+            selection-background-color: #2b6267;
+            selection-color: #f5fffd;
             border: 1px solid #35465d;
             border-radius: 8px;
             gridline-color: #2a384b;
         }
-        QTableWidget::item { padding: 0 8px; }
+        QTableWidget::item {
+            padding: 0 8px;
+            border-top: 1px solid transparent;
+            border-bottom: 1px solid transparent;
+        }
+        QTableWidget::item:selected {
+            background: #2b6267;
+            color: #f5fffd;
+            border-top: 1px solid #69a9ad;
+            border-bottom: 1px solid #69a9ad;
+        }
         QHeaderView { background: #1e2c3d; }
         QHeaderView::section {
             background: #1e2c3d;
@@ -163,11 +250,19 @@ void pageHeader(QVBoxLayout *layout, QWidget *page, const QString &title, const 
 
 void styleTable(QTableWidget *table)
 {
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setSelectionMode(QAbstractItemView::SingleSelection);
     table->setAlternatingRowColors(true);
     table->setShowGrid(false);
     table->verticalHeader()->hide();
     table->verticalHeader()->setDefaultSectionSize(35);
     table->horizontalHeader()->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+}
+
+void enableRowMenu(QTableWidget *table, const QList<QAbstractButton *> &buttons,
+                   const QList<QAction *> &actions)
+{
+    new TableRowMenu(table, buttons, actions);
 }
 
 }

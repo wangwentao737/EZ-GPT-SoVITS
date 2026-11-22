@@ -76,7 +76,7 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
 
     auto *layout = new QVBoxLayout(this);
     ui::pageHeader(layout, this, QStringLiteral("训练项目"),
-        QStringLiteral("按录音、标注和训练的顺序操作。已有切片或标注时，可直接导入。"));
+        QStringLiteral("已有切片或标注时可直接导入。右键单击片段，可以试听、编辑文本或排除片段。"));
     auto *selection = new QHBoxLayout;
     projects_ = new QComboBox(this);
     projects_->setPlaceholderText(QStringLiteral("创建或选择训练项目"));
@@ -115,7 +115,6 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
 
     labels_ = new QTableWidget(0, 3, this);
     labels_->setHorizontalHeaderLabels({QStringLiteral("片段"), QStringLiteral("语言"), QStringLiteral("文本")});
-    labels_->setSelectionBehavior(QAbstractItemView::SelectRows);
     labels_->setAccessibleName(QStringLiteral("音频切片与标注"));
     ui::styleTable(labels_);
     labels_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Interactive);
@@ -126,17 +125,35 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     player_ = new QMediaPlayer(this);
     player_->setAudioOutput(new QAudioOutput(player_));
     auto *labelsActions = new QHBoxLayout;
-    button(labelsActions, QStringLiteral("试听片段"), [this] {
+    auto *playClip = button(labelsActions, QStringLiteral("试听片段"), [this] {
         const auto *item = labels_->item(labels_->currentRow(), 0);
         if (item) {
             player_->setSource(QUrl::fromLocalFile(checkedPath(item->data(Qt::UserRole).toString())));
             player_->play();
         }
     });
-    button(labelsActions, QStringLiteral("排除片段"), [this] {
+    auto *editClip = button(labelsActions, QStringLiteral("编辑文本"), [this] {
+        require(!busy(), QStringLiteral("请等待当前阶段完成"));
+        if (auto *item = labels_->item(labels_->currentRow(), 2)) {
+            labels_->setCurrentItem(item);
+            labels_->editItem(item);
+        }
+    });
+    auto *excludeClip = button(labelsActions, QStringLiteral("排除片段"), [this] {
         require(!busy(), QStringLiteral("请等待当前阶段完成"));
         labels_->removeRow(labels_->currentRow());
     });
+    const auto updateClipActions = [this, playClip, editClip, excludeClip] {
+        const bool selected = labels_->item(labels_->currentRow(), 0) != nullptr;
+        const bool canEdit = selected && !busy();
+        playClip->setEnabled(selected);
+        editClip->setEnabled(canEdit);
+        excludeClip->setEnabled(canEdit);
+    };
+    updateClipActions();
+    connect(labels_, &QTableWidget::currentCellChanged, this, updateClipActions);
+    connect(&scheduler_, &TaskScheduler::changed, this, updateClipActions);
+    ui::enableRowMenu(labels_, {playClip, editClip, excludeClip});
     button(labelsActions, QStringLiteral("保存标注"), [this] { saveLabels(); });
     prepare_ = button(labelsActions, QStringLiteral("准备数据"), [this] {
         saveLabels();

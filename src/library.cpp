@@ -276,7 +276,7 @@ LibraryPage::LibraryPage(QString root, const QString &defaultOutput, TaskSchedul
 {
     auto *layout = new QVBoxLayout(this);
     ui::pageHeader(layout, this, QStringLiteral("声音与素材"),
-        QStringLiteral("按类型、项目或声音筛选。选中一项可查看文件位置、参考文本和关联任务。"));
+        QStringLiteral("按类型、项目或声音筛选。左键查看详情，右键可播放、打开文件位置或重命名声音。"));
     auto *filters = new QHBoxLayout;
     kind_ = new QComboBox(this);
     kind_->addItem(QStringLiteral("全部类型"), -1);
@@ -297,8 +297,6 @@ LibraryPage::LibraryPage(QString root, const QString &defaultOutput, TaskSchedul
     table_ = new QTableWidget(0, 4, this);
     table_->setHorizontalHeaderLabels({QStringLiteral("名称"), QStringLiteral("类型"),
         QStringLiteral("模型家族"), QStringLiteral("关联")});
-    table_->setSelectionMode(QAbstractItemView::SingleSelection);
-    table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
     ui::styleTable(table_);
     table_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
@@ -409,6 +407,7 @@ LibraryPage::LibraryPage(QString root, const QString &defaultOutput, TaskSchedul
         });
     }
     folders->setMenu(menu);
+    ui::enableRowMenu(table_, {rename_, play_, folder_, remove_});
     showDetails();
 }
 
