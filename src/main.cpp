@@ -487,7 +487,7 @@ private:
         auto *page = new QWidget(parent);
         auto *layout = new QVBoxLayout(page);
         ez::ui::pageHeader(layout, page, QStringLiteral("任务记录"),
-            QStringLiteral("右键单击任务，可查看产物或日志，也可按任务状态选择播放、复用、重试或取消。"));
+            QStringLiteral("左键选中一条任务。右键可查看产物或日志，并按任务状态选择播放、复用、重试或取消。"));
         auto *table = new QTableWidget(0, 4, page);
         table->setHorizontalHeaderLabels({QStringLiteral("创建时间"), QStringLiteral("操作"),
                                           QStringLiteral("状态"), QStringLiteral("结果")});
@@ -523,7 +523,7 @@ private:
         actions->addStretch();
         layout->addLayout(actions);
         const auto selection = [table] {
-            const auto *item = table->item(table->currentRow(), 0);
+            const auto *item = table->item(ez::ui::selectedRow(table), 0);
             return item ? item->data(Qt::UserRole).toString() : QString();
         };
         const auto refresh = [table, empty, selection] {
@@ -567,9 +567,10 @@ private:
         };
         refresh();
         const auto updateActions = [=] {
-            const auto *operation = table->item(table->currentRow(), 1);
-            const auto *status = table->item(table->currentRow(), 2);
-            const auto *result = table->item(table->currentRow(), 3);
+            const int row = ez::ui::selectedRow(table);
+            const auto *operation = table->item(row, 1);
+            const auto *status = table->item(row, 2);
+            const auto *result = table->item(row, 3);
             const auto state = status ? status->data(Qt::UserRole).toString() : QString();
             play->setEnabled(result && !result->data(Qt::UserRole).toString().isEmpty());
             open->setEnabled(status != nullptr);
@@ -581,13 +582,13 @@ private:
             exportJob->setEnabled(status != nullptr);
         };
         updateActions();
-        connect(table, &QTableWidget::currentCellChanged, page, updateActions);
+        connect(table, &QTableWidget::itemSelectionChanged, page, updateActions);
         connect(scheduler_, &ez::TaskScheduler::changed, page, [refresh, updateActions] {
             refresh();
             updateActions();
         });
         connect(copyResult, &QAction::triggered, page, [table] {
-            if (const auto *result = table->item(table->currentRow(), 3); result && !result->text().isEmpty())
+            if (const auto *result = table->item(ez::ui::selectedRow(table), 3); result && !result->text().isEmpty())
                 QApplication::clipboard()->setText(result->text());
         });
         connect(exportJob, &QAction::triggered, page, [this, selection] {
@@ -626,7 +627,7 @@ private:
             const auto id = selection();
             if (id.isEmpty())
                 return;
-            const auto audio = table->item(table->currentRow(), 3)->data(Qt::UserRole).toString();
+            const auto audio = table->item(ez::ui::selectedRow(table), 3)->data(Qt::UserRole).toString();
             try {
                 const auto path = ez::checkedPath(audio.isEmpty() ? root_ + "/jobs/" + id : QFileInfo(audio).absolutePath());
                 if (QFileInfo(path).isDir())
@@ -636,7 +637,7 @@ private:
             }
         });
         connect(play, &QPushButton::clicked, page, [this, parent, synthesis, table] {
-            const auto *item = table->item(table->currentRow(), 3);
+            const auto *item = table->item(ez::ui::selectedRow(table), 3);
             if (!item || item->data(Qt::UserRole).toString().isEmpty())
                 return;
             try {

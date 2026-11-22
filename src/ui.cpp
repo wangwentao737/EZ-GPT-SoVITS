@@ -46,7 +46,7 @@ private:
             if (button->isEnabled() && button->isVisible()) {
                 const QPointer<QAbstractButton> control(button);
                 operations.insert(menu.addAction(button->text()), [control] {
-                    if (control)
+                    if (control && control->isEnabled() && control->isVisible())
                         control->click();
                 });
             }
@@ -72,7 +72,7 @@ private:
                                      : context->globalPos();
         const auto chosen = menu.exec(anchor);
         const auto operation = operations.constFind(chosen);
-        if (operation != operations.cend() && selected.isValid() && table_->currentRow() == selected.row())
+        if (operation != operations.cend() && selected.isValid() && selectedRow(table_) == selected.row())
             operation.value()();
         return true;
     }
@@ -152,7 +152,7 @@ QString stylesheet()
         QListWidget#navigation::item:hover { color: #ffffff; background: #202e40; border-radius: 8px; }
         QListWidget#navigation::item:selected {
             color: #b0f5e3;
-            background: #203a43;
+            background: #284c56;
             border-left: 3px solid #6ce1c5;
             border-radius: 8px;
         }
@@ -192,7 +192,7 @@ QString stylesheet()
         QTableWidget {
             background: #131d2b;
             alternate-background-color: #182433;
-            selection-background-color: #2b6267;
+            selection-background-color: #347981;
             selection-color: #f5fffd;
             border: 1px solid #35465d;
             border-radius: 8px;
@@ -203,11 +203,12 @@ QString stylesheet()
             border-top: 1px solid transparent;
             border-bottom: 1px solid transparent;
         }
+        QTableWidget::item:hover:!selected { background: #25394a; }
         QTableWidget::item:selected {
-            background: #2b6267;
-            color: #f5fffd;
-            border-top: 1px solid #69a9ad;
-            border-bottom: 1px solid #69a9ad;
+            background: #347981;
+            color: #ffffff;
+            border-top: 1px solid #9de7e0;
+            border-bottom: 1px solid #9de7e0;
         }
         QHeaderView { background: #1e2c3d; }
         QHeaderView::section {
@@ -253,10 +254,17 @@ void styleTable(QTableWidget *table)
     table->setSelectionBehavior(QAbstractItemView::SelectRows);
     table->setSelectionMode(QAbstractItemView::SingleSelection);
     table->setAlternatingRowColors(true);
+    table->setMouseTracking(true);
     table->setShowGrid(false);
     table->verticalHeader()->hide();
     table->verticalHeader()->setDefaultSectionSize(35);
     table->horizontalHeader()->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+}
+
+int selectedRow(const QTableWidget *table)
+{
+    const auto rows = table->selectionModel()->selectedRows();
+    return rows.isEmpty() ? -1 : rows.constFirst().row();
 }
 
 void enableRowMenu(QTableWidget *table, const QList<QAbstractButton *> &buttons,

@@ -5,6 +5,7 @@
 #include "synthesis.h"
 #include "ui.h"
 
+#include <QAction>
 #include <QComboBox>
 #include <QDesktopServices>
 #include <QDir>
@@ -264,6 +265,7 @@ private:
     QLabel *empty_;
     QPlainTextEdit *details_;
     QLabel *status_;
+    QAction *useVoice_;
     QPushButton *rename_;
     QPushButton *remove_;
     QPushButton *play_;
@@ -276,7 +278,7 @@ LibraryPage::LibraryPage(QString root, const QString &defaultOutput, TaskSchedul
 {
     auto *layout = new QVBoxLayout(this);
     ui::pageHeader(layout, this, QStringLiteral("声音与素材"),
-        QStringLiteral("按类型、项目或声音筛选。左键查看详情，右键可播放、打开文件位置或重命名声音。"));
+        QStringLiteral("左键选中一项可查看详情。右键可使用声音、播放音频或打开文件位置。"));
     auto *filters = new QHBoxLayout;
     kind_ = new QComboBox(this);
     kind_->addItem(QStringLiteral("全部类型"), -1);
@@ -318,6 +320,7 @@ LibraryPage::LibraryPage(QString root, const QString &defaultOutput, TaskSchedul
     auto *actions = new QHBoxLayout;
     auto *importVoice = new QPushButton(QStringLiteral("导入声音"), this);
     importVoice->setObjectName("primary");
+    useVoice_ = new QAction(QStringLiteral("使用此声音"), this);
     rename_ = new QPushButton(QStringLiteral("重命名声音"), this);
     play_ = new QPushButton(QStringLiteral("播放"), this);
     folder_ = new QPushButton(QStringLiteral("所在目录"), this);
@@ -332,7 +335,7 @@ LibraryPage::LibraryPage(QString root, const QString &defaultOutput, TaskSchedul
 
     for (auto *box : {kind_, voice_, project_})
         connect(box, &QComboBox::currentIndexChanged, this, [this] { refill(); });
-    connect(table_, &QTableWidget::currentCellChanged, this, [this] { showDetails(); });
+    connect(table_, &QTableWidget::itemSelectionChanged, this, &LibraryPage::showDetails);
     connect(&scheduler, &TaskScheduler::changed, this, [this] {
         if (isVisible())
             reload();
@@ -362,6 +365,11 @@ LibraryPage::LibraryPage(QString root, const QString &defaultOutput, TaskSchedul
     connect(importVoice, &QPushButton::clicked, this, [=] {
         tabs->setCurrentWidget(synthesis);
         synthesis->importVoice();
+    });
+    connect(useVoice_, &QAction::triggered, this, [this, tabs] {
+        const auto id = selection().mid(6);
+        synthesis_->refreshVoices(id);
+        tabs->setCurrentWidget(synthesis_);
     });
     connect(rename_, &QPushButton::clicked, this, &LibraryPage::renameVoice);
     connect(remove_, &QPushButton::clicked, this, &LibraryPage::removeCopy);
@@ -407,7 +415,7 @@ LibraryPage::LibraryPage(QString root, const QString &defaultOutput, TaskSchedul
         });
     }
     folders->setMenu(menu);
-    ui::enableRowMenu(table_, {rename_, play_, folder_, remove_});
+    ui::enableRowMenu(table_, {rename_, play_, folder_, remove_}, {useVoice_});
     showDetails();
 }
 
@@ -429,7 +437,7 @@ void LibraryPage::reload()
 
 QString LibraryPage::selection() const
 {
-    const auto *item = table_->item(table_->currentRow(), 0);
+    const auto *item = table_->item(ui::selectedRow(table_), 0);
     return item ? item->data(Qt::UserRole).toString() : QString();
 }
 
@@ -502,7 +510,8 @@ void LibraryPage::showDetails()
     const auto selected = selection();
     const auto preset = selected.startsWith("voice:") ? library_.voices.constFind(selected.mid(6)) : library_.voices.cend();
     const auto file = library_.files.constFind(selected);
-    rename_->setEnabled(preset != library_.voices.cend());
+    useVoice_->setEnabled(preset != library_.voices.cend());
+    rename_->setEnabled(useVoice_->isEnabled());
     remove_->setEnabled(file != library_.files.cend() && file->managedCopy);
     play_->setEnabled(file != library_.files.cend()
                       && (file->kind == Reference || file->kind == Recording || file->kind == Clip || file->kind == Output));
