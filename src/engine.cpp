@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <iphlpapi.h>
 
+#include <QCoreApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -15,6 +16,7 @@
 #include <QNetworkAccessManager>
 #include <QNetworkProxy>
 #include <QNetworkReply>
+#include <QProcessEnvironment>
 #include <QStorageInfo>
 #include <QtConcurrentRun>
 #include <stdexcept>
@@ -256,9 +258,18 @@ void EngineManager::start(const QString &launcher, const QString &logPath)
     GetSystemDirectoryW(system, MAX_PATH);
     const std::wstring cmd = std::wstring(system) + L"\\cmd.exe";
     const auto cwd = QDir::toNativeSeparators(dir);
+    // Both Gradio servers inherit this browser command through the launcher.
+    auto environment = QProcessEnvironment::systemEnvironment();
+    environment.insert("BROWSER", QStringLiteral("\"%1\" %2 %s")
+        .arg(QCoreApplication::applicationFilePath(), QString::fromLatin1(engineBrowserNotification)));
+    auto variables = environment.toStringList();
+    variables.sort(Qt::CaseInsensitive);
+    auto childEnvironment = variables.join(QChar(u'\0'));
+    childEnvironment.append(QChar(u'\0'));
     const bool launched = jobReady && input != INVALID_HANDLE_VALUE
-        && CreateProcessW(cmd.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
-                          nullptr, reinterpret_cast<LPCWSTR>(cwd.utf16()), &startup, &created);
+        && CreateProcessW(cmd.c_str(), command.data(), nullptr, nullptr, TRUE,
+                          CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                          childEnvironment.data(), reinterpret_cast<LPCWSTR>(cwd.utf16()), &startup, &created);
     const auto launchError = GetLastError();
     CloseHandle(output);
     if (input != INVALID_HANDLE_VALUE)

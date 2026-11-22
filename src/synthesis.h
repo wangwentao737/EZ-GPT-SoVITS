@@ -13,6 +13,7 @@ class QLineEdit;
 class QLabel;
 class QMediaPlayer;
 class QPushButton;
+class QSpinBox;
 
 namespace ez {
 
@@ -32,6 +33,11 @@ public:
 private:
     void generate();
     void receiveAudio(const QString &id, const QJsonObject &result);
+    void applyVoiceDefaults();
+    void applySynthesisOptions(const QJsonObject &options);
+    void saveVoiceDefaults();
+    QJsonObject selectedVoiceSettings() const;
+    QJsonObject synthesisOptions() const;
 
     QString root_;
     TaskScheduler &scheduler_;
@@ -42,7 +48,13 @@ private:
     QComboBox *language_ = nullptr;
     QPlainTextEdit *text_ = nullptr;
     QCheckBox *batch_ = nullptr;
+    QPushButton *advanced_ = nullptr;
+    QPushButton *saveDefaults_ = nullptr;
+    QComboBox *split_ = nullptr;
     QDoubleSpinBox *speed_ = nullptr;
+    QSpinBox *topK_ = nullptr;
+    QDoubleSpinBox *topP_ = nullptr;
+    QDoubleSpinBox *temperature_ = nullptr;
     QLineEdit *seed_ = nullptr;
     QLabel *status_ = nullptr;
     QMediaPlayer *player_ = nullptr;

@@ -15,6 +15,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QGridLayout>
 #include <QJsonDocument>
 #include <QLabel>
 #include <QLineEdit>
@@ -23,6 +24,8 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSaveFile>
+#include <QSignalBlocker>
+#include <QSpinBox>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QStorageInfo>
@@ -37,6 +40,18 @@ namespace {
 
 const QStringList languages{QStringLiteral("中文"), QStringLiteral("英文"), QStringLiteral("日文"),
     QStringLiteral("粤语"), QStringLiteral("韩文"), QStringLiteral("多语种混合")};
+const QStringList splits{QStringLiteral("不切"), QStringLiteral("凑四句一切"), QStringLiteral("凑50字一切"),
+    QStringLiteral("按中文句号。切"), QStringLiteral("按英文句号.切"), QStringLiteral("按标点符号切")};
+constexpr auto defaultSplit = 1;
+constexpr auto defaultTopK = 15;
+constexpr auto defaultTopP = 1.0;
+constexpr auto defaultTemperature = 1.0;
+constexpr auto voiceSettingsRole = Qt::UserRole + 1;
+
+QString supportedLanguage(const QString &language)
+{
+    return languages.contains(language) ? language : languages.constFirst();
+}
 
 void execute(QSqlQuery &query)
 {
@@ -116,6 +131,7 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
     language_ = new QComboBox(this);
     language_->addItems(languages);
     language_->setAccessibleName(QStringLiteral("台词语言"));
+    connect(voices_, &QComboBox::currentIndexChanged, this, &SynthesisPanel::applyVoiceDefaults);
     auto *import = new QPushButton(QStringLiteral("导入声音"), this);
     auto *voiceLabel = new QLabel(QStringLiteral("声音"), this);
     voiceLabel->setObjectName("fieldLabel");
@@ -136,30 +152,66 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
     auto *parameters = new QHBoxLayout;
     batch_ = new QCheckBox(QStringLiteral("每行生成一条音频"), this);
     parameters->addWidget(batch_);
-    auto *advanced = new QPushButton(QStringLiteral("高级参数"), this);
-    advanced->setCheckable(true);
+    advanced_ = new QPushButton(QStringLiteral("高级参数"), this);
+    advanced_->setCheckable(true);
     parameters->addStretch(1);
-    parameters->addWidget(advanced);
+    parameters->addWidget(advanced_);
     layout->addLayout(parameters);
     auto *advancedPanel = new QWidget(this);
     advancedPanel->setObjectName("card");
-    auto *advancedLayout = new QHBoxLayout(advancedPanel);
+    auto *advancedLayout = new QGridLayout(advancedPanel);
     advancedLayout->setContentsMargins(11, 8, 11, 8);
-    speed_ = new QDoubleSpinBox(this);
+    advancedLayout->setHorizontalSpacing(12);
+    advancedLayout->setVerticalSpacing(8);
+    const auto field = [advancedLayout, advancedPanel](int row, int column, const QString &name, QWidget *control) {
+        auto *label = new QLabel(name, advancedPanel);
+        label->setObjectName("fieldLabel");
+        label->setBuddy(control);
+        control->setAccessibleName(name);
+        advancedLayout->addWidget(label, row, 2 * column);
+        advancedLayout->addWidget(control, row, 2 * column + 1);
+        advancedLayout->setColumnStretch(2 * column + 1, 1);
+    };
+    split_ = new QComboBox(advancedPanel);
+    split_->addItems(splits);
+    split_->setCurrentIndex(defaultSplit);
+    field(0, 0, QStringLiteral("切句"), split_);
+    speed_ = new QDoubleSpinBox(advancedPanel);
     speed_->setRange(0.60, 1.65);
     speed_->setSingleStep(0.05);
     speed_->setValue(1);
-    speed_->setPrefix(QStringLiteral("语速 "));
-    seed_ = new QLineEdit(this);
-    seed_->setPlaceholderText(QStringLiteral("随机种子（选填）"));
+    field(0, 1, QStringLiteral("语速"), speed_);
+    seed_ = new QLineEdit(advancedPanel);
+    seed_->setPlaceholderText(QStringLiteral("留空为随机"));
     seed_->setMaxLength(10);
-    advancedLayout->addWidget(speed_);
-    advancedLayout->addWidget(seed_, 1);
+    field(0, 2, QStringLiteral("种子"), seed_);
+    topK_ = new QSpinBox(advancedPanel);
+    topK_->setRange(1, 100);
+    topK_->setValue(defaultTopK);
+    topK_->setToolTip(QStringLiteral("每步采样最多考虑的候选数。"));
+    field(1, 0, QStringLiteral("Top K"), topK_);
+    topP_ = new QDoubleSpinBox(advancedPanel);
+    topP_->setRange(0.0, 1.0);
+    topP_->setSingleStep(0.05);
+    topP_->setValue(defaultTopP);
+    topP_->setToolTip(QStringLiteral("控制每步采样考虑的候选累计概率。"));
+    field(1, 1, QStringLiteral("Top P"), topP_);
+    temperature_ = new QDoubleSpinBox(advancedPanel);
+    temperature_->setRange(0.05, 1.0);
+    temperature_->setSingleStep(0.05);
+    temperature_->setValue(defaultTemperature);
+    temperature_->setToolTip(QStringLiteral("较低温度倾向于选择概率较高的候选。"));
+    field(1, 2, QStringLiteral("温度"), temperature_);
+    saveDefaults_ = new QPushButton(QStringLiteral("保存为此声音的默认参数"), advancedPanel);
+    saveDefaults_->setEnabled(false);
+    saveDefaults_->setToolTip(QStringLiteral("保存当前台词语言、切句、语速、种子与采样参数。"));
+    advancedLayout->addWidget(saveDefaults_, 2, 0, 1, 6, Qt::AlignRight);
+    connect(saveDefaults_, &QPushButton::clicked, this, &SynthesisPanel::saveVoiceDefaults);
     layout->addWidget(advancedPanel);
     advancedPanel->hide();
-    connect(advanced, &QPushButton::toggled, advancedPanel, &QWidget::setVisible);
-    connect(advanced, &QPushButton::toggled, this, [advanced](bool open) {
-        advanced->setText(open ? QStringLiteral("收起高级参数") : QStringLiteral("高级参数"));
+    connect(advanced_, &QPushButton::toggled, advancedPanel, &QWidget::setVisible);
+    connect(advanced_, &QPushButton::toggled, this, [this](bool open) {
+        advanced_->setText(open ? QStringLiteral("收起高级参数") : QStringLiteral("高级参数"));
     });
 
     auto *actions = new QHBoxLayout;
@@ -272,28 +324,97 @@ void SynthesisPanel::loadRequest(const QJsonObject &request)
     if (index >= 0)
         voices_->setCurrentIndex(index);
     text_->setPlainText(request.value("text").toString());
-    language_->setCurrentText(request.value("language").toString());
-    speed_->setValue(request.value("speed").toDouble(1));
-    const auto seed = request.value("seed").toInteger(-1);
-    seed_->setText(seed < 0 ? QString() : QString::number(seed));
+    language_->setCurrentText(supportedLanguage(request.value("language").toString()));
+    applySynthesisOptions(request);
+    if (split_->currentIndex() != defaultSplit || speed_->value() != 1 || !seed_->text().isEmpty()
+        || topK_->value() != defaultTopK || topP_->value() != defaultTopP || temperature_->value() != defaultTemperature)
+        advanced_->setChecked(true);
     batch_->setChecked(false);
+}
+
+void SynthesisPanel::applySynthesisOptions(const QJsonObject &options)
+{
+    speed_->setValue(options.value("speed").toDouble(1));
+    const auto split = split_->findText(options.value("split").toString());
+    split_->setCurrentIndex(split < 0 ? defaultSplit : split);
+    topK_->setValue(options.value("top_k").toInt(defaultTopK));
+    topP_->setValue(options.value("top_p").toDouble(defaultTopP));
+    temperature_->setValue(options.value("temperature").toDouble(defaultTemperature));
+    const auto seed = options.value("seed").toInteger(-1);
+    seed_->setText(seed < 0 ? QString() : QString::number(seed));
+}
+
+void SynthesisPanel::applyVoiceDefaults()
+{
+    const auto settings = voices_->currentData(voiceSettingsRole).toJsonObject();
+    language_->setCurrentText(supportedLanguage(settings.value("default_language").toString()));
+    applySynthesisOptions(settings);
+    saveDefaults_->setEnabled(!voices_->currentData().toString().isEmpty());
 }
 
 void SynthesisPanel::refreshVoices(const QString &selected)
 {
-    const auto current = selected.isEmpty() ? voices_->currentData().toString() : selected;
+    const auto previous = voices_->currentData().toString();
+    const auto current = selected.isEmpty() ? previous : selected;
     QSqlQuery query;
-    query.prepare("SELECT id,name,verified_engine FROM voices ORDER BY name");
+    query.prepare("SELECT id,name,verified_engine,settings FROM voices ORDER BY name");
     execute(query);
+    const QSignalBlocker block(voices_);
     voices_->clear();
     while (query.next()) {
         const auto verified = query.value(2).toString();
         voices_->addItem(query.value(1).toString() + (verified.isEmpty()
             ? QStringLiteral(" · 待验证") : QStringLiteral(" · 已验证")), query.value(0));
         voices_->setItemData(voices_->count() - 1, verified, Qt::ToolTipRole);
+        const auto settings = QJsonDocument::fromJson(query.value(3).toByteArray()).object();
+        voices_->setItemData(voices_->count() - 1, settings, voiceSettingsRole);
     }
     const int index = voices_->findData(current);
     voices_->setCurrentIndex(index >= 0 ? index : (voices_->count() ? 0 : -1));
+    if (previous != voices_->currentData().toString())
+        applyVoiceDefaults();
+}
+
+QJsonObject SynthesisPanel::selectedVoiceSettings() const
+{
+    QSqlQuery query;
+    query.prepare("SELECT settings FROM voices WHERE id=?");
+    query.addBindValue(voices_->currentData().toString());
+    execute(query);
+    if (!query.next())
+        throw std::runtime_error(QStringLiteral("声音预设已不存在").toStdString());
+    return QJsonDocument::fromJson(query.value(0).toByteArray()).object();
+}
+
+QJsonObject SynthesisPanel::synthesisOptions() const
+{
+    const auto seedText = seed_->text().trimmed();
+    bool valid = false;
+    const auto seed = seedText.toLongLong(&valid);
+    if (!seedText.isEmpty() && (!valid || seed < 0 || seed > 4294967295LL))
+        throw std::runtime_error(QStringLiteral("随机种子应为 0 至 4294967295").toStdString());
+    return {{"speed", speed_->value()}, {"split", split_->currentText()}, {"top_k", topK_->value()},
+        {"top_p", topP_->value()}, {"temperature", temperature_->value()}, {"seed", seedText.isEmpty() ? -1LL : seed}};
+}
+
+void SynthesisPanel::saveVoiceDefaults()
+{
+    try {
+        auto settings = selectedVoiceSettings();
+        const auto options = synthesisOptions();
+        for (auto option = options.constBegin(); option != options.constEnd(); ++option)
+            settings.insert(option.key(), option.value());
+        settings["default_language"] = language_->currentText();
+        QSqlQuery query;
+        query.prepare("UPDATE voices SET settings=? WHERE id=?");
+        query.addBindValue(QJsonDocument(settings).toJson(QJsonDocument::Compact));
+        query.addBindValue(voices_->currentData().toString());
+        execute(query);
+        refreshVoices();
+        status_->setText(QStringLiteral("已保存当前声音的默认参数。"));
+    } catch (const std::exception &error) {
+        status_->setText(QString::fromUtf8(error.what()));
+    }
 }
 
 void SynthesisPanel::importVoice(QJsonObject defaults)
@@ -345,6 +466,11 @@ void SynthesisPanel::importVoice(QJsonObject defaults)
     if (defaults.contains("prompt_language"))
         lang->setCurrentText(defaults.value("prompt_language").toString());
     form->addRow(QStringLiteral("参考语言"), lang);
+    auto *target = new QComboBox(&dialog);
+    target->addItems(languages);
+    target->setCurrentText(supportedLanguage(defaults.value("default_language")
+        .toString(defaults.value("prompt_language").toString())));
+    form->addRow(QStringLiteral("默认台词语言"), target);
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
     buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("保存声音"));
     buttons->button(QDialogButtonBox::Cancel)->setText(QStringLiteral("取消"));
@@ -356,7 +482,8 @@ void SynthesisPanel::importVoice(QJsonObject defaults)
 
     QJsonObject values{{"name", name->text().trimmed()}, {"family", family->currentText()},
         {"gpt", gpt->text()}, {"sovits", sovits->text()}, {"reference", ref->text()},
-        {"prompt", prompt->toPlainText().trimmed()}, {"prompt_language", lang->currentText()}};
+        {"prompt", prompt->toPlainText().trimmed()}, {"prompt_language", lang->currentText()},
+        {"default_language", target->currentText()}};
     if (defaults.contains("id") && values.value("family") == defaults.value("family")
         && values.value("gpt") == defaults.value("gpt")
         && values.value("sovits") == defaults.value("sovits")) {
@@ -404,25 +531,13 @@ void SynthesisPanel::generate()
             status_->setText(QStringLiteral("请先选择声音，再输入台词"));
             return;
         }
-        const auto seedText = seed_->text().trimmed();
-        bool valid = false;
-        const auto seed = seedText.toLongLong(&valid);
-        if (!seedText.isEmpty() && (!valid || seed < 0 || seed > 4294967295LL)) {
-            status_->setText(QStringLiteral("随机种子应为 0 至 4294967295"));
-            return;
-        }
-        QSqlQuery query;
-        query.prepare("SELECT settings FROM voices WHERE id=?");
-        query.addBindValue(voice);
-        execute(query);
-        if (!query.next())
-            throw std::runtime_error(QStringLiteral("声音预设已不存在").toStdString());
-        auto request = QJsonDocument::fromJson(query.value(0).toByteArray()).object();
+        auto request = selectedVoiceSettings();
+        const auto options = synthesisOptions();
+        for (auto option = options.constBegin(); option != options.constEnd(); ++option)
+            request.insert(option.key(), option.value());
         request["operation"] = "synthesize";
         request["voice_id"] = voice;
         request["language"] = language_->currentText();
-        request["speed"] = speed_->value();
-        request["seed"] = seedText.isEmpty() ? -1LL : seed;
         const auto text = text_->toPlainText();
         const auto lines = batch_->isChecked() ? text.split('\n', Qt::SkipEmptyParts) : QStringList{text};
         int count = 0;

@@ -518,10 +518,11 @@ void LibraryPage::showDetails()
     folder_->setEnabled(file != library_.files.cend());
     if (preset != library_.voices.cend()) {
         const auto &settings = preset->settings;
-        details_->setPlainText(QStringLiteral("GPT 权重 · %1\nSoVITS 权重 · %2\n参考音频 · %3\n参考文本 · %4\n参考语言 · %5\n验证引擎 · %6")
+        details_->setPlainText(QStringLiteral("GPT 权重 · %1\nSoVITS 权重 · %2\n参考音频 · %3\n参考文本 · %4\n参考语言 · %5\n默认台词语言 · %6\n验证引擎 · %7")
             .arg(settings.value("gpt").toString(), settings.value("sovits").toString(),
                  settings.value("reference").toString(), settings.value("prompt").toString(),
-                 settings.value("prompt_language").toString(), preset->verifiedEngine.isEmpty()
+                 settings.value("prompt_language").toString(), settings.value("default_language").toString(QStringLiteral("中文")),
+                 preset->verifiedEngine.isEmpty()
                     ? QStringLiteral("待验证") : preset->verifiedEngine));
     } else if (file != library_.files.cend()) {
         QStringList description{QDir::toNativeSeparators(file->path), associated(*file)};

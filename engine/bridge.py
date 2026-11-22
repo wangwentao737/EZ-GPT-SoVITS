@@ -22,6 +22,7 @@ BERT = f"{MODELS}/chinese-roberta-wwm-ext-large"
 HUBERT = f"{MODELS}/chinese-hubert-base"
 PORT_WEBUI = 9874
 PORT_TTS = 9872
+SPLITS = ("不切", "凑四句一切", "凑50字一切", "按中文句号。切", "按英文句号.切", "按标点符号切")
 FAMILIES = {
     "v2": (
         "gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt",
@@ -193,10 +194,37 @@ def wait_for_inference(webui_pid, job, cancel):
     raise RuntimeError("推理服务启动超时。请查看引擎启动日志。")
 
 
+def synthesis_parameters(request):
+    choices = (
+        ("top_k", "Top K", 15, 1, 100, True),
+        ("top_p", "Top P", 1.0, 0.0, 1.0, False),
+        ("temperature", "温度", 1.0, 0.05, 1.0, False),
+        ("speed", "语速", 1.0, 0.6, 1.65, False),
+        ("seed", "种子", -1, -1, 4294967295, True),
+    )
+    parameters = {}
+    for key, label, default, minimum, maximum, integer in choices:
+        raw = request.get(key, default)
+        message = f"{label} 超出有效范围（{minimum} 至 {maximum}）"
+        try:
+            number = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(message) from None
+        if isinstance(raw, bool) or not minimum <= number <= maximum or (integer and not number.is_integer()):
+            raise ValueError(message)
+        parameters[key] = int(number) if integer else number
+    split = request.get("split", SPLITS[1])
+    if split not in SPLITS:
+        raise ValueError("请选择此引擎支持的切句方式")
+    parameters["split"] = split
+    return parameters
+
+
 def synthesize(client, engine, data, job, request, cancel):
     family = request["family"]
     if family not in FAMILIES:
         raise ValueError("当前模型家族尚未适配")
+    parameters = synthesis_parameters(request)
     reference = safe_path(request["reference"], data)
     inspect_wav(reference, reference=True)
     prompt = request["prompt"].strip()
@@ -221,12 +249,12 @@ def synthesize(client, engine, data, job, request, cancel):
 
         tts = wait_for_inference(request["webui_pid"], job, cancel)
 
-        seed = int(request.get("seed", -1))
+        seed = parameters["seed"]
         result = invoke(
             tts, "inference", text, request.get("language", "中文"),
             handle_file(str(reference)), None, prompt, request.get("prompt_language", "中文"),
-            15, 1.0, 1.0, request.get("split", "凑四句一切"), 1,
-            float(request.get("speed", 1)), False, True, 0.3, seed, seed < 0,
+            parameters["top_k"], parameters["top_p"], parameters["temperature"], parameters["split"], 1,
+            parameters["speed"], False, True, 0.3, seed, seed < 0,
             False, False, 1.35, 4 if family == "v5turbo" else 32, False,
             1.30 if family == "v5dev" else 0.0, cancel=cancel,
         )
@@ -247,7 +275,7 @@ def synthesize(client, engine, data, job, request, cancel):
             digest = hashlib.file_digest(audio, "sha256").hexdigest()
         check_cancel(cancel)
         publish(audio=str(temporary), seed=int(actual_seed), duration=info.duration,
-                bytes=temporary.stat().st_size, sha256=digest)
+                bytes=temporary.stat().st_size, sha256=digest, parameters=parameters)
     finally:
         try:
             if start_requested:

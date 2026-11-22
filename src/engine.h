@@ -9,6 +9,8 @@
 
 namespace ez {
 
+inline constexpr char engineBrowserNotification[] = "--engine-browser-notification";
+
 QString checkedPath(const QString &path);
 QString engineRoot(const QString &launcher);
 

@@ -49,6 +49,7 @@
 #include <algorithm>
 #include <atomic>
 #include <stdexcept>
+#include <string_view>
 
 namespace {
 
@@ -898,6 +899,8 @@ private:
 
 int main(int argc, char **argv)
 {
+    if (argc == 3 && std::string_view(argv[1]) == ez::engineBrowserNotification)
+        return 0;
     QApplication app(argc, argv);
     app.setApplicationName("EZ-GPT-SoVITS");
     app.setOrganizationName("EZ-GPT-SoVITS");
