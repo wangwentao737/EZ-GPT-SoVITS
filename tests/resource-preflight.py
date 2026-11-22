@@ -154,14 +154,15 @@ def check_real_batch(program, engine, fixture, data, scratch):
     custom = {"top_k": 9, "top_p": 0.85, "temperature": 0.7, "speed": 1.2,
               "seed": 42, "split": "不切"}
     legacy_voice = {key: value for key, value in voice.items() if key not in defaults}
+    verification_batch = str(uuid.uuid4())
     requests = [
         {**voice, "reference": (data / "absent.wav").as_posix()},
         {**voice, "sovits": truncated.as_posix()},
         {**voice, "output_root": file_output.as_posix()},
         {**voice, "sovits": unloadable.as_posix()},
         {**legacy_voice, "top_k": 101},
-        {**legacy_voice, "seed": 42},
-        {**legacy_voice, **custom},
+        {**legacy_voice, "seed": 42, "batch_id": verification_batch, "batch_index": 1, "batch_size": 2},
+        {**legacy_voice, **custom, "batch_id": verification_batch, "batch_index": 2, "batch_size": 2},
     ]
     invoke(program, data, engine / "go-webui.bat", requests, expected=3)
     with sqlite3.connect(data / "library.sqlite") as database:
@@ -176,18 +177,29 @@ def check_real_batch(program, engine, fixture, data, scratch):
     assert not (data / "jobs" / rows[3][0] / "completion.json").exists()
     assert rows[4][1] == "failed" and "Top K 超出有效范围" in rows[4][2], rows[4]
     assert not (data / "jobs" / rows[4][0] / "completion.json").exists()
+    expected_inputs = {}
+    for name in ("gpt", "sovits", "reference"):
+        with Path(voice[name]).open("rb") as stream:
+            expected_inputs[name] = hashlib.file_digest(stream, "sha256").hexdigest()
     archived = []
     for row, parameters in zip(rows[5:], (defaults, custom), strict=True):
         assert row[1] == "succeeded", row
         result = json.loads(row[3])
         assert result["parameters"] == parameters and result["seed"] == parameters["seed"], result
+        verification = result["voice_verification"]
+        assert verification["sha256"] == expected_inputs
+        assert Path(verification["launcher"]).resolve() == (engine / "go-webui.bat").resolve()
+        assert verification["parameters"] == parameters and verification["seed"] == parameters["seed"]
+        assert verification["verified_at"].endswith("Z")
         wav = Path(result["audio"])
         assert hashlib.sha256(wav.read_bytes()).hexdigest() == result["sha256"]
         archived.append(wav)
     assert set((data / "outputs").rglob("*.wav")) == set(archived)
     assert len({hashlib.sha256(wav.read_bytes()).hexdigest() for wav in archived}) == 2
+    later_payload = json.loads((data / "jobs" / rows[-1][0] / "request.json").read_text(encoding="utf-8"))
+    assert later_payload["verification_hashes"] == expected_inputs, "Unchanged inputs in a batch should share verified input digests."
     print("Real batch: missing reference, truncated SoVITS, blocked output, and failed second-model load "
-          "were isolated; invalid sampling was rejected and legacy/custom settings each archived a valid WAV.")
+          "were isolated; invalid sampling was rejected and both WAVs archived with model verification evidence.")
 
 
 def main():

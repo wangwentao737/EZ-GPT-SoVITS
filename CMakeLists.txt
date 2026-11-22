@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(EZ_GPT_SoVITS VERSION 0.1.17 LANGUAGES CXX)
+project(EZ_GPT_SoVITS VERSION 0.1.18 LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "EZ-GPT-SoVITS requires Windows x64")
@@ -20,6 +20,7 @@ qt_add_executable(EZ-GPT-SoVITS WIN32
     src/settings.cpp src/settings.h
     src/library.cpp src/library.h
     src/synthesis.cpp src/synthesis.h
+    src/voiceverification.cpp src/voiceverification.h
     src/training.cpp src/training.h
 )
 target_compile_definitions(EZ-GPT-SoVITS PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN EZ_APP_VERSION="${PROJECT_VERSION}")

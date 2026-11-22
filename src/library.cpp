@@ -4,9 +4,11 @@
 #include "settings.h"
 #include "synthesis.h"
 #include "ui.h"
+#include "voiceverification.h"
 
 #include <QAction>
 #include <QComboBox>
+#include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
 #include <QFile>
@@ -62,6 +64,8 @@ struct Voice {
     QString name;
     QJsonObject settings;
     QString verifiedEngine;
+    QJsonObject verification;
+    QString verificationStatus;
 };
 
 struct Library {
@@ -167,11 +171,17 @@ Library readLibrary(QSqlDatabase database, const QString &root, bool scan)
         }
     }
 
-    check(query.exec("SELECT id,name,settings,verified_engine FROM voices ORDER BY name"), query);
+    check(query.exec("SELECT value FROM workspace_settings WHERE key='currentEngine'"), query);
+    const auto selectedEngine = query.next() ? query.value(0).toString() : QString();
+    query = voicesWithVerification(database);
+    check(!query.lastError().isValid(), query);
     while (query.next()) {
         const auto id = query.value(0).toString();
         const auto settings = readObject(query.value(2));
-        library.voices.insert(id, {query.value(1).toString(), settings, query.value(3).toString()});
+        const auto legacy = query.value(3).toString();
+        const auto record = query.value(4).isNull() ? QJsonObject{} : readObject(query.value(4));
+        library.voices.insert(id, {query.value(1).toString(), settings, legacy, record,
+                                   voiceVerificationStatus(settings, record, legacy, selectedEngine)});
         addInputs(library, settings, id, settings.value("project_id").toString());
     }
 
@@ -482,9 +492,12 @@ void LibraryPage::refill()
                 const auto projectId = preset.settings.value("project_id").toString();
                 if ((!voice.isEmpty() && item.key() != voice) || (!project.isEmpty() && projectId != project))
                     continue;
+                const auto projectName = library_.projects.value(projectId);
+                auto summary = preset.verificationStatus;
+                if (!projectName.isEmpty())
+                    summary += QStringLiteral(" · ") + projectName;
                 append("voice:" + item.key(), {preset.name, typeNames[Preset], preset.settings.value("family").toString(),
-                    library_.projects.value(projectId, preset.verifiedEngine.isEmpty()
-                        ? QStringLiteral("待验证") : QStringLiteral("已验证"))});
+                    summary});
             }
         }
         for (auto item = library_.files.cbegin(); item != library_.files.cend(); ++item) {
@@ -518,12 +531,29 @@ void LibraryPage::showDetails()
     folder_->setEnabled(file != library_.files.cend());
     if (preset != library_.voices.cend()) {
         const auto &settings = preset->settings;
-        details_->setPlainText(QStringLiteral("GPT 权重 · %1\nSoVITS 权重 · %2\n参考音频 · %3\n参考文本 · %4\n参考语言 · %5\n默认台词语言 · %6\n验证引擎 · %7")
+        const auto &record = preset->verification;
+        const auto date = QDateTime::fromString(record.value("verified_at").toString(), Qt::ISODateWithMs).toLocalTime();
+        const auto engine = record.value("launcher").toString(preset->verifiedEngine);
+        const auto hashes = record.value("sha256").toObject();
+        const auto params = record.value("parameters").toObject();
+        auto description = QStringLiteral("验证状态 · %1").arg(preset->verificationStatus);
+        if (!engine.isEmpty())
+            description += QStringLiteral("\n上次验证引擎 · %1").arg(engine);
+        if (date.isValid()) {
+            description += QStringLiteral("\n上次试音 · %1\n语言 · %2　切句 · %3　语速 · %4　种子 · %5"
+                                          "\nTop K · %6　Top P · %7　温度 · %8")
+                .arg(date.toString("yyyy-MM-dd HH:mm:ss"), record.value("language").toString(), params.value("split").toString())
+                .arg(params.value("speed").toDouble()).arg(record.value("seed").toInteger())
+                .arg(params.value("top_k").toInt()).arg(params.value("top_p").toDouble()).arg(params.value("temperature").toDouble());
+        }
+        description += QStringLiteral("\nGPT 权重 · %1\nSoVITS 权重 · %2\n参考音频 · %3\n参考文本 · %4\n参考语言 · %5\n默认台词语言 · %6")
             .arg(settings.value("gpt").toString(), settings.value("sovits").toString(),
                  settings.value("reference").toString(), settings.value("prompt").toString(),
-                 settings.value("prompt_language").toString(), settings.value("default_language").toString(QStringLiteral("中文")),
-                 preset->verifiedEngine.isEmpty()
-                    ? QStringLiteral("待验证") : preset->verifiedEngine));
+                 settings.value("prompt_language").toString(), settings.value("default_language").toString(QStringLiteral("中文")));
+        if (!hashes.isEmpty())
+            description += QStringLiteral("\nGPT SHA-256 · %1\nSoVITS SHA-256 · %2\n参考音频 SHA-256 · %3")
+                .arg(hashes.value("gpt").toString(), hashes.value("sovits").toString(), hashes.value("reference").toString());
+        details_->setPlainText(description);
     } else if (file != library_.files.cend()) {
         QStringList description{QDir::toNativeSeparators(file->path), associated(*file)};
         for (const auto &id : file->jobs)

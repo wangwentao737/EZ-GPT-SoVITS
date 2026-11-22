@@ -2,12 +2,14 @@
 #include "engine.h"
 #include "jobs.h"
 #include "ui.h"
+#include "voiceverification.h"
 
 #include <QAudioOutput>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QCryptographicHash>
 #include <QDesktopServices>
+#include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -25,6 +27,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSaveFile>
+#include <QShowEvent>
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QSqlError>
@@ -396,23 +399,41 @@ void SynthesisPanel::refreshVoices(const QString &selected)
 {
     const auto previous = voices_->currentData().toString();
     const auto current = selected.isEmpty() ? previous : selected;
-    QSqlQuery query;
-    query.prepare("SELECT id,name,verified_engine,settings FROM voices ORDER BY name");
-    execute(query);
+    auto query = voicesWithVerification();
+    if (query.lastError().isValid())
+        throw std::runtime_error(query.lastError().text().toStdString());
+    const auto launcher = launcher_();
     const QSignalBlocker block(voices_);
     voices_->clear();
     while (query.next()) {
-        const auto verified = query.value(2).toString();
-        voices_->addItem(query.value(1).toString() + (verified.isEmpty()
-            ? QStringLiteral(" · 待验证") : QStringLiteral(" · 已验证")), query.value(0));
-        voices_->setItemData(voices_->count() - 1, verified, Qt::ToolTipRole);
-        const auto settings = QJsonDocument::fromJson(query.value(3).toByteArray()).object();
+        const auto settings = QJsonDocument::fromJson(query.value(2).toByteArray()).object();
+        const auto legacy = query.value(3).toString();
+        const auto record = QJsonDocument::fromJson(query.value(4).toByteArray()).object();
+        const auto state = voiceVerificationStatus(settings, record, legacy, launcher);
+        voices_->addItem(query.value(1).toString() + QStringLiteral(" · ") + state, query.value(0));
+        const auto date = QDateTime::fromString(record.value("verified_at").toString(), Qt::ISODateWithMs).toLocalTime();
+        auto details = state;
+        if (date.isValid()) {
+            details += QStringLiteral("\n上次试音 · %1\n%2")
+                .arg(date.toString("yyyy-MM-dd HH:mm:ss"), record.value("launcher").toString());
+        }
+        voices_->setItemData(voices_->count() - 1, details, Qt::ToolTipRole);
         voices_->setItemData(voices_->count() - 1, settings, voiceSettingsRole);
     }
     const int index = voices_->findData(current);
     voices_->setCurrentIndex(index >= 0 ? index : (voices_->count() ? 0 : -1));
     if (previous != voices_->currentData().toString())
         applyVoiceDefaults();
+}
+
+void SynthesisPanel::showEvent(QShowEvent *event)
+{
+    QWidget::showEvent(event);
+    try {
+        refreshVoices();
+    } catch (const std::exception &error) {
+        status_->setText(QString::fromUtf8(error.what()));
+    }
 }
 
 QJsonObject SynthesisPanel::selectedVoiceSettings() const
@@ -561,6 +582,7 @@ void SynthesisPanel::importVoice(QJsonObject defaults)
 void SynthesisPanel::generate()
 {
     try {
+        refreshVoices();
         const auto launcher = launcher_();
         const auto voice = voices_->currentData().toString();
         if (launcher.isEmpty()) {
@@ -661,13 +683,11 @@ void SynthesisPanel::receiveAudio(const QString &id, const QJsonObject &result)
     if (!result.contains("audio"))
         return;
     QSqlQuery query;
-    query.prepare("SELECT launcher,request FROM jobs WHERE id=?");
+    query.prepare("SELECT request FROM jobs WHERE id=?");
     query.addBindValue(id);
     if (!query.exec() || !query.next())
         return;
-    const auto launcher = query.value(0).toString();
-    const auto request = QJsonDocument::fromJson(query.value(1).toByteArray()).object();
-    const auto voice = request.value("voice_id").toString();
+    const auto request = QJsonDocument::fromJson(query.value(0).toByteArray()).object();
     const bool batch = !submittedBatch_.isEmpty();
     const bool visibleResult = batch ? request.value("batch_id").toString() == submittedBatch_
         : submittedJob_.isEmpty() || id == submittedJob_;
@@ -682,12 +702,14 @@ void SynthesisPanel::receiveAudio(const QString &id, const QJsonObject &result)
         if (!batch)
             status_->setText(QStringLiteral("语音已生成 · %1 秒").arg(result.value("duration").toDouble(), 0, 'f', 2));
     }
-    query.finish();
-    query.prepare("UPDATE voices SET verified_engine=? WHERE id=?");
-    query.addBindValue(launcher);
-    query.addBindValue(voice);
-    if (query.exec())
-        refreshVoices();
+    if (result.contains("voice_verification")) {
+        query.finish();
+        try {
+            refreshVoices();
+        } catch (const std::exception &error) {
+            status_->setText(QString::fromUtf8(error.what()));
+        }
+    }
 }
 
 }

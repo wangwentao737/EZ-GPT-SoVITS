@@ -49,6 +49,7 @@ private:
     QString engineFailure_;
     qint64 engineLogOffset_ = 0;
     QJsonObject activeRequest_;
+    QJsonObject activeVoiceVersion_;
     EngineManager &engine_;
     QProcess worker_;
     QTimer cancelTimeout_;

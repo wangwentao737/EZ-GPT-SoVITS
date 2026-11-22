@@ -2,6 +2,7 @@
 #include "engine.h"
 #include "resources.h"
 #include "settings.h"
+#include "voiceverification.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -348,10 +349,21 @@ void TaskScheduler::next()
         const auto resourceIssue = jobResourceIssue(engine_.root(), root_, activeRequest_);
         if (!resourceIssue.isEmpty())
             fail(resourceIssue);
-        if (operation == "synthesize")
+        auto payload = activeRequest_;
+        if (operation == "synthesize") {
             checkOutputDirectory(outputRootForRequest(root_, activeRequest_));
+            const auto launcher = engine_.root() + "/go-webui.bat";
+            activeVoiceVersion_ = voiceInputVersion(activeRequest_, launcher);
+            if (!activeVoiceVersion_.isEmpty()) {
+                payload["record_voice_verification"] = true;
+                const auto previous = latestBatchVerification(activeRequest_.value("voice_id").toString(),
+                                                               activeRequest_.value("batch_id").toString());
+                if (previous.value("input_version").toObject() == activeVoiceVersion_)
+                    payload["verification_hashes"] = previous.value("sha256");
+            }
+        }
         update(active_, "running");
-        startJobProcess(worker_, engine_.root(), root_, jobPath_, activeRequest_, engine_.webuiPid());
+        startJobProcess(worker_, engine_.root(), root_, jobPath_, payload, engine_.webuiPid());
     } catch (const std::exception &error) {
         finish(false, QString::fromUtf8(error.what()));
     }
@@ -364,6 +376,7 @@ void TaskScheduler::finish(bool processSucceeded, QString message)
     const auto id = std::exchange(active_, {});
     const auto job = std::exchange(jobPath_, {});
     const auto request = std::exchange(activeRequest_, {});
+    const auto voiceVersion = std::exchange(activeVoiceVersion_, {});
     const auto engineFailure = std::exchange(engineFailure_, {});
     const bool cancelled = std::exchange(cancelling_, false);
     cancelTimeout_.stop();
@@ -397,6 +410,21 @@ void TaskScheduler::finish(bool processSucceeded, QString message)
                 fail(QStringLiteral("引擎未提交有效的任务产物"));
             if (request.value("operation") == "synthesize") {
                 const auto source = checkedPath(job + "/verified.wav");
+                const auto hashes = result.take("verification_hashes").toObject();
+                if (!voiceVersion.isEmpty()) {
+                    const auto launcher = engine_.root() + "/go-webui.bat";
+                    const auto current = voiceInputVersion(request, launcher);
+                    if (!sameSynthesisInputs(voiceVersion, current))
+                        fail(QStringLiteral("合成期间权重、参考音频或引擎文件发生变化。请确认文件后重试。"));
+                    if (hashes.size() == 3) {
+                        result["voice_verification"] = QJsonObject{
+                            {"launcher", launcher}, {"input_version", current}, {"sha256", hashes},
+                            {"verified_at", QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},
+                            {"parameters", result.value("parameters")}, {"seed", result.value("seed")},
+                            {"language", request.value("language").toString(QStringLiteral("中文"))},
+                        };
+                    }
+                }
                 const auto voice = QUuid(request.value("voice_id").toString()).toString(QUuid::WithoutBraces);
                 auto outputRoot = outputRootForRequest(root_, request);
                 if (!outputRoot.endsWith('/'))

@@ -226,12 +226,13 @@ def synthesize(client, engine, data, job, request, cancel):
         raise ValueError("当前模型家族尚未适配")
     parameters = synthesis_parameters(request)
     reference = safe_path(request["reference"], data)
-    inspect_wav(reference, reference=True)
+    inspect_wav(reference, reference=True, cancel=cancel)
     prompt = request["prompt"].strip()
     text = request["text"].strip()
     if not prompt or not text:
         raise ValueError("请填写参考文本和目标台词")
     staged = []
+    verification_hashes = {}
     start_requested = False
     gpu = request.get("gpu", "0")
     if not re.fullmatch(r"\d{1,2}", gpu):
@@ -240,6 +241,14 @@ def synthesize(client, engine, data, job, request, cancel):
         for kind, key in (("GPT", "gpt"), ("SoVITS", "sovits")):
             check_cancel(cancel)
             staged.append(stage_weight(safe_path(request[key], data), engine, kind, family, job, cancel))
+        if request.get("record_voice_verification"):
+            inputs = {"gpt": safe_path(engine / staged[0], engine),
+                      "sovits": safe_path(engine / staged[1], engine), "reference": reference}
+            cached = request.get("verification_hashes", {})
+            verification_hashes = {
+                key: cached[key] if re.fullmatch(r"[0-9a-f]{64}", cached.get(key, "")) else sha256_file(path, cancel)
+                for key, path in inputs.items()
+            }
         invoke(client, "switch_version", family)
         invoke(client, "change_choices")
         check_cancel(cancel)
@@ -275,7 +284,8 @@ def synthesize(client, engine, data, job, request, cancel):
             digest = hashlib.file_digest(audio, "sha256").hexdigest()
         check_cancel(cancel)
         publish(audio=str(temporary), seed=int(actual_seed), duration=info.duration,
-                bytes=temporary.stat().st_size, sha256=digest, parameters=parameters)
+                bytes=temporary.stat().st_size, sha256=digest, parameters=parameters,
+                verification_hashes=verification_hashes)
     finally:
         try:
             if start_requested:

@@ -13,6 +13,7 @@ class QLineEdit;
 class QLabel;
 class QMediaPlayer;
 class QPushButton;
+class QShowEvent;
 class QSpinBox;
 
 namespace ez {
@@ -35,6 +36,7 @@ signals:
     void viewBatchRequested(const QString &batch);
 
 private:
+    void showEvent(QShowEvent *event) override;
     void generate();
     void refreshSubmission();
     void receiveAudio(const QString &id, const QJsonObject &result);
