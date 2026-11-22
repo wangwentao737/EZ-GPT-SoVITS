@@ -1,10 +1,12 @@
 #pragma once
 
 #include <QElapsedTimer>
+#include <QFutureWatcher>
 #include <QJsonObject>
 #include <QObject>
 #include <QProcess>
 #include <QTimer>
+#include <atomic>
 
 namespace ez {
 
@@ -32,6 +34,7 @@ class TaskScheduler final : public QObject {
     Q_OBJECT
 public:
     TaskScheduler(QString dataRoot, QString defaultOutputRoot, EngineManager &engine, QObject *parent = nullptr);
+    ~TaskScheduler() override;
     QString enqueue(const QString &launcher, QJsonObject request, const QJsonObject &project = {});
     QStringList enqueueBatch(const QString &launcher, const QList<QJsonObject> &requests);
     QString enqueueSynthesisBatch(const QString &launcher, QList<QJsonObject> requests);
@@ -55,6 +58,9 @@ private:
     QStringList enqueueRequests(const QString &launcher, const QList<QJsonObject> &requests, QJsonObject project = {});
     void failQueued(const QString &launcher, const QString &message);
     void finish(bool processSucceeded, QString message);
+    void startArchive(QJsonObject result);
+    void finishArchive();
+    void settle(const QJsonObject &result, const QString &message = {});
     void forceCancel();
     void continueAfterCancellation();
     void removeStagedWeights(const QString &id, const QJsonObject &request);
@@ -71,6 +77,9 @@ private:
     QJsonObject activeVoiceVersion_;
     EngineManager &engine_;
     QProcess worker_;
+    QFutureWatcher<QString> archive_;
+    QJsonObject archiveReceipt_;
+    std::atomic_bool archiveCancelled_ = false;
     QTimer cancelTimeout_;
     QTimer activityTimer_;
     QElapsedTimer activityClock_;

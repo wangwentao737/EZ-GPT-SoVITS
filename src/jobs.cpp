@@ -12,14 +12,17 @@
 #include <QJsonDocument>
 #include <QProcessEnvironment>
 #include <QSaveFile>
+#include <QScopeGuard>
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QStorageInfo>
 #include <QUuid>
+#include <QtConcurrentRun>
 #include <QtEndian>
 #include <stdexcept>
 #include <utility>
+#include <windows.h>
 
 namespace ez {
 namespace {
@@ -112,21 +115,44 @@ QString recoveryHint(const QString &message, const QString &logs, const QString 
     return message;
 }
 
-void publishWave(const QString &source, const QString &target)
+QString partialWavePath(const QString &target)
+{
+    return target + ".ez-partial";
+}
+
+QString stageWave(const QString &source, const QString &partial, qint64 expectedBytes,
+                  const QByteArray &expectedHash, const std::atomic_bool &cancelled)
 {
     QFile input(source);
-    QSaveFile output(target);
-    if (QFileInfo::exists(target) || !input.open(QIODevice::ReadOnly) || !output.open(QIODevice::WriteOnly))
-        fail(QStringLiteral("无法归档音频，请检查生成目录权限和可用空间"));
-    while (!input.atEnd()) {
-        const auto block = input.read(1024 * 1024);
-        if (input.error() != QFileDevice::NoError || output.write(block) != block.size())
-            fail(QStringLiteral("音频写入中断，请检查生成目录权限和可用空间"));
+    QFile output(partial);
+    if (!input.open(QIODevice::ReadOnly) || input.size() != expectedBytes || expectedBytes <= 44
+        || expectedHash.size() != 64)
+        return QStringLiteral("音频大小或摘要记录无效，请重新生成");
+    if (!output.open(QIODevice::WriteOnly | QIODevice::NewOnly))
+        return QStringLiteral("无法创建音频归档临时文件：%1").arg(output.errorString());
+    auto cleanup = qScopeGuard([&output] { output.remove(); });
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    qint64 copied = 0;
+    while (!cancelled.load()) {
+        const auto chunk = input.read(1024 * 1024);
+        if (input.error() != QFileDevice::NoError)
+            return QStringLiteral("无法读取待归档的音频：%1").arg(input.errorString());
+        if (chunk.isEmpty())
+            break;
+        if (output.write(chunk) != chunk.size())
+            return QStringLiteral("音频写入中断，请检查生成目录权限和可用空间：%1").arg(output.errorString());
+        hash.addData(chunk);
+        copied += chunk.size();
     }
-    if (!output.commit())
-        fail(QStringLiteral("无法保存成品音频：%1").arg(output.errorString()));
-    input.close();
-    QFile::remove(source);
+    if (cancelled.load())
+        return QStringLiteral("音频归档已取消");
+    if (copied != expectedBytes || hash.result().toHex() != expectedHash)
+        return QStringLiteral("待归档的音频在保存期间发生变化，请重新生成");
+    if (!output.flush())
+        return QStringLiteral("无法写入完整的音频：%1").arg(output.errorString());
+    output.close();
+    cleanup.dismiss();
+    return {};
 }
 
 }
@@ -199,6 +225,8 @@ TaskScheduler::TaskScheduler(QString dataRoot, QString defaultOutputRoot, Engine
                 || QDir::cleanPath(audio) != audio
                 || QFileInfo(audio).fileName() != id + ".wav")
                 continue;
+            if (!QUuid(id).isNull() && completion.value("archive_version").toInt() == 1)
+                QFile::remove(checkedPath(partialWavePath(audio)));
             if (isArchivedWave(audio, completion))
                 update(id, "succeeded", {}, completion);
         } catch (const std::exception &) {
@@ -209,16 +237,17 @@ TaskScheduler::TaskScheduler(QString dataRoot, QString defaultOutputRoot, Engine
     execute(query);
     activityTimer_.setInterval(300);
     connect(&activityTimer_, &QTimer::timeout, this, &TaskScheduler::pollActivity);
+    connect(&archive_, &QFutureWatcher<QString>::finished, this, &TaskScheduler::finishArchive);
     cancelTimeout_.setSingleShot(true);
     connect(&cancelTimeout_, &QTimer::timeout, this, &TaskScheduler::forceCancel);
     connect(&engine_, &EngineManager::readinessChanged, this, [this](bool ready) {
         if (ready)
             next();
-        else if (running() && !cancelling_)
+        else if (worker_.state() != QProcess::NotRunning && !cancelling_)
             worker_.kill();
     });
     connect(&engine_, &EngineManager::instanceFailed, this, [this](const QString &launcher, const QString &message) {
-        if (running() && !cancelling_)
+        if (running() && archiveReceipt_.isEmpty() && !cancelling_)
             engineFailure_ = message;
         failQueued(launcher, message);
     });
@@ -234,6 +263,16 @@ TaskScheduler::TaskScheduler(QString dataRoot, QString defaultOutputRoot, Engine
             finish(false, worker_.errorString());
         }
     });
+}
+
+TaskScheduler::~TaskScheduler()
+{
+    if (!archiveReceipt_.isEmpty()) {
+        archiveCancelled_.store(true);
+        archive_.waitForFinished();
+        if (archive_.result().isEmpty())
+            QFile::remove(partialWavePath(archiveReceipt_.value("audio").toString()));
+    }
 }
 
 QString TaskScheduler::enqueue(const QString &launcher, QJsonObject request, const QJsonObject &project)
@@ -425,6 +464,10 @@ void TaskScheduler::pollActivity()
         if (!gpu.isEmpty())
             next.device = QStringLiteral("所选显卡 %1").arg(gpu.left(2));
     }
+    if (!archiveReceipt_.isEmpty()) {
+        next.phase = QStringLiteral("正在归档 WAV");
+        next.total = 0;
+    }
     if (cancelling_) {
         next.phase = QStringLiteral("正在取消任务");
         next.total = 0;
@@ -439,39 +482,15 @@ void TaskScheduler::finish(bool processSucceeded, QString message)
 {
     if (!running())
         return;
-    const auto id = std::exchange(active_, {});
-    const auto job = std::exchange(jobPath_, {});
-    const auto request = std::exchange(activeRequest_, {});
-    const auto voiceVersion = std::exchange(activeVoiceVersion_, {});
-    const auto engineFailure = std::exchange(engineFailure_, {});
-    const bool cancelled = std::exchange(cancelling_, false);
-    cancelTimeout_.stop();
-    activityTimer_.stop();
-    const auto elapsedMs = activityClock_.isValid() ? activityClock_.elapsed() : 0;
-    activityClock_.invalidate();
-    if (!activity_.id.isEmpty()) {
-        activity_ = {};
-        emit activityChanged();
+    if (cancelling_) {
+        removeStagedWeights(active_, activeRequest_);
+        settle({});
+        return;
     }
-    QJsonObject result;
     try {
-        if (cancelled) {
-            removeStagedWeights(id, request);
-            const auto message = restartEngine_ ? QStringLiteral("已停止本程序启动的引擎进程")
-                                                : QStringLiteral("当前任务已停止");
-            update(id, "cancelled", message);
-            if (!stopping_) {
-                if (restartEngine_)
-                    QTimer::singleShot(750, this, &TaskScheduler::continueAfterCancellation);
-                else
-                    QTimer::singleShot(0, this, &TaskScheduler::next);
-            }
-            restartEngine_ = false;
-            emit this->cancelled(id);
-            return;
-        }
         if (processSucceeded) {
-            QFile log(checkedPath(job + "/result.log"));
+            QJsonObject result;
+            QFile log(checkedPath(jobPath_ + "/result.log"));
             if (log.open(QIODevice::ReadOnly)) {
                 while (!log.atEnd()) {
                     const auto line = log.readLine();
@@ -481,72 +500,150 @@ void TaskScheduler::finish(bool processSucceeded, QString message)
             }
             if (result.isEmpty())
                 fail(QStringLiteral("引擎未提交有效的任务产物"));
-            result["elapsed_ms"] = elapsedMs;
-            if (request.value("operation") == "synthesize") {
-                const auto source = checkedPath(job + "/verified.wav");
-                const auto hashes = result.take("verification_hashes").toObject();
-                if (!voiceVersion.isEmpty()) {
-                    const auto launcher = engine_.root() + "/go-webui.bat";
-                    const auto current = voiceInputVersion(request, launcher);
-                    if (!sameSynthesisInputs(voiceVersion, current))
-                        fail(QStringLiteral("合成期间权重、参考音频或引擎文件发生变化。请确认文件后重试。"));
-                    if (hashes.size() == 3) {
-                        result["voice_verification"] = QJsonObject{
-                            {"launcher", launcher}, {"input_version", current}, {"sha256", hashes},
-                            {"verified_at", QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},
-                            {"parameters", result.value("parameters")}, {"seed", result.value("seed")},
-                            {"language", request.value("language").toString(QStringLiteral("中文"))},
-                        };
-                    }
-                }
-                const auto voice = QUuid(request.value("voice_id").toString()).toString(QUuid::WithoutBraces);
-                auto outputRoot = outputRootForRequest(root_, request);
-                if (!outputRoot.endsWith('/'))
-                    outputRoot += '/';
-                const auto directory = checkedPath(outputRoot + voice + "/"
-                    + QDate::currentDate().toString(Qt::ISODate));
-                const auto output = checkedPath(directory + "/" + id + ".wav");
-                result.insert("audio", output);
-                save(job + "/completion.json", json(result));
-                if (!QDir().mkpath(directory))
-                    fail(QStringLiteral("无法创建生成目录：%1").arg(directory));
-                publishWave(source, output);
+            result["elapsed_ms"] = activityClock_.isValid() ? activityClock_.elapsed() : 0;
+            if (activeRequest_.value("operation") == "synthesize") {
+                startArchive(std::move(result));
+                return;
             }
-            update(id, "succeeded", {}, result);
-            emit completed(id, result);
-        } else {
-            QString detail;
-            if (message.isEmpty()) {
-                QFile log(checkedPath(job + "/error.log"));
-                if (log.open(QIODevice::ReadOnly)) {
-                    log.seek(qMax<qint64>(0, log.size() - 4096));
-                    detail = QString::fromUtf8(log.readAll()).trimmed();
-                    message = detail.section('\n', -1);
-                }
-                QFile engineLog(checkedPath(root_ + "/engine-start.log"));
-                if (engineLog.open(QIODevice::ReadOnly) && engineLog.size() > engineLogOffset_) {
-                    engineLog.seek(qMax(engineLogOffset_, engineLog.size() - 16384));
-                    detail += '\n' + QString::fromUtf8(engineLog.readAll());
-                }
+            settle(result);
+            return;
+        }
+        QString detail;
+        if (message.isEmpty()) {
+            QFile log(checkedPath(jobPath_ + "/error.log"));
+            if (log.open(QIODevice::ReadOnly)) {
+                log.seek(qMax<qint64>(0, log.size() - 4096));
+                detail = QString::fromUtf8(log.readAll()).trimmed();
+                message = detail.section('\n', -1);
             }
-            if (!engineFailure.isEmpty())
-                message = engineFailure;
-            if (message.isEmpty())
-                message = QStringLiteral("任务中断，详情见任务日志");
-            message = recoveryHint(message, detail, request.value("operation").toString());
+            QFile engineLog(checkedPath(root_ + "/engine-start.log"));
+            if (engineLog.open(QIODevice::ReadOnly) && engineLog.size() > engineLogOffset_) {
+                engineLog.seek(qMax(engineLogOffset_, engineLog.size() - 16384));
+                detail += '\n' + QString::fromUtf8(engineLog.readAll());
+            }
+        }
+        if (!engineFailure_.isEmpty())
+            message = engineFailure_;
+        if (message.isEmpty())
+            message = QStringLiteral("任务中断，详情见任务日志");
+        message = recoveryHint(message, detail, activeRequest_.value("operation").toString());
+    } catch (const std::exception &error) {
+        message = QString::fromUtf8(error.what());
+    }
+    settle({}, message);
+}
+
+void TaskScheduler::startArchive(QJsonObject result)
+{
+    const auto hashes = result.take("verification_hashes").toObject();
+    if (!activeVoiceVersion_.isEmpty()) {
+        const auto launcher = engine_.root() + "/go-webui.bat";
+        const auto current = voiceInputVersion(activeRequest_, launcher);
+        if (!sameSynthesisInputs(activeVoiceVersion_, current))
+            fail(QStringLiteral("合成期间权重、参考音频或引擎文件发生变化。请确认文件后重试。"));
+        if (hashes.size() == 3) {
+            result["voice_verification"] = QJsonObject{
+                {"launcher", launcher}, {"input_version", current}, {"sha256", hashes},
+                {"verified_at", QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},
+                {"parameters", result.value("parameters")}, {"seed", result.value("seed")},
+                {"language", activeRequest_.value("language").toString(QStringLiteral("中文"))},
+            };
+        }
+    }
+    const auto voice = QUuid(activeRequest_.value("voice_id").toString()).toString(QUuid::WithoutBraces);
+    const auto outputRoot = outputRootForRequest(root_, activeRequest_);
+    const auto directory = checkedPath(QDir(outputRoot).filePath(
+        voice + "/" + QDate::currentDate().toString(Qt::ISODate)));
+    const auto output = checkedPath(directory + "/" + active_ + ".wav");
+    const auto partial = checkedPath(partialWavePath(output));
+    const auto source = checkedPath(jobPath_ + "/verified.wav");
+    if (!QDir().mkpath(directory))
+        fail(QStringLiteral("无法创建生成目录：%1").arg(directory));
+    if (QFileInfo::exists(partial) || QFileInfo::exists(output))
+        fail(QStringLiteral("此任务的归档路径已存在，请重试任务"));
+    result["audio"] = output;
+    result["archive_version"] = 1;
+    save(jobPath_ + "/completion.json", json(result));
+
+    const auto bytes = result.value("bytes").toInteger();
+    const auto hash = result.value("sha256").toString().toLatin1();
+    archiveCancelled_.store(false);
+    archiveReceipt_ = std::move(result);
+    archive_.setFuture(QtConcurrent::run([this, source, partial, bytes, hash] {
+        return stageWave(source, partial, bytes, hash, archiveCancelled_);
+    }));
+    pollActivity();
+}
+
+void TaskScheduler::finishArchive()
+{
+    if (archiveReceipt_.isEmpty())
+        return;
+    auto result = std::exchange(archiveReceipt_, {});
+    auto message = archive_.result();
+    if (message.isEmpty()) {
+        try {
+            const auto output = checkedPath(result.value("audio").toString());
+            const auto partial = checkedPath(partialWavePath(output));
+            if (!cancelling_) {
+                const auto target = QDir::toNativeSeparators(output);
+                const auto staged = QDir::toNativeSeparators(partial);
+                // Both paths share a parent. Rename atomically without replacing a destination.
+                if (MoveFileExW(reinterpret_cast<LPCWSTR>(staged.utf16()),
+                                reinterpret_cast<LPCWSTR>(target.utf16()), MOVEFILE_WRITE_THROUGH)) {
+                    QFile::remove(jobPath_ + "/verified.wav");
+                    result["elapsed_ms"] = activityClock_.elapsed();
+                    settle(result);
+                    return;
+                }
+                message = QStringLiteral("无法保存成品音频，请检查生成目录权限（Windows %1）").arg(GetLastError());
+            }
+            QFile::remove(partial);
+        } catch (const std::exception &error) {
+            message = QString::fromUtf8(error.what());
+        }
+    }
+    settle({}, message);
+}
+
+void TaskScheduler::settle(const QJsonObject &result, const QString &message)
+{
+    const auto id = std::exchange(active_, {});
+    jobPath_.clear();
+    activeRequest_ = {};
+    activeVoiceVersion_ = {};
+    engineFailure_.clear();
+    const bool cancelled = std::exchange(cancelling_, false);
+    const bool restart = std::exchange(restartEngine_, false);
+    cancelTimeout_.stop();
+    activityTimer_.stop();
+    activityClock_.invalidate();
+    if (!activity_.id.isEmpty()) {
+        activity_ = {};
+        emit activityChanged();
+    }
+    try {
+        if (cancelled) {
+            update(id, "cancelled", restart ? QStringLiteral("已停止本程序启动的引擎进程")
+                                            : QStringLiteral("当前任务已停止"));
+            emit this->cancelled(id);
+        } else if (result.isEmpty()) {
             update(id, "failed", message);
             emit failed(message);
+        } else {
+            update(id, "succeeded", {}, result);
+            emit completed(id, result);
         }
     } catch (const std::exception &error) {
-        const auto detail = QString::fromUtf8(error.what());
-        try {
-            update(id, "failed", detail);
-        } catch (const std::exception &) {
-            // The next startup marks a still-running record as interrupted.
-        }
-        emit failed(detail);
+        // A committed artifact can still be recovered from its receipt on startup.
+        emit failed(QString::fromUtf8(error.what()));
     }
-    QTimer::singleShot(0, this, &TaskScheduler::next);
+    if (!stopping_) {
+        if (restart)
+            QTimer::singleShot(750, this, &TaskScheduler::continueAfterCancellation);
+        else
+            QTimer::singleShot(0, this, &TaskScheduler::next);
+    }
 }
 
 void TaskScheduler::update(const QString &id, const QString &state, const QString &message,
@@ -570,6 +667,12 @@ void TaskScheduler::cancel(const QString &id)
         if (cancelling_)
             return;
         cancelling_ = true;
+        if (!archiveReceipt_.isEmpty()) {
+            archiveCancelled_.store(true);
+            update(id, "running", QStringLiteral("正在取消归档…"));
+            pollActivity();
+            return;
+        }
         try {
             save(jobPath_ + "/cancel.requested", {});
             cancelTimeout_.start(cancelGraceMs);
@@ -606,7 +709,7 @@ void TaskScheduler::cancelQueuedBatch(const QString &batch)
 
 void TaskScheduler::forceCancel()
 {
-    if (!cancelling_ || !running())
+    if (!cancelling_ || !running() || !archiveReceipt_.isEmpty())
         return;
     cancelTimeout_.stop();
     if (engine_.active()) {
@@ -658,6 +761,11 @@ void TaskScheduler::stop()
     stopping_ = true;
     if (running()) {
         cancel(active_);
+        if (!archiveReceipt_.isEmpty()) {
+            archive_.waitForFinished();
+            finishArchive();
+            return;
+        }
         if (!worker_.waitForFinished(cancelGraceMs)) {
             forceCancel();
             worker_.waitForFinished(1000);

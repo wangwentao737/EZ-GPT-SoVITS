@@ -97,13 +97,6 @@ QString stylesheet()
             background: #0d141f;
             border-right: 1px solid #263242;
         }
-        QLabel#brandMark {
-            color: #0a2120;
-            background: #6ce1c5;
-            border-radius: 10px;
-            font-size: 16px;
-            font-weight: 700;
-        }
         QLabel#brand { color: #edf2f6; font-weight: 700; }
         QLabel#version, QLabel#muted { color: #aebcd0; }
         QLabel#version { font-size: 12px; }

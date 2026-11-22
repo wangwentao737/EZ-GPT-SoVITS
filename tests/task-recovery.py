@@ -23,12 +23,13 @@ def start(program, data):
 
 def interrupted_synthesis(database, data, variant):
     job_id = str(uuid.uuid4())
-    output_root = data.with_name(data.name + "-external") if variant == "custom_output" else data / "outputs"
+    custom = variant in ("custom_output", "custom_partial")
+    output_root = data.with_name(data.name + "-external") if custom else data / "outputs"
     target = output_root / f"{job_id}.wav"
     temporary = data / "jobs" / job_id
     temporary.mkdir(parents=True)
     target.parent.mkdir(exist_ok=True)
-    wave_path = temporary / "verified.wav" if variant == "before_move" else target
+    wave_path = temporary / "verified.wav" if variant in ("before_move", "custom_partial") else target
     with wave.open(str(wave_path), "wb") as stream:
         stream.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
         stream.writeframes(b"\0\0" * 1600)
@@ -36,19 +37,21 @@ def interrupted_synthesis(database, data, variant):
     receipt = {"audio": target.as_posix(), "duration": 0.1}
     if variant != "legacy_truncated":
         receipt.update(bytes=len(content), sha256=hashlib.sha256(content).hexdigest())
+        receipt["archive_version"] = 1
+        target.with_suffix(".wav.ez-partial").write_bytes(content[:100])
     if variant == "changed":
         wave_path.write_bytes(content[:-1] + b"\xff")
     elif variant == "legacy_truncated":
         wave_path.write_bytes(content[:-50])
     (temporary / "completion.json").write_text(json.dumps(receipt), encoding="utf-8")
     request = {"text": "snapshot"}
-    if variant == "custom_output":
+    if custom:
         request["output_root"] = output_root.as_posix()
     database.execute(
         "INSERT INTO jobs(id,created,launcher,operation,state,request) VALUES(?,?,?,?,?,?)",
         (job_id, "2026-01-01", "fixture", "synthesize", "running", json.dumps(request).encode()),
     )
-    return job_id
+    return job_id, target
 
 
 def main():
@@ -58,8 +61,10 @@ def main():
     data = workspace / ".test" / f"recovery-{uuid.uuid4().hex}"
     start(program, data)
     database = sqlite3.connect(data / "library.sqlite")
-    variants = ("complete", "custom_output", "before_move", "changed", "legacy_truncated")
+    variants = ("complete", "custom_output", "before_move", "custom_partial", "changed", "legacy_truncated")
     jobs = {variant: interrupted_synthesis(database, data, variant) for variant in variants}
+    unrelated = data / "outputs" / "unrelated.wav.ez-partial"
+    unrelated.write_bytes(b"owned by another app")
 
     project_id = uuid.uuid4().hex
     project_dir = data / "projects" / project_id
@@ -83,7 +88,7 @@ def main():
     database.commit()
 
     start(program, data)
-    for variant, job_id in jobs.items():
+    for variant, (job_id, target) in jobs.items():
         state, request, result = database.execute(
             "SELECT state,request,result FROM jobs WHERE id=?", (job_id,)
         ).fetchone()
@@ -92,6 +97,8 @@ def main():
             assert state == "succeeded" and Path(json.loads(result)["audio"]).is_file(), (variant, state)
         else:
             assert state == "interrupted" and result is None, (variant, state, result)
+        assert not target.with_suffix(".wav.ez-partial").exists(), variant
+    assert unrelated.read_bytes() == b"owned by another app"
     recovered = json.loads(database.execute("SELECT state FROM projects WHERE id=?", (project_id,)).fetchone()[0])
     assert recovered["sovits"] == weight.as_posix() and "pending" not in recovered
     assert recovered["dataset"] == project["dataset"] and "gpt" not in recovered

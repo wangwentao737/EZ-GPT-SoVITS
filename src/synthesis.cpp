@@ -25,6 +25,7 @@
 #include <QMediaPlayer>
 #include <QMessageBox>
 #include <QPlainTextEdit>
+#include <QPromise>
 #include <QPushButton>
 #include <QSaveFile>
 #include <QShowEvent>
@@ -299,27 +300,46 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
         play_->setText(state == QMediaPlayer::PlayingState ? QStringLiteral("暂停") : QStringLiteral("播放"));
     });
     connect(export_, &QPushButton::clicked, this, [this] {
+        if (exporter_.isRunning())
+            return;
+        const auto audio = audio_;
         auto target = QFileDialog::getSaveFileName(this, QStringLiteral("另存 WAV"),
-                                                  QFileInfo(audio_).fileName(), "WAV (*.wav)");
+                                                  QFileInfo(audio).fileName(), "WAV (*.wav)");
         if (target.isEmpty())
             return;
-        try {
-            if (!target.endsWith(".wav", Qt::CaseInsensitive))
-                target += ".wav";
-            QFile source(checkedPath(audio_));
-            QSaveFile output(checkedPath(target));
-            if (!source.open(QIODevice::ReadOnly) || !output.open(QIODevice::WriteOnly))
-                throw std::runtime_error(QStringLiteral("无法读取音频或写入目标文件").toStdString());
-            while (!source.atEnd()) {
-                const auto chunk = source.read(1024 * 1024);
-                if (source.error() != QFileDevice::NoError || output.write(chunk) != chunk.size())
-                    throw std::runtime_error(QStringLiteral("写入中断，请检查磁盘空间").toStdString());
+        if (!target.endsWith(".wav", Qt::CaseInsensitive))
+            target += ".wav";
+        export_->setText(QStringLiteral("正在另存…"));
+        export_->setEnabled(false);
+        exporter_.setFuture(QtConcurrent::run([audio, target](QPromise<QString> &promise) {
+            try {
+                QFile source(checkedPath(audio));
+                QSaveFile output(checkedPath(target));
+                if (source.fileName().compare(output.fileName(), Qt::CaseInsensitive) == 0)
+                    throw std::runtime_error(QStringLiteral("请选择其他路径，当前 WAV 已在该位置").toStdString());
+                if (!source.open(QIODevice::ReadOnly) || !output.open(QIODevice::WriteOnly))
+                    throw std::runtime_error(QStringLiteral("无法读取音频或写入目标文件").toStdString());
+                while (!promise.isCanceled() && !source.atEnd()) {
+                    const auto chunk = source.read(1024 * 1024);
+                    if (source.error() != QFileDevice::NoError || output.write(chunk) != chunk.size())
+                        throw std::runtime_error(QStringLiteral("写入中断，请检查磁盘空间").toStdString());
+                }
+                source.close();
+                if (!promise.isCanceled()) {
+                    if (!output.commit())
+                        throw std::runtime_error(output.errorString().toStdString());
+                    promise.addResult(QStringLiteral("WAV 已保存到 %1").arg(QDir::toNativeSeparators(target)));
+                }
+            } catch (const std::exception &error) {
+                promise.addResult(QString::fromUtf8(error.what()));
             }
-            if (!output.commit())
-                throw std::runtime_error(output.errorString().toStdString());
-        } catch (const std::exception &error) {
-            status_->setText(QString::fromUtf8(error.what()));
-        }
+        }));
+    });
+    connect(&exporter_, &QFutureWatcher<QString>::finished, this, [this] {
+        export_->setText(QStringLiteral("另存 WAV"));
+        export_->setEnabled(!audio_.isEmpty());
+        if (!exporter_.isCanceled())
+            status_->setText(exporter_.result());
     });
     connect(&importer_, &QFutureWatcher<QJsonObject>::finished, this, [this] {
         importing_ = false;
@@ -346,6 +366,8 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
 SynthesisPanel::~SynthesisPanel()
 {
     importer_.waitForFinished();
+    exporter_.cancel();
+    exporter_.waitForFinished();
 }
 
 void SynthesisPanel::playAudio(const QString &path)
@@ -356,7 +378,7 @@ void SynthesisPanel::playAudio(const QString &path)
     player_->setSource(QUrl::fromLocalFile(audio_));
     play_->setEnabled(true);
     play_->setToolTip({});
-    export_->setEnabled(true);
+    export_->setEnabled(!exporter_.isRunning());
     folder_->setEnabled(true);
     player_->play();
 }
@@ -697,7 +719,7 @@ void SynthesisPanel::receiveAudio(const QString &id, const QJsonObject &result)
         play_->setEnabled(true);
         play_->setToolTip(batch ? QStringLiteral("播放本批最近生成的成品 · 第 %1 条")
             .arg(request.value("batch_index").toInt()) : QString());
-        export_->setEnabled(true);
+        export_->setEnabled(!exporter_.isRunning());
         folder_->setEnabled(true);
         if (!batch)
             status_->setText(QStringLiteral("语音已生成 · %1 秒").arg(result.value("duration").toDouble(), 0, 'f', 2));

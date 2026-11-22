@@ -50,6 +50,7 @@ private:
     TaskScheduler &scheduler_;
     std::function<QString()> launcher_;
     QFutureWatcher<QJsonObject> importer_;
+    QFutureWatcher<QString> exporter_;
     bool importing_ = false;
     QComboBox *voices_ = nullptr;
     QComboBox *language_ = nullptr;

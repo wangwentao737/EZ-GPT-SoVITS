@@ -22,6 +22,7 @@
 #include <QFormLayout>
 #include <QFutureWatcher>
 #include <QHeaderView>
+#include <QIcon>
 #include <QInputDialog>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -109,7 +110,7 @@ class Workspace final : public QWidget {
 public:
     Workspace(const QString &root, const QString &defaultOutput) : root_(root), defaultOutput_(defaultOutput)
     {
-        setWindowTitle(QStringLiteral("EZ-GPT-SoVITS · 语音工作台"));
+        setWindowTitle(QStringLiteral("GPT-SoVITS · 语音工作台"));
         resize(1120, 740);
         setMinimumSize(900, 600);
         setObjectName("workspace");
@@ -124,10 +125,11 @@ public:
         rail->setContentsMargins(13, 21, 13, 16);
         rail->setSpacing(12);
         auto *brand = new QHBoxLayout;
-        auto *mark = new QLabel(QStringLiteral("EZ"), sidebar);
+        auto *mark = new QLabel(sidebar);
         mark->setObjectName("brandMark");
         mark->setFixedSize(34, 34);
         mark->setAlignment(Qt::AlignCenter);
+        mark->setPixmap(qApp->windowIcon().pixmap(mark->size(), mark->devicePixelRatioF()));
         auto *brandName = new QLabel(QStringLiteral("GPT-SoVITS"), sidebar);
         brandName->setObjectName("brand");
         brand->addWidget(mark);
@@ -1035,6 +1037,7 @@ int main(int argc, char **argv)
     app.setApplicationName("EZ-GPT-SoVITS");
     app.setOrganizationName("EZ-GPT-SoVITS");
     app.setApplicationVersion(QStringLiteral(EZ_APP_VERSION));
+    app.setWindowIcon(QIcon(QStringLiteral(":/branding/app-icon.png")));
     QCommandLineParser parser;
     parser.addHelpOption();
     parser.addVersionOption();
@@ -1054,7 +1057,7 @@ int main(int argc, char **argv)
         const auto defaultOutput = root + "/outputs";
         QLockFile lock(ez::checkedPath(root + "/workspace.lock"));
         if (!lock.tryLock())
-            throw std::runtime_error(QStringLiteral("此数据目录已由另一个 EZ 实例使用").toStdString());
+            throw std::runtime_error(QStringLiteral("此数据目录已由另一个语音工作台实例使用").toStdString());
         initDatabase(root);
         if (parser.isSet(probeOption)) {
             ez::EngineManager engine;
@@ -1151,7 +1154,7 @@ int main(int argc, char **argv)
         if (parser.isSet(probeOption) || parser.isSet(smokeOption))
             QTextStream(stderr) << failureMessage(error) << Qt::endl;
         else
-            QMessageBox::critical(nullptr, QStringLiteral("无法打开 EZ-GPT-SoVITS"), failureMessage(error));
+            QMessageBox::critical(nullptr, QStringLiteral("无法打开语音工作台"), failureMessage(error));
         return 1;
     }
 }

@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.24)
-project(EZ_GPT_SoVITS VERSION 0.1.19 LANGUAGES CXX)
+project(EZ_GPT_SoVITS VERSION 0.1.20 LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "EZ-GPT-SoVITS requires Windows x64")
 endif()
+enable_language(RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,6 +12,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_INSTALL_BINDIR ".")
 find_package(Qt6 6.8 REQUIRED COMPONENTS Widgets Network Sql Multimedia Concurrent)
 qt_add_executable(EZ-GPT-SoVITS WIN32
+    assets/app-icon.rc
     src/main.cpp
     src/ui.cpp src/ui.h
     src/engine.cpp src/engine.h
@@ -23,6 +25,7 @@ qt_add_executable(EZ-GPT-SoVITS WIN32
     src/voiceverification.cpp src/voiceverification.h
     src/training.cpp src/training.h
 )
+target_include_directories(EZ-GPT-SoVITS PRIVATE assets)
 target_compile_definitions(EZ-GPT-SoVITS PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN EZ_APP_VERSION="${PROJECT_VERSION}")
 target_compile_options(EZ-GPT-SoVITS PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
 target_link_libraries(EZ-GPT-SoVITS PRIVATE
@@ -31,6 +34,11 @@ target_link_libraries(EZ-GPT-SoVITS PRIVATE
 qt_add_resources(EZ-GPT-SoVITS "engine_bridge"
     PREFIX "/"
     FILES engine/bridge.py
+)
+qt_add_resources(EZ-GPT-SoVITS "branding"
+    PREFIX "/branding"
+    BASE assets
+    FILES assets/app-icon.png
 )
 install(TARGETS EZ-GPT-SoVITS RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 install(FILES README.md THIRD_PARTY.md 开发文档.md DESTINATION .)
