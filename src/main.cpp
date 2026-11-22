@@ -227,10 +227,19 @@ public:
         status_->setWordWrap(true);
         status_->setTextFormat(Qt::PlainText);
         status_->setObjectName("statusLine");
+        auto *activityLine = ez::ui::hint({}, content);
+        activityLine->setAccessibleName(QStringLiteral("当前任务阶段与耗时"));
+        activityLine->hide();
+        layout->addWidget(activityLine);
         layout->addWidget(status_);
 
         auto *settings = createSettings(tabs);
         scheduler_ = new ez::TaskScheduler(root_, defaultOutput_, engine_, this);
+        connect(scheduler_, &ez::TaskScheduler::activityChanged, activityLine, [this, activityLine] {
+            const auto text = ez::jobActivityText(scheduler_->activity());
+            activityLine->setText(text);
+            activityLine->setVisible(!text.isEmpty());
+        });
         connect(scheduler_, &ez::TaskScheduler::failed, this, [this](const QString &message) {
             status_->setText(message.section('\n', 0, 0));
         });

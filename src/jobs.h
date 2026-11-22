@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QElapsedTimer>
 #include <QJsonObject>
 #include <QObject>
 #include <QProcess>
@@ -8,6 +9,21 @@
 namespace ez {
 
 class EngineManager;
+
+struct JobActivity {
+    QString id;
+    QString operation;
+    QString phase;
+    QString device;
+    QString unit;
+    int completed = 0;
+    int total = 0;
+    qint64 seconds = 0;
+
+    bool operator==(const JobActivity &) const = default;
+};
+
+QString jobActivityText(const JobActivity &activity);
 
 void startJobProcess(QProcess &worker, const QString &engine, const QString &root,
                      const QString &job, QJsonObject request, quint32 webuiPid);
@@ -24,15 +40,18 @@ public:
     void cancelQueuedBatch(const QString &batch);
     void stop();
     bool running() const;
+    const JobActivity &activity() const { return activity_; }
 
 signals:
     void changed();
     void completed(const QString &id, const QJsonObject &result);
     void cancelled(const QString &id);
     void failed(const QString &message);
+    void activityChanged();
 
 private:
     void next();
+    void pollActivity();
     QStringList enqueueRequests(const QString &launcher, const QList<QJsonObject> &requests, QJsonObject project = {});
     void failQueued(const QString &launcher, const QString &message);
     void finish(bool processSucceeded, QString message);
@@ -53,6 +72,9 @@ private:
     EngineManager &engine_;
     QProcess worker_;
     QTimer cancelTimeout_;
+    QTimer activityTimer_;
+    QElapsedTimer activityClock_;
+    JobActivity activity_;
     bool cancelling_ = false;
     bool stopping_ = false;
     bool restartEngine_ = false;

@@ -303,6 +303,7 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
         }
     });
     connect(&scheduler_, &TaskScheduler::changed, this, [this] { showState(); });
+    connect(&scheduler_, &TaskScheduler::activityChanged, this, &TrainingPanel::showActivity);
     query.prepare("SELECT name,id FROM projects ORDER BY rowid DESC");
     execute(query);
     while (query.next())
@@ -722,7 +723,8 @@ void TrainingPanel::showState()
     if (project_.isEmpty()) {
         advise(create_, QStringLiteral("下一步：点「新建项目」，再导入原始录音或已切好的 WAV。"));
     } else if (active) {
-        advise(nullptr, QStringLiteral("当前阶段已提交。可在「任务记录」查看结果、错误详情或取消任务。"));
+        advise(nullptr, QStringLiteral("当前阶段已排队，等待引擎或前面的任务。可在「任务记录」取消。"));
+        showActivity();
     } else if (project_.contains("gpt") && project_.contains("sovits")) {
         advise(preview_, QStringLiteral("两份模型权重已完成。选一段清晰的参考录音，点「试听并入库」。"));
     } else if (canResume) {
@@ -742,6 +744,13 @@ void TrainingPanel::showState()
     } else {
         advise(recordings_, QStringLiteral("导入原始录音进行切片，或直接导入已切好的 WAV 片段。"));
     }
+}
+
+void TrainingPanel::showActivity()
+{
+    const auto &activity = scheduler_.activity();
+    if (!activity.id.isEmpty() && project_.value("pending").toString() == activity.id)
+        stage_->setText(jobActivityText(activity));
 }
 
 }

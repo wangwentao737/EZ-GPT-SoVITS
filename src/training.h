@@ -33,6 +33,7 @@ private:
     void complete(const QString &id, const QJsonObject &result, bool live = true);
     void importVoice();
     void showState();
+    void showActivity();
     bool busy() const;
     QString nextTrainingStage() const;
     QString resumeJob(const QString &operation) const;

@@ -65,6 +65,12 @@ def clone_dataset(source, target, missing=None, duplicate=False):
             clone(old, new)
 
 
+def progress_updates(data, job):
+    output = (data / "jobs" / job / "result.log").read_text(encoding="utf-8", errors="replace")
+    return [json.loads(line.removeprefix("EZ_PROGRESS ")) for line in output.splitlines()
+            if line.startswith("EZ_PROGRESS ")]
+
+
 def main():
     workspace = Path(__file__).resolve().parents[1]
     scratch = workspace / ".test"
@@ -104,6 +110,11 @@ def main():
     rows = run(args.app, engine, data, [prepare], expected=0)
     assert len(rows) == 1 and rows[0][1] == "succeeded", rows
     prepared = json.loads(rows[0][3])
+    phases = [entry["phase"] for entry in progress_updates(data, rows[0][0])]
+    expected_phases = ("处理训练文本", "提取声学特征", "提取语义特征", "校验预处理产物")
+    assert all(phase in phases for phase in expected_phases), phases
+    assert [phases.index(phase) for phase in expected_phases] == sorted(phases.index(phase) for phase in expected_phases)
+    assert prepared["elapsed_ms"] > 0
     dataset = Path(prepared["dataset"])
     assert prepared["sample_count"] == len(lines)
     manifest = json.loads((dataset / "ez-dataset.json").read_text(encoding="utf-8"))
@@ -145,6 +156,9 @@ def main():
     for job, state, message, result in rows[3:]:
         assert state == "succeeded", (state, message)
         output = json.loads(result)
+        updates = [entry for entry in progress_updates(data, job) if entry["unit"] == "轮"]
+        assert any(entry["completed"] > 0 and entry["total"] == 2 for entry in updates), updates
+        assert updates[-1]["completed"] == 2 and output["elapsed_ms"] > 0, updates
         assert Path(output["dataset"]) == dataset and output["sample_count"] == len(lines)
         assert Path(output["checkpoints"]) != dataset
         assert Path(output["weight"]).is_file() and output["weight"].startswith(str(project))

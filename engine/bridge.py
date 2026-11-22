@@ -63,6 +63,27 @@ def publish(**values):
     print("EZ_RESULT " + json.dumps(values, ensure_ascii=True), flush=True)
 
 
+class JobProgress:
+    def __init__(self, job):
+        self.path = safe_path(job / "progress.json", job)
+        self.temporary = safe_path(job / "progress.json.partial", job)
+        self.last = None
+
+    def __call__(self, phase, completed=0, total=0, unit="", device=""):
+        update = {"phase": phase, "completed": completed, "total": total, "unit": unit, "device": device}
+        if update == self.last:
+            return
+        content = json.dumps(update, ensure_ascii=False)
+        try:
+            self.temporary.write_text(content, encoding="utf-8")
+            os.replace(self.temporary, self.path)
+            print("EZ_PROGRESS " + content, flush=True)
+        except OSError:
+            # A progress update must never fail the task.
+            return
+        self.last = update
+
+
 def connect(port, download_files=False):
     return Client(
         f"http://127.0.0.1:{port}",
@@ -81,7 +102,7 @@ def check_cancel(marker):
         raise Cancelled
 
 
-def invoke(client, endpoint, *arguments, cancel=None, stop=None):
+def invoke(client, endpoint, *arguments, cancel=None, stop=None, on_wait=None):
     matches = [item for item in client.config["dependencies"] if item["api_name"] == endpoint]
     if len(matches) != 1 or len(matches[0]["inputs"]) != len(arguments):
         raise ValueError(f"目标引擎接口与适配契约不一致：{endpoint}")
@@ -89,7 +110,12 @@ def invoke(client, endpoint, *arguments, cancel=None, stop=None):
         return client.predict(*arguments, api_name=f"/{endpoint}")
     check_cancel(cancel)
     pending = client.submit(*arguments, api_name=f"/{endpoint}")
+    last_update = 0
     while not pending.done():
+        now = time.monotonic()
+        if on_wait is not None and now - last_update >= 0.5:
+            on_wait(pending)
+            last_update = now
         try:
             pending.result(timeout=0.2)
         except TimeoutError:
@@ -102,7 +128,10 @@ def invoke(client, endpoint, *arguments, cancel=None, stop=None):
                 pending.result(timeout=2)
             raise Cancelled from None
     check_cancel(cancel)
-    return pending.result()
+    result = pending.result()
+    if on_wait is not None:
+        on_wait(pending)
+    return result
 
 
 def inspect_wav(path, reference=False, cancel=None):
@@ -221,6 +250,8 @@ def synthesis_parameters(request):
 
 
 def synthesize(client, engine, data, job, request, cancel):
+    progress = JobProgress(job)
+    progress("检查声音预设和参考录音")
     family = request["family"]
     if family not in FAMILIES:
         raise ValueError("当前模型家族尚未适配")
@@ -238,10 +269,12 @@ def synthesize(client, engine, data, job, request, cancel):
     if not re.fullmatch(r"\d{1,2}", gpu):
         raise ValueError("请选择有效的显卡编号")
     try:
+        progress("准备两份模型权重")
         for kind, key in (("GPT", "gpt"), ("SoVITS", "sovits")):
             check_cancel(cancel)
             staged.append(stage_weight(safe_path(request[key], data), engine, kind, family, job, cancel))
         if request.get("record_voice_verification"):
+            progress("校验模型和参考音频")
             inputs = {"gpt": safe_path(engine / staged[0], engine),
                       "sovits": safe_path(engine / staged[1], engine), "reference": reference}
             cached = request.get("verification_hashes", {})
@@ -253,12 +286,14 @@ def synthesize(client, engine, data, job, request, cancel):
         invoke(client, "change_choices")
         check_cancel(cancel)
         args = (BERT, HUBERT, gpu, *staged, True)
+        progress("启动推理服务并加载模型")
         invoke(client, "change_tts_inference", *args)
         start_requested = True
 
         tts = wait_for_inference(request["webui_pid"], job, cancel)
 
         seed = parameters["seed"]
+        progress("生成音频")
         result = invoke(
             tts, "inference", text, request.get("language", "中文"),
             handle_file(str(reference)), None, prompt, request.get("prompt_language", "中文"),
@@ -268,6 +303,7 @@ def synthesize(client, engine, data, job, request, cancel):
             1.30 if family == "v5dev" else 0.0, cancel=cancel,
         )
         audio_path, actual_seed = result
+        progress("校验并保存音频")
         path = safe_path(audio_path, job)
         info = inspect_wav(path)
         temporary = safe_path(job / "verified.wav", job)
@@ -302,7 +338,8 @@ def require_outputs(folder, glob, stage):
     return files
 
 
-def transcribe(engine, project, request, gpu, cancel):
+def transcribe(engine, project, request, gpu, cancel, progress):
+    progress("加载本地转写模型")
     # The embedded Python distribution omits site initialization and its .pth hooks.
     if importlib.util.find_spec("distutils") is None:
         from _distutils_hack import add_shim
@@ -330,13 +367,16 @@ def transcribe(engine, project, request, gpu, cancel):
     for path in local.values():
         if not (path / "config.yaml").is_file() or not (path / "model.pt").is_file():
             raise FileNotFoundError(f"本地转写资源不完整：{path.name}。可导入已有标注或手动填写。")
+    device = f"cuda:{gpu}" if torch.cuda.is_available() else "cpu"
     model = AutoModel(
         **{role: str(path) for role, path in local.items()},
-        device=f"cuda:{gpu}" if torch.cuda.is_available() else "cpu",
+        device=device,
         disable_update=True,
     )
     labels = []
-    for candidate in require_outputs(source, "*.wav", "切片"):
+    clips = require_outputs(source, "*.wav", "切片")
+    progress("转写录音片段", 0, len(clips), "段", device)
+    for candidate in clips:
         check_cancel(cancel)
         clip = safe_path(candidate, source)
         inspect_wav(clip)
@@ -344,7 +384,9 @@ def transcribe(engine, project, request, gpu, cancel):
         text = response[0].get("text", "").strip() if response else ""
         text = text.replace("|", "｜").replace("\n", " ")
         labels.append(f"{clip}|{source.name}|{language.upper()}|{text}")
+        progress("转写录音片段", len(labels), len(clips), "段", device)
     check_cancel(cancel)
+    progress("保存转写标注", len(labels), len(clips), "段", device)
     destination.mkdir()
     annotation = safe_path(destination / f"{source.name}.list", project)
     annotation.write_text("\n".join(labels) + "\n", encoding="utf-8")
@@ -563,7 +605,32 @@ def require_resume_trace(log, offset, stage, run, epoch):
     raise ValueError("引擎没有确认从检查点恢复，未采用本次权重。请查看启动日志或重跑该阶段。")
 
 
+def preparation_progress(pending, progress, seen):
+    for output in pending.outputs():
+        message = output[0] if isinstance(output, (tuple, list)) and output else output
+        if not isinstance(message, str):
+            continue
+        for marker, phase in (("1A-Doing", "处理训练文本"), ("1B-Doing", "提取声学特征"), ("1C-Doing", "提取语义特征")):
+            if marker in message and marker not in seen:
+                seen.add(marker)
+                progress(phase)
+
+
+def training_progress(weights, pattern, total, previous, progress):
+    phase = "训练模型 · 已保存权重的轮次"
+    saved = max(previous, progress.last["completed"]) if progress.last and progress.last["phase"] == phase else previous
+    try:
+        for file in weights.glob(pattern):
+            match = re.search(r"[_-]e(\d+)(?=_s|\.)", file.name)
+            if match and saved < int(match[1]) <= total and zipfile.is_zipfile(file):
+                saved = int(match[1])
+    except OSError:
+        pass
+    progress(phase, saved, total, "轮")
+
+
 def run_training(client, engine, data, job, request, cancel):
+    progress = JobProgress(job)
     stage = request["operation"]
     project = safe_path(request["project"], data)
     project.mkdir(parents=True, exist_ok=True)
@@ -572,20 +639,23 @@ def run_training(client, engine, data, job, request, cancel):
         raise ValueError("请选择有效的显卡编号")
 
     if stage == "slice":
+        progress("切分原始录音")
         source = shell_path(request["source"], project)
         destination = safe_path(request["destination"], project)
         destination.mkdir()
         invoke(client, "open_slice", source, shell_path(destination, project),
                -34, 4000, 300, 10, 500, 0.9, 0.25, 1, cancel=cancel, stop="close_slice")
         clips = require_outputs(destination, "*.wav", "切片")
-        for clip in clips:
+        progress("校验切片音频", 0, len(clips), "段")
+        for index, clip in enumerate(clips, 1):
             check_cancel(cancel)
-            inspect_wav(clip)
+            inspect_wav(clip, cancel=cancel)
+            progress("校验切片音频", index, len(clips), "段")
         publish(clips=[str(clip) for clip in clips])
         return
 
     if stage == "asr":
-        transcribe(engine, project, request, gpu, cancel)
+        transcribe(engine, project, request, gpu, cancel, progress)
         return
 
     family = request["family"]
@@ -597,6 +667,7 @@ def run_training(client, engine, data, job, request, cancel):
         raise ValueError("项目实验标识无效")
     experiment_dir = safe_path(engine / "logs" / experiment, engine)
     if stage == "prepare":
+        progress("核对标注与录音")
         annotation = safe_path(request["annotation"], project)
         clips = safe_path(request["source"], project)
         snapshot = annotated_samples(annotation, clips, cancel, inspect_audio=True)
@@ -604,9 +675,13 @@ def run_training(client, engine, data, job, request, cancel):
         if experiment_dir.exists():
             raise ValueError("此预处理实验已存在，请从项目重新准备训练数据")
         invoke(client, "switch_version", family)
+        progress("启动数据预处理")
+        seen = set()
         invoke(client, "open1abc", family, shell_path(annotation, project), shell_path(clips, project),
                experiment, gpu, gpu, gpu,
-               BERT, HUBERT, sovits, cancel=cancel, stop="close1abc")
+               BERT, HUBERT, sovits, cancel=cancel, stop="close1abc",
+               on_wait=lambda pending: preparation_progress(pending, progress, seen))
+        progress("校验预处理产物")
         if hashlib.sha256(annotation.read_bytes()).hexdigest() != snapshot["annotation_sha256"]:
             raise ValueError("预处理时标注发生变更，请重新准备训练数据")
         _, sample_count = verify_dataset(experiment_dir, family, snapshot, cancel)
@@ -620,6 +695,7 @@ def run_training(client, engine, data, job, request, cancel):
 
     if stage not in {"train_sovits", "train_gpt"}:
         raise ValueError(f"未知训练阶段：{stage}")
+    progress("校验训练样本与配置")
     manifest = safe_path(experiment_dir / "ez-dataset.json", experiment_dir)
     snapshot = json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else None
     if snapshot is not None and snapshot["family"] != family:
@@ -638,8 +714,11 @@ def run_training(client, engine, data, job, request, cancel):
     signature = resume_signature(engine, experiment_dir, artifacts, snapshot, settings,
                                  sovits if stage == "train_sovits" else gpt, cancel)
     parent = request.get("resume_job")
+    if parent:
+        progress("检查断点和训练配置")
     resume = find_resume_checkpoint(data, job, engine, settings, signature, parent, cancel) if parent else None
     completed_epoch = 0
+    progress("准备本次训练目录")
     run = new_training_run(engine, experiment_dir, artifacts, cancel)
     if resume:
         source, relative, completed_epoch, state = resume
@@ -672,13 +751,22 @@ def run_training(client, engine, data, job, request, cancel):
     interval = 1 if signature is not None else epochs
     engine_log = safe_path(data / "engine-start.log", data)
     offset = engine_log.stat().st_size if completed_epoch else 0
+    on_wait = None
+    if signature is not None:
+        epoch_pattern = f"{run.name}_e*_s*_l32.pth" if stage == "train_sovits" else f"{run.name}-e*.ckpt"
+        training_progress(weights, epoch_pattern, epochs, completed_epoch, progress)
+        on_wait = lambda _: training_progress(weights, epoch_pattern, epochs, completed_epoch, progress)
+    else:
+        progress("训练模型")
     if stage == "train_sovits":
         discriminator = "" if family.startswith("v5") else sovits.replace("/s2G", "/s2D")
         invoke(client, "open1Ba", family, batch, epochs, run.name, 0.4, True, True, interval,
-               gpu, sovits, discriminator, family.startswith("v5"), 32, cancel=cancel, stop="close1Ba")
+               gpu, sovits, discriminator, family.startswith("v5"), 32, cancel=cancel, stop="close1Ba",
+               on_wait=on_wait)
     else:
         invoke(client, "open1Bb", batch, epochs, run.name, False, True, True, interval, gpu, gpt,
-               cancel=cancel, stop="close1Bb")
+               cancel=cancel, stop="close1Bb", on_wait=on_wait)
+    progress("核对并保存训练权重")
     if completed_epoch:
         require_resume_trace(engine_log, offset, stage, run, completed_epoch)
     if signature is None:
