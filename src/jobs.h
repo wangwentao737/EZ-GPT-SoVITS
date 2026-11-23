@@ -3,6 +3,7 @@
 #include <QElapsedTimer>
 #include <QFutureWatcher>
 #include <QJsonObject>
+#include <QMap>
 #include <QObject>
 #include <QProcess>
 #include <QTimer>
@@ -27,8 +28,8 @@ struct JobActivity {
 
 QString jobActivityText(const JobActivity &activity);
 
-void startJobProcess(QProcess &worker, const QString &engine, const QString &root,
-                     const QString &job, QJsonObject request, quint32 webuiPid);
+void startJobProcess(QProcess &worker, const EngineManager &engine, const QString &root,
+                     const QString &job, QJsonObject request);
 
 class TaskScheduler final : public QObject {
     Q_OBJECT
@@ -64,6 +65,10 @@ private:
     void forceCancel();
     void continueAfterCancellation();
     void removeStagedWeights(const QString &id, const QJsonObject &request);
+    void submitInference(QJsonObject request, const QString &group);
+    void readInferenceStatus();
+    void closeInference();
+    void inferenceExited(bool success);
     void update(const QString &id, const QString &state, const QString &message = {},
                 const QJsonObject &result = {});
 
@@ -75,8 +80,16 @@ private:
     qint64 engineLogOffset_ = 0;
     QJsonObject activeRequest_;
     QJsonObject activeVoiceVersion_;
+    QString activeEngineFingerprint_;
     EngineManager &engine_;
     QProcess worker_;
+    QProcess inferenceWorker_;
+    QTimer inferenceTimeout_;
+    QByteArray inferenceStatus_;
+    QString inferenceGroup_;
+    QMap<QString, QJsonObject> inferenceStaged_;
+    bool inferenceTask_ = false;
+    bool inferenceClosing_ = false;
     QFutureWatcher<QString> archive_;
     QJsonObject archiveReceipt_;
     std::atomic_bool archiveCancelled_ = false;

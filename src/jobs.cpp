@@ -2,6 +2,7 @@
 #include "engine.h"
 #include "resources.h"
 #include "settings.h"
+#include "workspacepaths.h"
 #include "voiceverification.h"
 
 #include <QCryptographicHash>
@@ -82,7 +83,10 @@ bool isArchivedWave(const QString &path, const QJsonObject &receipt)
 QString outputRootForRequest(const QString &dataRoot, const QJsonObject &request)
 {
     const auto saved = request.value("output_root").toString();
-    return checkedPath(saved.isEmpty() ? dataRoot + "/outputs" : saved);
+    const auto output = checkedPath(saved.isEmpty() ? dataRoot + "/outputs" : saved);
+    if (request.value("external_output").toBool() && !QFileInfo(output).exists())
+        fail(QStringLiteral("自定义成品目录不可用。请在「设置」中重新定位：%1").arg(output));
+    return output;
 }
 
 void checkOutputDirectory(const QString &path)
@@ -175,29 +179,51 @@ QString jobActivityText(const JobActivity &activity)
     return text + QStringLiteral(" · 已用 %1").arg(elapsed);
 }
 
-void startJobProcess(QProcess &worker, const QString &engine, const QString &root,
-                     const QString &job, QJsonObject request, quint32 webuiPid)
+static QJsonObject prepareJob(const EngineManager &engine, const QString &root,
+                             const QString &directory, QJsonObject request)
 {
-    const auto directory = checkedPath(job);
     if (!QDir().mkpath(directory))
         fail(QStringLiteral("无法创建任务目录"));
-    request.insert("engine", engine);
+    request.insert("engine", engine.root());
     request.insert("data", root);
     request.insert("job", directory);
-    request.insert("webui_pid", static_cast<qint64>(webuiPid));
+    request.insert("webui_pid", static_cast<qint64>(engine.webuiPid()));
+    request.insert("main_port", int(engine.ports().main));
+    request.insert("inference_port", int(engine.ports().inference));
     save(directory + "/request.json", json(request));
-    QFile embedded(":/engine/bridge.py");
-    if (!embedded.open(QIODevice::ReadOnly))
-        fail(QStringLiteral("无法读取引擎适配程序"));
-    save(directory + "/bridge.py", embedded.readAll());
+    return request;
+}
+
+static QString prepareBridge(const QString &directory)
+{
+    for (const auto *name : {"bridge.py", "20261006-contract.json"}) {
+        QFile embedded(QString(":/engine/") + name);
+        if (!embedded.open(QIODevice::ReadOnly))
+            fail(QStringLiteral("无法读取引擎适配文件 %1").arg(QString::fromLatin1(name)));
+        save(directory + '/' + name, embedded.readAll());
+    }
+    return directory + "/bridge.py";
+}
+
+static void configureWorker(QProcess &worker, const QString &engine)
+{
     worker.setWorkingDirectory(engine);
     auto environment = QProcessEnvironment::systemEnvironment();
     environment.insert("PATH", QDir::toNativeSeparators(engine + "/runtime") + ';' + environment.value("PATH"));
     worker.setProcessEnvironment(environment);
+    worker.setProgram(checkedPath(engine + "/runtime/python.exe"));
+}
+
+void startJobProcess(QProcess &worker, const EngineManager &engine, const QString &root,
+                     const QString &job, QJsonObject request)
+{
+    const auto directory = checkedPath(job);
+    prepareJob(engine, root, directory, std::move(request));
+    const auto bridge = prepareBridge(directory);
+    configureWorker(worker, engine.root());
     worker.setStandardOutputFile(checkedPath(directory + "/result.log"));
     worker.setStandardErrorFile(checkedPath(directory + "/error.log"));
-    worker.setProgram(checkedPath(engine + "/runtime/python.exe"));
-    worker.setArguments({"-I", "-X", "utf8", "-B", "-u", directory + "/bridge.py", directory + "/request.json"});
+    worker.setArguments({"-I", "-X", "utf8", "-B", "-u", bridge, directory + "/request.json"});
     worker.start();
 }
 
@@ -210,15 +236,29 @@ TaskScheduler::TaskScheduler(QString dataRoot, QString defaultOutputRoot, Engine
                   "operation TEXT NOT NULL, state TEXT NOT NULL, request BLOB NOT NULL,"
                   "message TEXT NOT NULL DEFAULT '', result BLOB)");
     execute(query);
+    query.prepare("CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created)");
+    execute(query);
+    query.prepare("CREATE INDEX IF NOT EXISTS jobs_batch ON jobs(json_extract(CAST(request AS TEXT),'$.batch_id'))"
+                  " WHERE json_valid(CAST(request AS TEXT))");
+    execute(query);
+    query.prepare("CREATE INDEX IF NOT EXISTS jobs_script_line ON jobs(json_extract(CAST(request AS TEXT),'$.line_id'))"
+                  " WHERE operation='synthesize' AND json_valid(CAST(request AS TEXT))");
+    execute(query);
     query.prepare("SELECT id,request FROM jobs WHERE state='running' AND operation='synthesize'");
     execute(query);
     QList<QPair<QString, QJsonObject>> unfinished;
     while (query.next())
         unfinished.append({query.value(0).toString(), QJsonDocument::fromJson(query.value(1).toByteArray()).object()});
     query.finish();
-    for (const auto &[id, request] : unfinished) {
+    for (const auto &[id, snapshot] : unfinished) {
         try {
-            const auto completion = readResult(root_ + "/jobs/" + id + "/completion.json");
+            if (QUuid(id).isNull())
+                continue;
+            const auto request = resolvedWorkspacePaths(snapshot);
+            auto receipt = readResult(root_ + "/jobs/" + id + "/completion.json");
+            if (request.value("external_output").toBool())
+                receipt["external_output"] = true;
+            const auto completion = resolvedWorkspacePaths(receipt);
             const auto audio = completion.value("audio").toString();
             const auto output = outputRootForRequest(root_, request);
             if (!audio.startsWith(output.endsWith('/') ? output : output + '/', Qt::CaseInsensitive)
@@ -240,11 +280,25 @@ TaskScheduler::TaskScheduler(QString dataRoot, QString defaultOutputRoot, Engine
     connect(&archive_, &QFutureWatcher<QString>::finished, this, &TaskScheduler::finishArchive);
     cancelTimeout_.setSingleShot(true);
     connect(&cancelTimeout_, &QTimer::timeout, this, &TaskScheduler::forceCancel);
+    inferenceTimeout_.setSingleShot(true);
+    connect(&inferenceTimeout_, &QTimer::timeout, &inferenceWorker_, &QProcess::kill);
+    connect(&inferenceWorker_, &QProcess::readyReadStandardOutput, this, &TaskScheduler::readInferenceStatus);
+    connect(&inferenceWorker_, &QProcess::finished, this, [this](int code, QProcess::ExitStatus status) {
+        inferenceExited(code == 0 && status == QProcess::NormalExit);
+    });
+    connect(&inferenceWorker_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+        if (error == QProcess::FailedToStart)
+            inferenceExited(false);
+    });
     connect(&engine_, &EngineManager::readinessChanged, this, [this](bool ready) {
-        if (ready)
+        if (ready) {
             next();
-        else if (worker_.state() != QProcess::NotRunning && !cancelling_)
-            worker_.kill();
+        } else if (!cancelling_) {
+            if (worker_.state() != QProcess::NotRunning)
+                worker_.kill();
+            if (inferenceWorker_.state() != QProcess::NotRunning)
+                inferenceWorker_.kill();
+        }
     });
     connect(&engine_, &EngineManager::instanceFailed, this, [this](const QString &launcher, const QString &message) {
         if (running() && archiveReceipt_.isEmpty() && !cancelling_)
@@ -267,6 +321,7 @@ TaskScheduler::TaskScheduler(QString dataRoot, QString defaultOutputRoot, Engine
 
 TaskScheduler::~TaskScheduler()
 {
+    stop();
     if (!archiveReceipt_.isEmpty()) {
         archiveCancelled_.store(true);
         archive_.waitForFinished();
@@ -304,7 +359,7 @@ QStringList TaskScheduler::enqueueRequests(const QString &launcher, const QList<
 {
     if (requests.isEmpty())
         fail(QStringLiteral("没有可提交的任务"));
-    const auto root = engineRoot(launcher);
+    const auto root = engineRoot(resolvedEngineLauncher(launcher));
     if (engine_.active() && engine_.root().compare(root, Qt::CaseInsensitive) != 0)
         fail(QStringLiteral("另一个引擎正在运行，请在「工作台」停止后再提交。"));
     const auto entry = root + "/go-webui.bat";
@@ -323,22 +378,25 @@ QStringList TaskScheduler::enqueueRequests(const QString &launcher, const QList<
             if (operation.isEmpty())
                 fail(QStringLiteral("任务缺少操作类型"));
             if (operation == "synthesize") {
-                const auto output = snapshot.value("output_root").toString().isEmpty()
-                    ? configuredOutputRoot(defaultOutputRoot_) : outputRootForRequest(root_, snapshot);
+                const auto savedOutput = snapshot.value("output_root").toString();
+                const auto output = savedOutput.isEmpty() ? configuredOutputRoot(defaultOutputRoot_)
+                    : outputRootForRequest(root_, resolvedWorkspacePaths(snapshot));
                 snapshot["output_root"] = output;
+                if (savedOutput.isEmpty() || !snapshot.contains("external_output"))
+                    snapshot["external_output"] = output.compare(defaultOutputRoot_, Qt::CaseInsensitive) != 0;
             }
             query.bindValue(0, id);
             query.bindValue(1, created);
             query.bindValue(2, entry);
             query.bindValue(3, operation);
-            query.bindValue(4, json(snapshot));
+            query.bindValue(4, json(storedWorkspacePaths(snapshot)));
             execute(query);
             submitted.append(id);
         }
         if (!project.isEmpty()) {
             project.insert("pending", submitted.constFirst());
             query.prepare("UPDATE projects SET state=? WHERE id=?");
-            query.addBindValue(json(project));
+            query.addBindValue(json(storedWorkspacePaths(project)));
             query.addBindValue(project.value("id").toString());
             execute(query);
             if (query.numRowsAffected() != 1)
@@ -386,7 +444,7 @@ void TaskScheduler::failQueued(const QString &launcher, const QString &message)
 
 void TaskScheduler::next()
 {
-    if (stopping_ || !engine_.ready() || running())
+    if (stopping_ || !engine_.ready() || running() || inferenceClosing_)
         return;
     try {
         QSqlQuery query;
@@ -394,14 +452,29 @@ void TaskScheduler::next()
                       " AND launcher=? COLLATE NOCASE ORDER BY created, rowid LIMIT 1");
         query.addBindValue(engine_.root() + "/go-webui.bat");
         execute(query);
-        if (!query.next())
+        if (!query.next()) {
+            closeInference();
             return;
-        active_ = query.value(0).toString();
-        activeRequest_ = QJsonDocument::fromJson(query.value(1).toByteArray()).object();
+        }
+        const auto id = query.value(0).toString();
+        const auto snapshot = query.value(1).toByteArray();
         query.finish();
+        const auto queued = QJsonDocument::fromJson(snapshot).object();
+        const auto operation = queued.value("operation").toString();
+        const auto batch = queued.value("batch_id").toString();
+        const auto voice = queued.value("voice_id").toString();
+        const auto group = operation != "synthesize" ? QString()
+            : batch.isEmpty() || voice.isEmpty() ? id : batch + '/' + voice;
+        if (!inferenceGroup_.isEmpty() && inferenceGroup_ != group) {
+            closeInference();
+            return;
+        }
+        active_ = id;
+        if (QUuid(id).isNull())
+            fail(QStringLiteral("任务编号无效"));
+        activeRequest_ = readWorkspaceRecord(snapshot);
         jobPath_ = checkedPath(root_ + "/jobs/" + active_);
         engineLogOffset_ = QFileInfo(checkedPath(root_ + "/engine-start.log")).size();
-        const auto operation = activeRequest_.value("operation").toString();
         const auto interfaceIssue = engine_.interfaceIssue(operation);
         if (!interfaceIssue.isEmpty())
             fail(interfaceIssue);
@@ -409,6 +482,7 @@ void TaskScheduler::next()
         if (!resourceIssue.isEmpty())
             fail(resourceIssue);
         auto payload = activeRequest_;
+        activeEngineFingerprint_ = engineFingerprint(engine_.root());
         if (operation == "synthesize") {
             checkOutputDirectory(outputRootForRequest(root_, activeRequest_));
             const auto launcher = engine_.root() + "/go-webui.bat";
@@ -425,9 +499,86 @@ void TaskScheduler::next()
         activityClock_.start();
         pollActivity();
         activityTimer_.start();
-        startJobProcess(worker_, engine_.root(), root_, jobPath_, payload, engine_.webuiPid());
+        if (operation == "synthesize")
+            submitInference(std::move(payload), group);
+        else
+            startJobProcess(worker_, engine_, root_, jobPath_, std::move(payload));
     } catch (const std::exception &error) {
         finish(false, QString::fromUtf8(error.what()));
+    }
+}
+
+void TaskScheduler::submitInference(QJsonObject request, const QString &group)
+{
+    request = prepareJob(engine_, root_, jobPath_, std::move(request));
+    if (inferenceWorker_.state() == QProcess::NotRunning) {
+        const auto bridge = prepareBridge(jobPath_);
+        configureWorker(inferenceWorker_, engine_.root());
+        inferenceWorker_.setStandardErrorFile(checkedPath(jobPath_ + "/inference-worker.log"));
+        inferenceWorker_.setArguments({"-I", "-X", "utf8", "-B", "-u", bridge, "--synthesis-worker"});
+        inferenceWorker_.start();
+    }
+    inferenceGroup_ = group;
+    inferenceTask_ = true;
+    inferenceStaged_.insert(active_, activeRequest_);
+    const auto content = json(request) + '\n';
+    if (inferenceWorker_.write(content) != content.size())
+        inferenceWorker_.kill();
+}
+
+void TaskScheduler::readInferenceStatus()
+{
+    inferenceStatus_ += inferenceWorker_.readAllStandardOutput();
+    qsizetype end;
+    while ((end = inferenceStatus_.indexOf('\n')) >= 0) {
+        const auto fields = inferenceStatus_.left(end).simplified().split(' ');
+        inferenceStatus_.remove(0, end + 1);
+        if (!inferenceTask_ || fields.size() != 3 || fields[0] != "EZ_DONE" || fields[1] != active_.toLatin1())
+            continue;
+        bool valid = false;
+        const int code = fields[2].toInt(&valid);
+        if (!valid || (code != 0 && code != 1 && code != cancelledExitCode)) {
+            inferenceWorker_.kill();
+            return;
+        }
+        inferenceTask_ = false;
+        finish(code == 0, {});
+    }
+}
+
+void TaskScheduler::closeInference()
+{
+    if (inferenceWorker_.state() == QProcess::NotRunning || inferenceClosing_ || inferenceTask_)
+        return;
+    inferenceClosing_ = true;
+    inferenceTimeout_.start(cancelGraceMs);
+    inferenceWorker_.closeWriteChannel();
+}
+
+void TaskScheduler::inferenceExited(bool success)
+{
+    readInferenceStatus();
+    const bool taskLost = std::exchange(inferenceTask_, false);
+    const bool closed = std::exchange(inferenceClosing_, false);
+    inferenceTimeout_.stop();
+    inferenceGroup_.clear();
+    inferenceStatus_.clear();
+    if (!closed || !success || taskLost) {
+        if (engine_.active()) {
+            restartEngine_ = true;
+            engine_.stop();
+        }
+        for (auto item = inferenceStaged_.constBegin(); item != inferenceStaged_.constEnd(); ++item)
+            removeStagedWeights(item.key(), item.value());
+    }
+    inferenceStaged_.clear();
+    if (taskLost) {
+        finish(false, {});
+    } else if (!running() && !stopping_) {
+        if (std::exchange(restartEngine_, false))
+            QTimer::singleShot(750, this, &TaskScheduler::continueAfterCancellation);
+        else
+            QTimer::singleShot(0, this, &TaskScheduler::next);
     }
 }
 
@@ -501,6 +652,10 @@ void TaskScheduler::finish(bool processSucceeded, QString message)
             if (result.isEmpty())
                 fail(QStringLiteral("引擎未提交有效的任务产物"));
             result["elapsed_ms"] = activityClock_.isValid() ? activityClock_.elapsed() : 0;
+            if (activeEngineFingerprint_ == engineFingerprint(engine_.root())) {
+                result["engine_fingerprint"] = activeEngineFingerprint_;
+                result["gradio_version"] = engine_.gradioVersion();
+            }
             if (activeRequest_.value("operation") == "synthesize") {
                 startArchive(std::move(result));
                 return;
@@ -562,8 +717,10 @@ void TaskScheduler::startArchive(QJsonObject result)
     if (QFileInfo::exists(partial) || QFileInfo::exists(output))
         fail(QStringLiteral("此任务的归档路径已存在，请重试任务"));
     result["audio"] = output;
+    if (activeRequest_.value("external_output").toBool())
+        result["external_output"] = true;
     result["archive_version"] = 1;
-    save(jobPath_ + "/completion.json", json(result));
+    save(jobPath_ + "/completion.json", json(storedWorkspacePaths(result)));
 
     const auto bytes = result.value("bytes").toInteger();
     const auto hash = result.value("sha256").toString().toLatin1();
@@ -612,12 +769,15 @@ void TaskScheduler::settle(const QJsonObject &result, const QString &message)
     jobPath_.clear();
     activeRequest_ = {};
     activeVoiceVersion_ = {};
+    activeEngineFingerprint_.clear();
     engineFailure_.clear();
     const bool cancelled = std::exchange(cancelling_, false);
     const bool restart = std::exchange(restartEngine_, false);
     cancelTimeout_.stop();
     activityTimer_.stop();
     activityClock_.invalidate();
+    if (cancelled)
+        closeInference();
     if (!activity_.id.isEmpty()) {
         activity_ = {};
         emit activityChanged();
@@ -653,7 +813,7 @@ void TaskScheduler::update(const QString &id, const QString &state, const QStrin
     query.prepare("UPDATE jobs SET state=?, message=?, result=? WHERE id=?");
     query.addBindValue(state);
     query.addBindValue(message.isNull() ? QStringLiteral("") : message);
-    query.addBindValue(json(result));
+    query.addBindValue(json(storedWorkspacePaths(result)));
     query.addBindValue(id);
     execute(query);
     emit changed();
@@ -718,6 +878,8 @@ void TaskScheduler::forceCancel()
     }
     if (worker_.state() != QProcess::NotRunning)
         worker_.kill();
+    if (inferenceWorker_.state() != QProcess::NotRunning)
+        inferenceWorker_.kill();
 }
 
 void TaskScheduler::continueAfterCancellation()
@@ -764,12 +926,19 @@ void TaskScheduler::stop()
         if (!archiveReceipt_.isEmpty()) {
             archive_.waitForFinished();
             finishArchive();
-            return;
-        }
-        if (!worker_.waitForFinished(cancelGraceMs)) {
+        } else if (inferenceTask_ && !inferenceWorker_.waitForReadyRead(cancelGraceMs)) {
+            forceCancel();
+        } else if (worker_.state() != QProcess::NotRunning && !worker_.waitForFinished(cancelGraceMs)) {
             forceCancel();
             worker_.waitForFinished(1000);
         }
+    }
+    if (inferenceTask_)
+        forceCancel();
+    closeInference();
+    if (inferenceWorker_.state() != QProcess::NotRunning && !inferenceWorker_.waitForFinished(cancelGraceMs)) {
+        inferenceWorker_.kill();
+        inferenceWorker_.waitForFinished(1000);
     }
 }
 

@@ -1,6 +1,7 @@
 """Check resource failures against an isolated simulator and the real test engine."""
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -10,7 +11,10 @@ import sqlite3
 import subprocess
 import sys
 import uuid
+
 import zipfile
+
+from workspace_paths import workspace_path
 
 
 def invoke(program, data, launcher, requests=None, expected=0):
@@ -80,53 +84,90 @@ def check_interface_isolation(program, workspace):
     runtime.mkdir(parents=True)
     (runtime / "python.exe").write_bytes(b"exists for preflight only")
     (engine / "config.py").write_text("# simulator startup fixture\n", encoding="ascii")
-    methods = {"switch_version": 1, "change_choices": 0, "change_tts_inference": 6,
-               "open_slice": 10, "open1abc": 10, "open1Ba": 13, "open1Bb": 9}
-    payload = json.dumps({
-        "version": "4.44.1",
-        "dependencies": [{"api_name": name, "inputs": list(range(count))} for name, count in methods.items()],
-    }).encode()
-    (engine / "browser-probe.py").write_text(
-        "import sys\n"
-        "import webbrowser\n"
-        "controller = webbrowser.get()\n"
-        'assert controller.args == ["--engine-browser-notification", "%s"]\n'
-        "assert controller.open(sys.argv[1])\n",
-        encoding="ascii",
-    )
-    (engine / "webui.py").write_text(
-        "import subprocess\n"
-        "import sys\n"
-        "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
-        'for port in (9874, 9872):\n'
-        '    subprocess.run([sys.executable, "-I", "-B", "browser-probe.py", f"http://localhost:{port}/"], check=True)\n'
-        "class Handler(BaseHTTPRequestHandler):\n"
-        "    def do_GET(self):\n"
-        '        if self.path != "/config":\n'
-        "            self.send_error(404)\n"
-        "            return\n"
-        "        self.send_response(200)\n"
-        '        self.send_header("Content-Type", "application/json")\n'
-        "        self.end_headers()\n"
-        f"        self.wfile.write({payload!r})\n"
-        'HTTPServer(("127.0.0.1", 9874), Handler).serve_forever()\n', encoding="ascii",
-    )
+    contract = json.loads((Path(__file__).resolve().parents[1] / "engine/20261006-contract.json").read_bytes())
+    config = {"version": "4.45.0", "components": [], "dependencies": []}
+    info = {"named_endpoints": {}}
+    for method, spec in contract["main"].items():
+        ids = []
+        for name, component, schema, label in spec["inputs"]:
+            ids.append(len(config["components"]) + 1)
+            config["components"].append({"id": ids[-1], "type": component.lower(), "props": {"label": label}})
+        config["dependencies"].append({"api_name": method, "inputs": ids})
+        info["named_endpoints"]["/" + method] = {
+            "parameters": [{"parameter_name": name, "component": widget, "type": {"type": schema}}
+                           for name, widget, schema, _ in spec["inputs"]],
+            "returns": [{"component": widget, "type": {"type": schema}} for widget, schema in spec["returns"]],
+        }
+
+    simulator = '''import subprocess
+import sys
+import webbrowser
+import config
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, HTTPServer
+controller = webbrowser.get()
+assert controller.args == ["--engine-browser-notification", "%s"]
+assert controller.open("http://localhost:19874/")
+assert controller.open("http://localhost:19872/")
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path not in ("/config", "/info"):
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(Path(self.path[1:] + ".json").read_bytes())
+    def do_POST(self):
+        Path("unexpected-post.txt").touch()
+        self.send_error(405)
+HTTPServer(("127.0.0.1", config.webui_port_main), Handler).serve_forever()
+'''
+    (engine / "webui.py").write_text(simulator, encoding="ascii")
     launcher = engine / "go-webui.bat"
     launcher.write_text(f'@"{sys.executable}" -B -u "%~dp0webui.py"\n', encoding="utf-8")
+    (engine / "config.py").write_text("webui_port_main = 19874\nwebui_port_infer_tts = 19872\n", encoding="ascii")
 
-    data = workspace / "interface-status"
-    invoke(program, data, launcher)
-    report = (data / "probe-result.txt").read_text(encoding="utf-8")
-    assert "语音合成暂不可用" in report and "切片暂不可用" not in report, report
-    data = workspace / "interface-task"
-    data.mkdir()
-    invoke(program, data, launcher, [{"operation": "synthesize", "family": "v5turbo"}], expected=3)
-    with sqlite3.connect(data / "library.sqlite") as database:
-        state, reason = database.execute("SELECT state,message FROM jobs").fetchone()
-    assert state == "failed" and "change_tts_inference_1" in reason, (state, reason)
-    assert not (data / "jobs").exists()
-    print("Interface: missing synthesis endpoint isolated; both inherited browser requests used the silent command.",
-          flush=True)
+    for case, operation, affected, evidence in (
+        ("new-version-and-port", None, None, None),
+        ("missing-synthesis", "synthesize", "语音合成", "change_tts_inference_1"),
+        ("reordered-training", "train_sovits", "SoVITS 训练", "open1Ba"),
+        ("changed-return", "train_gpt", "GPT 训练", "open1Bb"),
+    ):
+        current_config = copy.deepcopy(config)
+        current_info = copy.deepcopy(info)
+        if case == "missing-synthesis":
+            dependency = next(dep for dep in current_config["dependencies"] if dep["api_name"] == evidence)
+            dependency["api_name"] += "_renamed"
+        elif case == "reordered-training":
+            ids = next(dep["inputs"] for dep in current_config["dependencies"] if dep["api_name"] == evidence)
+            ids[1], ids[2] = ids[2], ids[1]
+        elif case == "changed-return":
+            current_info["named_endpoints"]["/" + evidence]["returns"][0]["type"]["type"] = "number"
+        (engine / "config.json").write_text(json.dumps(current_config), encoding="utf-8")
+        (engine / "info.json").write_text(json.dumps(current_info), encoding="utf-8")
+        data = workspace / f"interface-{case}"
+        invoke(program, data, launcher)
+        report = (data / "probe-result.txt").read_text(encoding="utf-8")
+        if operation is None:
+            assert "引擎可以使用" in report, report
+            invoke(program, data, launcher, [{"operation": "synthesize", "family": "future-family"}], expected=3)
+            with sqlite3.connect(data / "library.sqlite") as database:
+                state, reason = database.execute("SELECT state,message FROM jobs").fetchone()
+            assert state == "failed" and "模型家族" in reason and "future-family" in reason
+            assert not (engine / "unexpected-post.txt").exists()
+            continue
+        assert f"{affected}暂不可用" in report and "切片暂不可用" not in report, report
+        invoke(program, data, launcher, [{"operation": operation, "family": "v5turbo"}], expected=3)
+        with sqlite3.connect(data / "library.sqlite") as database:
+            state, reason = database.execute("SELECT state,message FROM jobs").fetchone()
+        assert state == "failed" and evidence in reason, (state, reason)
+        if case == "changed-return":
+            assert "返回结构" in reason
+        assert not (data / "jobs").exists()
+        assert not (engine / "unexpected-post.txt").exists()
+    print("Interface: minor version and custom ports accepted with intact contracts; "
+          "renamed endpoint, reordered parameters and changed return blocked only their operations.", flush=True)
 
 
 def check_real_batch(program, engine, fixture, data, scratch):
@@ -191,7 +232,7 @@ def check_real_batch(program, engine, fixture, data, scratch):
         assert Path(verification["launcher"]).resolve() == (engine / "go-webui.bat").resolve()
         assert verification["parameters"] == parameters and verification["seed"] == parameters["seed"]
         assert verification["verified_at"].endswith("Z")
-        wav = Path(result["audio"])
+        wav = workspace_path(data, result["audio"])
         assert hashlib.sha256(wav.read_bytes()).hexdigest() == result["sha256"]
         archived.append(wav)
     assert set((data / "outputs").rglob("*.wav")) == set(archived)
@@ -209,6 +250,7 @@ def main():
     parser.add_argument("--app", type=Path, default=root / "out" / "portable" / "EZ-GPT-SoVITS.exe")
     parser.add_argument("--engine", type=Path, default=scratch / "engine-20261006")
     parser.add_argument("--synthesis", type=Path, default=scratch / "synthesis" / "fixtures" / "synthesis.json")
+    parser.add_argument("--simulator-only", action="store_true")
     args = parser.parse_args()
     program = args.app.resolve(strict=True)
     engine = args.engine.resolve(strict=True)
@@ -219,6 +261,8 @@ def main():
     check_startup(program, workspace)
     check_batch_startup_failures(program, workspace)
     check_interface_isolation(program, workspace)
+    if args.simulator_only:
+        return
     fixture = json.loads(source.read_text(encoding="utf-8-sig"))
     check_real_batch(program, engine, fixture, workspace / "real-batch", scratch)
 

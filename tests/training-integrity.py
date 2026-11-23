@@ -10,6 +10,8 @@ import sqlite3
 import subprocess
 import uuid
 
+from workspace_paths import workspace_path
+
 
 def clone(source, target):
     source, target = Path(source), Path(target)
@@ -161,7 +163,9 @@ def main():
         assert updates[-1]["completed"] == 2 and output["elapsed_ms"] > 0, updates
         assert Path(output["dataset"]) == dataset and output["sample_count"] == len(lines)
         assert Path(output["checkpoints"]) != dataset
-        assert Path(output["weight"]).is_file() and output["weight"].startswith(str(project))
+        weight = workspace_path(data, output["weight"])
+        assert weight.is_file() and weight.is_relative_to(project)
+        output["weight"] = weight.as_posix()
         record = json.loads((data / "jobs" / job / "training-run.json").read_text(encoding="utf-8"))
         assert record["checkpoints"] == output["checkpoints"] and record["epochs"] == 2
         runs.append(output)
@@ -177,7 +181,7 @@ def main():
                                          "reference": str(reference), "voice_id": str(uuid.uuid4())}], expected=0)
     assert len(rows) == 1 and rows[0][1] == "succeeded", rows
     audio = json.loads(rows[0][3])
-    assert hashlib.sha256(Path(audio["audio"]).read_bytes()).hexdigest() == audio["sha256"]
+    assert hashlib.sha256(workspace_path(data, audio["audio"]).read_bytes()).hexdigest() == audio["sha256"]
     print("The newly trained pair synthesized and archived a WAV with a matching checksum.", flush=True)
 
 

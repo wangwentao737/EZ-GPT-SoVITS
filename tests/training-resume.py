@@ -10,6 +10,8 @@ import sqlite3
 import subprocess
 import time
 import uuid
+
+from workspace_paths import workspace_path
 import zipfile
 
 
@@ -126,9 +128,10 @@ def main():
         result = json.loads(restored[3])
         assert 0 < result["resume_epoch"] < resumed["epochs"], result
         assert Path(result["checkpoints"]) != original_run
-        assert Path(result["weight"]).is_file() and Path(result["weight"]).is_relative_to(project)
+        weight = workspace_path(data, result["weight"])
+        assert weight.is_file() and weight.is_relative_to(project)
         assert sha256(checkpoint) == original_digest
-        weights[operation.removeprefix("train_")] = result["weight"]
+        weights[operation.removeprefix("train_")] = weight.as_posix()
         receipt = json.loads((data / "jobs" / restored[0] / "training-run.json").read_text(encoding="utf-8"))
         assert receipt["resume_job"] == job and receipt["resume_epoch"] == result["resume_epoch"]
         print(f"{operation}: restored from epoch {result['resume_epoch']}; completed epoch {resumed['epochs']}. "
@@ -142,7 +145,7 @@ def main():
                                            "voice_id": str(uuid.uuid4())}], expected=0)
     assert audio[1] == "succeeded", audio
     archived = json.loads(audio[3])
-    assert sha256(Path(archived["audio"])) == archived["sha256"]
+    assert sha256(workspace_path(data, archived["audio"])) == archived["sha256"]
     print("Both resumed weights synthesized and archived a verified WAV.", flush=True)
 
 

@@ -5,6 +5,7 @@
 #include <functional>
 
 class QComboBox;
+class QCheckBox;
 class QLabel;
 class QMediaPlayer;
 class QPushButton;
@@ -27,8 +28,12 @@ private:
     void saveProject(const QJsonObject &project);
     void importAudio(bool clips);
     void readClips();
-    void loadLabels(const QString &path);
+    void loadLabels(const QString &path, bool automatic = false);
     void saveLabels();
+    void saveAndAdvance();
+    void updateReviewFilter();
+    QJsonObject reviewDrafts() const;
+    QString clipId(const QString &filename) const;
     void submit(const QString &operation, bool resume = false);
     void complete(const QString &id, const QJsonObject &result, bool live = true);
     void importVoice();
@@ -37,6 +42,7 @@ private:
     bool busy() const;
     QString nextTrainingStage() const;
     QString resumeJob(const QString &operation) const;
+    bool eventFilter(QObject *watched, QEvent *event) override;
     void showEvent(QShowEvent *event) override;
 
     QString root_;
@@ -46,6 +52,8 @@ private:
     QJsonObject project_;
     QComboBox *projects_ = nullptr;
     QTableWidget *labels_ = nullptr;
+    QCheckBox *pendingOnly_ = nullptr;
+    bool reviewsDirty_ = false;
     QSpinBox *gpu_ = nullptr;
     QSpinBox *batch_ = nullptr;
     QSpinBox *epochs_ = nullptr;
@@ -57,6 +65,8 @@ private:
     QPushButton *train_ = nullptr;
     QPushButton *resume_ = nullptr;
     QPushButton *preview_ = nullptr;
+    QPushButton *playClip_ = nullptr;
+    QPushButton *saveNext_ = nullptr;
     QPushButton *suggested_ = nullptr;
     QLabel *status_ = nullptr;
     QLabel *stage_ = nullptr;

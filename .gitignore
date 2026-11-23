@@ -6,6 +6,12 @@
 /out/
 /dist/
 /.vs/
+/.vscode/
+/开发文档.md
+/下一步改进开发文档.md
+/下一阶段开发文档-整合包兼容与引擎选择.md
+/engine/20261006.md
+/tests/里程碑验收.md
 /CMakeUserPresets.json
 __pycache__/
 *.pyc

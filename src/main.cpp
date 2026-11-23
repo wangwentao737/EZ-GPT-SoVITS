@@ -4,6 +4,7 @@
 #include "library.h"
 #include "resources.h"
 #include "settings.h"
+#include "workspacepaths.h"
 #include "synthesis.h"
 #include "training.h"
 #include "ui.h"
@@ -17,6 +18,8 @@
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QDesktopServices>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QFileDialog>
 #include <QFormLayout>
@@ -37,6 +40,7 @@
 #include <QProcess>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QScrollBar>
 #include <QSignalBlocker>
 #include <QSqlDatabase>
 #include <QSqlError>
@@ -49,6 +53,7 @@
 #include <QtConcurrentRun>
 #include <algorithm>
 #include <atomic>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 
@@ -96,7 +101,7 @@ void startProbeJob(QProcess &worker, const ez::EngineManager &engine, const QStr
     if (request.value("operation").toString().isEmpty())
         throw std::runtime_error("The test request must name an operation.");
 
-    ez::startJobProcess(worker, engine.root(), root, root + "/probe-job", request, engine.webuiPid());
+    ez::startJobProcess(worker, engine, root, root + "/probe-job", request);
 }
 
 struct InspectionResult {
@@ -413,8 +418,12 @@ private:
         profiles_ = new QComboBox(page);
         profiles_->setPlaceholderText(QStringLiteral("尚未配置引擎"));
         addEngine_ = new QPushButton(QStringLiteral("添加启动路径"), page);
+        auto *moveEngine = new QPushButton(QStringLiteral("重新定位引擎"), page);
+        auto *engineDetails = new QPushButton(QStringLiteral("引擎详情"), page);
         options->addWidget(profiles_, 1);
         options->addWidget(addEngine_);
+        options->addWidget(moveEngine);
+        options->addWidget(engineDetails);
         engineForm->addRow(QStringLiteral("当前引擎"), options);
 
         enginePath_ = new QLineEdit(page);
@@ -424,7 +433,8 @@ private:
         auto *outputForm = section(QStringLiteral("文件位置"),
             QStringLiteral("默认保存在程序同级的 data 文件夹。更改生成目录只影响随后提交的合成任务。"));
         const auto savedOutput = ez::workspaceSetting("outputRoot");
-        auto *output = new QLineEdit(QDir::toNativeSeparators(savedOutput.isEmpty() ? defaultOutput_ : savedOutput), page);
+        auto *output = new QLineEdit(QDir::toNativeSeparators(savedOutput.isEmpty() ? defaultOutput_
+            : ez::resolvedOutputDirectory(savedOutput)), page);
         output->setReadOnly(true);
         output->setToolTip(output->text());
         outputForm->addRow(QStringLiteral("成品生成目录"), output);
@@ -434,9 +444,11 @@ private:
         auto *choose = new QPushButton(QStringLiteral("更改目录"), page);
         auto *reset = new QPushButton(QStringLiteral("恢复默认目录"), page);
         auto *open = new QPushButton(QStringLiteral("打开成品目录"), page);
+        auto *moveOutput = new QPushButton(QStringLiteral("重新定位成品"), page);
         actions->addWidget(choose);
         actions->addWidget(reset);
         actions->addWidget(open);
+        actions->addWidget(moveOutput);
         actions->addStretch();
         outputForm->addRow(actions);
         auto *dataFolder = new QLineEdit(QDir::toNativeSeparators(root_), page);
@@ -464,6 +476,59 @@ private:
             }
         };
         connect(addEngine_, &QPushButton::clicked, this, &Workspace::addEngine);
+        connect(engineDetails, &QPushButton::clicked, page, [this] { showEngineDetails(); });
+        connect(moveEngine, &QPushButton::clicked, page, [this] {
+            if (engine_.active() || scheduler_->running() || checking_) {
+                status_->setText(QStringLiteral("请先结束任务并停止引擎。"));
+                return;
+            }
+            const auto previous = currentLauncher();
+            if (previous.isEmpty())
+                return;
+            const auto selected = QFileDialog::getOpenFileName(this, QStringLiteral("选择搬迁后的 go-webui.bat"),
+                {}, QStringLiteral("启动入口 (go-webui.bat)"));
+            if (selected.isEmpty())
+                return;
+            try {
+                if (ez::relocateWorkspaceEngine(previous, selected, [this](const QString &details) {
+                        return QMessageBox::question(this, QStringLiteral("重新定位引擎"), details) == QMessageBox::Yes;
+                    })) {
+                    reloadProfiles(ez::workspaceSetting("currentEngine"));
+                    status_->setText(QStringLiteral("引擎位置已更新。"));
+                }
+            } catch (const std::exception &error) {
+                status_->setText(failureMessage(error));
+            }
+        });
+        connect(moveOutput, &QPushButton::clicked, page, [this, output] {
+            if (scheduler_->running()) {
+                status_->setText(QStringLiteral("请先等待当前任务结束。"));
+                return;
+            }
+            try {
+                const auto choices = ez::workspaceOutputDirectories();
+                if (choices.isEmpty()) {
+                    status_->setText(QStringLiteral("默认成品随数据目录搬迁。目前没有可重新定位的自定义成品目录。"));
+                    return;
+                }
+                bool accepted = true;
+                const auto previous = choices.size() == 1 ? choices.first() : QInputDialog::getItem(this,
+                    QStringLiteral("选择要重新定位的目录"), QStringLiteral("原成品位置"), choices, 0, false, &accepted);
+                if (!accepted)
+                    return;
+                const auto selected = QFileDialog::getExistingDirectory(this, QStringLiteral("选择搬迁后的自定义成品目录"));
+                if (selected.isEmpty())
+                    return;
+                if (ez::relocateWorkspaceOutput(previous, selected, [this](const QString &details) {
+                        return QMessageBox::question(this, QStringLiteral("重新定位成品"), details) == QMessageBox::Yes;
+                    })) {
+                    output->setText(QDir::toNativeSeparators(ez::configuredOutputRoot(defaultOutput_)));
+                    status_->setText(QStringLiteral("自定义成品位置已更新。"));
+                }
+            } catch (const std::exception &error) {
+                status_->setText(failureMessage(error));
+            }
+        });
         connect(choose, &QPushButton::clicked, page, [this, output, saveOutput] {
             const auto selected = QFileDialog::getExistingDirectory(this, QStringLiteral("选择成品生成目录"), output->text());
             if (!selected.isEmpty())
@@ -485,6 +550,155 @@ private:
             }
         });
         return page;
+    }
+
+    void showEngineDetails()
+    {
+        const auto launcher = currentLauncher();
+        if (launcher.isEmpty()) {
+            status_->setText(QStringLiteral("请先选择要检查的引擎。"));
+            return;
+        }
+        QString directory;
+        try {
+            directory = ez::engineRoot(launcher);
+        } catch (const std::exception &error) {
+            status_->setText(failureMessage(error));
+            return;
+        }
+        QDialog dialog(this);
+        dialog.setWindowTitle(QStringLiteral("引擎详情"));
+        dialog.resize(850, 530);
+        auto *layout = new QVBoxLayout(&dialog);
+        auto *summary = ez::ui::hint({}, &dialog);
+        layout->addWidget(summary);
+        auto *selectors = new QFormLayout;
+        auto *family = new QComboBox(&dialog);
+        family->addItems({"v5turbo", "v5dev", "v2Pro", "v2ProPlus", "v2"});
+        family->setCurrentText(family_->currentText());
+        auto *voices = new QComboBox(&dialog);
+        QSqlQuery presets("SELECT id,name,settings FROM voices ORDER BY name");
+        while (presets.next()) {
+            voices->addItem(presets.value(1).toString(), presets.value(0));
+            voices->setItemData(voices->count() - 1, presets.value(2), Qt::UserRole + 1);
+        }
+        voices->setCurrentIndex(qMax(0, voices->findData(checkVoice_->currentData())));
+        selectors->addRow(QStringLiteral("模型家族"), family);
+        selectors->addRow(QStringLiteral("试音声音"), voices);
+        layout->addLayout(selectors);
+        auto *table = new QTableWidget(&dialog);
+        table->setColumnCount(3);
+        table->setHorizontalHeaderLabels({QStringLiteral("功能"), QStringLiteral("状态"), QStringLiteral("依据")});
+        table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+        table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+        table->horizontalHeader()->setStretchLastSection(true);
+        layout->addWidget(table, 1);
+        auto *actions = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+        auto *start = actions->addButton(QStringLiteral("启动并检查"), QDialogButtonBox::ActionRole);
+        auto *trial = actions->addButton(QStringLiteral("用当前声音试合成一句"), QDialogButtonBox::ActionRole);
+        auto *notice = ez::ui::hint({}, &dialog);
+        layout->addWidget(notice);
+        layout->addWidget(actions);
+        connect(actions, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+        const QStringList operations{"start", "slice", "asr", "prepare", "synthesize", "train_sovits", "train_gpt", "resume"};
+        const auto refresh = [&, this] {
+            try {
+                const auto fingerprint = ez::engineFingerprint(directory);
+                const auto ports = ez::enginePorts(directory);
+                const bool ready = engine_.ready() && engine_.root() == directory;
+                summary->setText(QStringLiteral("%1 · 主服务 %2 · 推理服务 %3 · Gradio %4\nSHA-256 %5")
+                    .arg(directory).arg(ports.main).arg(ports.inference)
+                    .arg(ready ? engine_.gradioVersion() : QStringLiteral("待检查"), fingerprint));
+                start->setEnabled(!engine_.active());
+                trial->setEnabled(voices->currentIndex() >= 0 && (!engine_.active() || ready)
+                    && engine_.interfaceIssue("synthesize").isEmpty());
+                table->setRowCount(operations.size());
+                const auto selectedFamily = family->currentText();
+                for (int row = 0; row < operations.size(); ++row) {
+                    const auto operation = operations[row];
+                    const auto label = operation == "resume" ? QStringLiteral("断点续训") : ez::operationLabel(operation);
+                    const auto interfaceIssue = ready
+                        ? engine_.interfaceIssue(operation == "resume" ? "train_sovits" : operation) : QString();
+                    const auto resources = operation == "resume" ? ez::resumeEngineIssue(directory, selectedFamily)
+                        : ez::resourceIssue(directory, operation, selectedFamily);
+                    QString status = QStringLiteral("待检查");
+                    QString detail = QStringLiteral("启动引擎后检查接口。");
+                    if (!interfaceIssue.isEmpty() || (operation == "resume" && !resources.isEmpty())) {
+                        status = QStringLiteral("接口有变化");
+                        detail = interfaceIssue.isEmpty() ? resources : interfaceIssue;
+                    } else if (!resources.isEmpty()) {
+                        status = QStringLiteral("资源缺失");
+                        detail = resources;
+                    } else if (ready) {
+                        status = operation == "start" ? QStringLiteral("实测通过") : QStringLiteral("接口已识别");
+                        detail = operation == "resume" ? QStringLiteral("每个项目还需校验输入签名和检查点。")
+                            : QStringLiteral("资源与调用契约已核对。");
+                    }
+                    if (status != QStringLiteral("资源缺失") && status != QStringLiteral("接口有变化") && operation != "start") {
+                        QSqlQuery proof;
+                        proof.prepare("SELECT created,request FROM jobs WHERE state='succeeded' AND launcher=? COLLATE NOCASE "
+                            "AND json_extract(CAST(result AS TEXT),'$.engine_fingerprint')=? "
+                            "AND (operation=? OR (?='resume' AND json_extract(CAST(result AS TEXT),'$.resume_epoch')>0)) "
+                            "AND (? IN ('slice','asr') OR json_extract(CAST(request AS TEXT),'$.family')=?) ORDER BY rowid DESC LIMIT 1");
+                        for (const auto &value : {launcher, fingerprint, operation, operation, operation, selectedFamily})
+                            proof.addBindValue(value);
+                        if (proof.exec() && proof.next()) {
+                            const auto request = QJsonDocument::fromJson(proof.value(1).toByteArray()).object();
+                            detail = proof.value(0).toString() + " " + request.value("name").toString();
+                            status = QStringLiteral("实测通过");
+                        }
+                    }
+                    for (const auto &[column, text] : {std::pair{0, label}, {1, status}, {2, detail.simplified()}}) {
+                        auto *cell = new QTableWidgetItem(text);
+                        cell->setToolTip(text);
+                        table->setItem(row, column, cell);
+                    }
+                }
+            } catch (const std::exception &error) {
+                notice->setText(failureMessage(error));
+            }
+        };
+        connect(start, &QPushButton::clicked, &dialog, [this, launcher] { scheduler_->startEngine(launcher); });
+        QString trialJob;
+        connect(trial, &QPushButton::clicked, &dialog, [&, this] {
+            try {
+                auto request = ez::readWorkspaceRecord(voices->currentData(Qt::UserRole + 1).toByteArray());
+                const auto language = request.value("default_language").toString(QStringLiteral("中文"));
+                bool accepted = false;
+                const auto line = QInputDialog::getText(&dialog, QStringLiteral("引擎试合成"), QStringLiteral("试音台词"),
+                    QLineEdit::Normal, language == QStringLiteral("英文") ? "Hello, this is an engine test."
+                        : QStringLiteral("你好，这是一段引擎试音。"), &accepted).trimmed();
+                if (!accepted || line.isEmpty())
+                    return;
+                request["operation"] = "synthesize";
+                request["voice_id"] = voices->currentData().toString();
+                request["name"] = voices->currentText();
+                request["text"] = line;
+                request["language"] = language;
+                request["compatibility_trial"] = true;
+                family->setCurrentText(request.value("family").toString());
+                trialJob = scheduler_->enqueue(launcher, request);
+                notice->setText(QStringLiteral("试音已提交，可在「任务记录」试听 WAV。"));
+            } catch (const std::exception &error) {
+                notice->setText(failureMessage(error));
+            }
+        });
+        connect(family, &QComboBox::currentIndexChanged, &dialog, refresh);
+        connect(&engine_, &ez::EngineManager::statusChanged, &dialog, [&, this](const QString &message) {
+            notice->setText(message);
+            refresh();
+        });
+        connect(scheduler_, &ez::TaskScheduler::completed, &dialog, [&](const QString &id) {
+            if (id == trialJob) {
+                notice->setText(QStringLiteral("试音 WAV 已校验并归档。"));
+                refresh();
+            }
+        });
+        connect(scheduler_, &ez::TaskScheduler::failed, &dialog, [notice](const QString &message) { notice->setText(message); });
+        refresh();
+        dialog.exec();
     }
 
     void openFolder(const QString &location)
@@ -519,6 +733,15 @@ private:
         table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
         table->horizontalHeader()->setStretchLastSection(true);
         layout->addWidget(table, 1);
+        auto *pageControls = new QHBoxLayout;
+        auto *older = new QPushButton(QStringLiteral("下一页"), page);
+        auto *newer = new QPushButton(QStringLiteral("上一页"), page);
+        auto *pageNumber = ez::ui::hint({}, page);
+        pageControls->addStretch();
+        pageControls->addWidget(newer);
+        pageControls->addWidget(pageNumber);
+        pageControls->addWidget(older);
+        layout->addLayout(pageControls);
         auto *empty = new QLabel(page);
         empty->setObjectName("emptyState");
         empty->setAlignment(Qt::AlignCenter);
@@ -549,13 +772,19 @@ private:
             const auto *item = table->item(ez::ui::selectedRow(table), 0);
             return item ? item->data(Qt::UserRole).toString() : QString();
         };
-        const auto loadBatches = [batches] {
+        const auto lastJob = std::make_shared<qint64>(-1);
+        const auto loadBatches = [batches, lastJob] {
+            QSqlQuery latest("SELECT COALESCE(MAX(rowid), 0) FROM jobs");
+            if (!latest.next() || latest.value(0).toLongLong() == *lastJob)
+                return;
+            *lastJob = latest.value(0).toLongLong();
             const auto previous = batches->currentData().toString();
             const QSignalBlocker block(batches);
             batches->clear();
             batches->addItem(QStringLiteral("全部任务"));
             QSqlQuery query("SELECT json_extract(CAST(request AS TEXT),'$.batch_id') AS batch, MIN(created), COUNT(*)"
-                            " FROM jobs WHERE operation='synthesize' GROUP BY batch HAVING batch IS NOT NULL"
+                            " FROM jobs WHERE operation='synthesize' AND json_valid(CAST(request AS TEXT))"
+                            " GROUP BY batch HAVING batch IS NOT NULL"
                             " ORDER BY MIN(rowid) DESC");
             while (query.next()) {
                 const auto time = QDateTime::fromString(query.value(1).toString(), Qt::ISODateWithMs).toLocalTime();
@@ -564,18 +793,35 @@ private:
             }
             batches->setCurrentIndex(qMax(0, batches->findData(previous)));
         };
-        const auto refresh = [=] {
+        struct PageAnchor {
+            QString created;
+            qint64 rowid = 0;
+        };
+        const auto pageAnchors = std::make_shared<QList<PageAnchor>>(QList<PageAnchor>{{}});
+        const auto nextAnchor = std::make_shared<PageAnchor>();
+        const int pageSize = 60;
+        const auto refresh = [=](bool resolvePaths = false) {
             const auto selected = selection();
             const auto batch = batches->currentData().toString();
+            const auto scroll = table->verticalScrollBar()->value();
+            const auto anchor = pageAnchors->last();
             QSqlQuery query;
-            const QString select = "SELECT id,created,operation,state,message,result,request FROM jobs";
+            const QString select = "SELECT id,created,operation,state,message,result,request,rowid FROM jobs";
             if (batch.isEmpty()) {
-                query.exec(select + " ORDER BY created DESC,rowid DESC");
+                query.prepare(select + (anchor.rowid ? " WHERE (created,rowid)< (?,?)" : "")
+                    + " ORDER BY created DESC,rowid DESC LIMIT ?");
+                if (anchor.rowid) {
+                    query.addBindValue(anchor.created);
+                    query.addBindValue(anchor.rowid);
+                }
             } else {
-                query.prepare(select + " WHERE json_extract(CAST(request AS TEXT),'$.batch_id')=? ORDER BY rowid");
+                query.prepare(select + " WHERE json_valid(CAST(request AS TEXT))"
+                    " AND json_extract(CAST(request AS TEXT),'$.batch_id')=? AND rowid>? ORDER BY rowid LIMIT ?");
                 query.addBindValue(batch);
-                query.exec();
+                query.addBindValue(anchor.rowid);
             }
+            query.addBindValue(pageSize + 1);
+            query.exec();
             const QMap<QString, QString> names{{"synthesize", QStringLiteral("语音合成")},
                 {"slice", QStringLiteral("音频切片")}, {"asr", QStringLiteral("自动转写")},
                 {"prepare", QStringLiteral("准备数据")}, {"train_gpt", QStringLiteral("训练 GPT")},
@@ -584,20 +830,35 @@ private:
                 {"succeeded", QStringLiteral("成功")}, {"failed", QStringLiteral("失败")},
                 {"cancelled", QStringLiteral("已取消")}, {"interrupted", QStringLiteral("中断")}};
             const QSignalBlocker block(table);
-            table->setRowCount(0);
-            bool hasQueued = false;
-            bool hasFailed = false;
+            int row = 0;
+            int selectedRow = -1;
+            *nextAnchor = {};
+            PageAnchor tail;
             while (query.next()) {
+                if (row == pageSize) {
+                    *nextAnchor = tail;
+                    break;
+                }
                 const auto id = query.value(0).toString();
-                const int row = table->rowCount();
+                tail = {query.value(1).toString(), query.value(7).toLongLong()};
+                if (id == selected)
+                    selectedRow = row;
+                const auto message = query.value(4).toString();
+                const auto state = query.value(3).toString();
+                const auto payload = query.value(5).toByteArray();
+                if (!resolvePaths && row < table->rowCount() && table->item(row, 0)->data(Qt::UserRole).toString() == id
+                    && table->item(row, 2)->data(Qt::UserRole).toString() == state
+                    && table->item(row, 3)->data(Qt::UserRole + 1).toString() == message
+                    && table->item(row, 3)->data(Qt::UserRole + 2).toByteArray() == payload) {
+                    ++row;
+                    continue;
+                }
                 const auto time = QDateTime::fromString(query.value(1).toString(), Qt::ISODateWithMs).toLocalTime();
                 const auto operation = query.value(2).toString();
-                const auto state = query.value(3).toString();
-                const auto result = QJsonDocument::fromJson(query.value(5).toByteArray()).object();
-                const auto audio = result.value("audio").toString();
                 const auto request = QJsonDocument::fromJson(query.value(6).toByteArray()).object();
+                const auto result = ez::readWorkspaceResult(payload, request);
+                const auto audio = result.value("audio").toString();
                 const auto taskBatch = request.value("batch_id").toString();
-                const auto message = query.value(4).toString();
                 auto operationText = names.value(operation, operation);
                 auto details = audio.isEmpty() ? message : audio;
                 auto tooltip = details;
@@ -609,9 +870,8 @@ private:
                     tooltip = details.isEmpty() ? text : text + '\n' + details;
                     details = outcome.isEmpty() ? text : text + QStringLiteral(" · ") + outcome;
                 }
-                hasQueued |= state == "queued";
-                hasFailed |= state == "failed" || state == "interrupted";
-                table->insertRow(row);
+                if (row == table->rowCount())
+                    table->insertRow(row);
                 const QStringList columns{time.toString("yyyy-MM-dd HH:mm:ss"), operationText, states.value(state, state), details};
                 for (int column = 0; column < columns.size(); ++column)
                     table->setItem(row, column, new QTableWidgetItem(columns[column]));
@@ -625,13 +885,36 @@ private:
                     table->item(row, 2)->setForeground(QColor("#ffb6a6"));
                 table->item(row, 3)->setData(Qt::UserRole, audio);
                 table->item(row, 3)->setData(Qt::UserRole + 1, message);
+                table->item(row, 3)->setData(Qt::UserRole + 2, payload);
                 table->item(row, 3)->setToolTip(tooltip);
-                if (id == selected)
-                    table->selectRow(row);
+                ++row;
             }
+            table->setRowCount(row);
+            if (selectedRow >= 0)
+                table->selectRow(selectedRow);
+            else
+                table->clearSelection();
+            table->verticalScrollBar()->setValue(scroll);
+            pageNumber->setText(QStringLiteral("第 %1 页").arg(pageAnchors->size()));
+            newer->setEnabled(pageAnchors->size() > 1);
+            older->setEnabled(nextAnchor->rowid != 0);
             table->setVisible(table->rowCount() > 0);
             empty->setVisible(table->rowCount() == 0);
             empty->setText(QStringLiteral("生成语音或开始训练后，任务会出现在这里。"));
+            bool hasQueued = false;
+            bool hasFailed = false;
+            if (!batch.isEmpty()) {
+                QSqlQuery totals;
+                totals.prepare("SELECT COUNT(*),SUM(state='queued'),SUM(state IN ('failed','interrupted')) FROM jobs "
+                    "WHERE json_valid(CAST(request AS TEXT)) AND json_extract(CAST(request AS TEXT),'$.batch_id')=?");
+                totals.addBindValue(batch);
+                if (totals.exec() && totals.next()) {
+                    pageNumber->setText(QStringLiteral("第 %1 页 · 本批 %2 条")
+                        .arg(pageAnchors->size()).arg(totals.value(0).toInt()));
+                    hasQueued = totals.value(1).toInt() > 0;
+                    hasFailed = totals.value(2).toInt() > 0;
+                }
+            }
             retryBatch->setVisible(!batch.isEmpty());
             retryBatch->setEnabled(hasFailed);
             cancelBatch->setVisible(!batch.isEmpty());
@@ -665,14 +948,37 @@ private:
         };
         updateActions();
         connect(table, &QTableWidget::itemSelectionChanged, page, updateActions);
-        connect(batches, &QComboBox::currentIndexChanged, page, [refresh, updateActions] {
+        connect(batches, &QComboBox::currentIndexChanged, page, [pageAnchors, refresh, updateActions] {
+            *pageAnchors = {PageAnchor{}};
             refresh();
             updateActions();
         });
-        connect(scheduler_, &ez::TaskScheduler::changed, page, [loadBatches, refresh, updateActions] {
+        connect(older, &QPushButton::clicked, page, [pageAnchors, nextAnchor, refresh, updateActions] {
+            if (nextAnchor->rowid)
+                pageAnchors->append(*nextAnchor);
+            refresh();
+            updateActions();
+        });
+        connect(newer, &QPushButton::clicked, page, [pageAnchors, refresh, updateActions] {
+            if (pageAnchors->size() > 1)
+                pageAnchors->removeLast();
+            refresh();
+            updateActions();
+        });
+        const auto updateVisible = [parent, page, loadBatches, refresh, updateActions] {
+            if (parent->currentWidget() != page)
+                return;
             loadBatches();
             refresh();
             updateActions();
+        };
+        connect(scheduler_, &ez::TaskScheduler::changed, page, updateVisible);
+        connect(parent, &QTabWidget::currentChanged, page, [=] {
+            if (parent->currentWidget() == page) {
+                loadBatches();
+                refresh(true);
+                updateActions();
+            }
         });
         connect(synthesis, &ez::SynthesisPanel::viewBatchRequested, page, showBatch);
         connect(filterBatch, &QAction::triggered, page, [table, showBatch] {
@@ -699,7 +1005,7 @@ private:
                 QList<QJsonObject> requests;
                 while (query.next()) {
                     launcher = query.value(0).toString();
-                    requests.append(QJsonDocument::fromJson(query.value(1).toByteArray()).object());
+                    requests.append(ez::readWorkspaceRecord(query.value(1).toByteArray()));
                 }
                 query.finish();
                 if (!requests.isEmpty())
@@ -740,7 +1046,7 @@ private:
                 return;
             }
             const auto launcher = query.value(0).toString();
-            const auto request = QJsonDocument::fromJson(query.value(1).toByteArray()).object();
+            const auto request = ez::readWorkspaceRecord(query.value(1).toByteArray());
             query.finish();
             try {
                 scheduler_->enqueue(launcher, request);
@@ -785,7 +1091,7 @@ private:
             query.prepare("SELECT request FROM jobs WHERE id=? AND operation='synthesize'");
             query.addBindValue(selection());
             if (query.exec() && query.next()) {
-                synthesis->loadRequest(QJsonDocument::fromJson(query.value(0).toByteArray()).object());
+                synthesis->loadRequest(ez::readWorkspaceRecord(query.value(0).toByteArray()));
                 parent->setCurrentWidget(synthesis);
             }
         });
@@ -937,7 +1243,7 @@ private:
             const auto root = root_;
             const auto configured = ez::workspaceSetting("outputRoot");
             const auto output = configured.isEmpty() ? defaultOutput_ : configured;
-            const auto voice = QJsonDocument::fromJson(checkVoice_->currentData(Qt::UserRole + 1).toByteArray()).object();
+            const auto voice = ez::readWorkspaceRecord(checkVoice_->currentData(Qt::UserRole + 1).toByteArray());
             const auto interfaces = engine_.interfaceIssues();
             auto devices = engine_.devices();
             if (devices.isEmpty())
@@ -1059,6 +1365,20 @@ int main(int argc, char **argv)
         if (!lock.tryLock())
             throw std::runtime_error(QStringLiteral("此数据目录已由另一个语音工作台实例使用").toStdString());
         initDatabase(root);
+        const auto preview = [&](const QString &summary) {
+            if (parser.isSet(probeOption) || parser.isSet(smokeOption)) {
+                QTextStream(stdout) << summary << Qt::endl;
+                return true;
+            }
+            QMessageBox review(QMessageBox::Information, QStringLiteral("素材库迁移预览"),
+                QStringLiteral("检测到需要更新的素材库引用。应用前会备份索引。"),
+                QMessageBox::Apply | QMessageBox::Cancel);
+            review.setDetailedText(summary);
+            review.setDefaultButton(QMessageBox::Apply);
+            return review.exec() == QMessageBox::Apply;
+        };
+        if (!ez::openWorkspacePaths(root, preview))
+            return 0;
         if (parser.isSet(probeOption)) {
             ez::EngineManager engine;
             if (parser.isSet(queueOption)) {

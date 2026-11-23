@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(EZ_GPT_SoVITS VERSION 0.1.20 LANGUAGES CXX)
+project(EZ_GPT_SoVITS VERSION 0.1.21 LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "EZ-GPT-SoVITS requires Windows x64")
@@ -20,10 +20,14 @@ qt_add_executable(EZ-GPT-SoVITS WIN32
     src/diagnostics.cpp src/diagnostics.h
     src/jobs.cpp src/jobs.h
     src/settings.cpp src/settings.h
+    src/workspacepaths.cpp src/workspacepaths.h
     src/library.cpp src/library.h
     src/synthesis.cpp src/synthesis.h
     src/voiceverification.cpp src/voiceverification.h
     src/training.cpp src/training.h
+    src/recordings.cpp src/recordings.h
+    src/scriptlines.cpp src/scriptlines.h
+    src/waveexport.cpp src/waveexport.h
 )
 target_include_directories(EZ-GPT-SoVITS PRIVATE assets)
 target_compile_definitions(EZ-GPT-SoVITS PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN EZ_APP_VERSION="${PROJECT_VERSION}")
@@ -33,7 +37,7 @@ target_link_libraries(EZ-GPT-SoVITS PRIVATE
 )
 qt_add_resources(EZ-GPT-SoVITS "engine_bridge"
     PREFIX "/"
-    FILES engine/bridge.py
+    FILES engine/bridge.py engine/20261006-contract.json
 )
 qt_add_resources(EZ-GPT-SoVITS "branding"
     PREFIX "/branding"
@@ -41,8 +45,8 @@ qt_add_resources(EZ-GPT-SoVITS "branding"
     FILES assets/app-icon.png
 )
 install(TARGETS EZ-GPT-SoVITS RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
-install(FILES README.md THIRD_PARTY.md 开发文档.md DESTINATION .)
-install(FILES engine/20261006.md DESTINATION engine)
+install(FILES README.md THIRD_PARTY.md DESTINATION .)
+install(FILES engine/20261006-contract.json DESTINATION engine)
 get_filename_component(qt_sdk_root "${Qt6_DIR}/../../.." ABSOLUTE)
 if(IS_DIRECTORY "${qt_sdk_root}/sbom")
     install(DIRECTORY "${qt_sdk_root}/sbom/" DESTINATION licenses/qt-sbom
@@ -57,3 +61,18 @@ set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION ".")
 include(InstallRequiredSystemLibraries)
 qt_generate_deploy_app_script(TARGET EZ-GPT-SoVITS OUTPUT_SCRIPT deploy_script NO_COMPILER_RUNTIME)
 install(SCRIPT ${deploy_script})
+
+option(EZ_BUILD_CHECKS "Build the optional Windows component checks" OFF)
+if(EZ_BUILD_CHECKS)
+    find_package(Qt6 6.8 REQUIRED COMPONENTS Test)
+    qt_add_executable(EZ-component-checks
+        tests/workflow-components.cpp
+        src/waveexport.cpp src/recordings.cpp src/engine.cpp src/resources.cpp
+        src/scriptlines.cpp
+        src/training.cpp src/jobs.cpp src/settings.cpp src/workspacepaths.cpp src/voiceverification.cpp src/ui.cpp
+    )
+    target_include_directories(EZ-component-checks PRIVATE src)
+    target_compile_definitions(EZ-component-checks PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_options(EZ-component-checks PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+    target_link_libraries(EZ-component-checks PRIVATE Qt6::Widgets Qt6::Network Qt6::Multimedia Qt6::Concurrent Qt6::Sql Qt6::Test iphlpapi ws2_32)
+endif()

@@ -10,6 +10,8 @@ import sys
 import uuid
 import wave
 
+from workspace_paths import workspace_path
+
 
 def start(program, data):
     subprocess.run(
@@ -94,13 +96,13 @@ def main():
         ).fetchone()
         assert json.loads(request)["text"] == "snapshot"
         if variant in ("complete", "custom_output"):
-            assert state == "succeeded" and Path(json.loads(result)["audio"]).is_file(), (variant, state)
+            assert state == "succeeded" and workspace_path(data, json.loads(result)["audio"]).is_file(), (variant, state)
         else:
             assert state == "interrupted" and result is None, (variant, state, result)
         assert not target.with_suffix(".wav.ez-partial").exists(), variant
     assert unrelated.read_bytes() == b"owned by another app"
     recovered = json.loads(database.execute("SELECT state FROM projects WHERE id=?", (project_id,)).fetchone()[0])
-    assert recovered["sovits"] == weight.as_posix() and "pending" not in recovered
+    assert workspace_path(data, recovered["sovits"]) == weight and "pending" not in recovered
     assert recovered["dataset"] == project["dataset"] and "gpt" not in recovered
     assert database.execute("SELECT COUNT(*) FROM jobs WHERE operation='train_gpt'").fetchone()[0] == 0
 

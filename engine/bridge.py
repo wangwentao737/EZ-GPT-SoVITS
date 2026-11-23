@@ -1,5 +1,6 @@
-"""Run one EZ job with the Gradio client bundled in the selected engine."""
+"""Run EZ jobs with the Gradio client bundled in the selected engine."""
 
+from contextlib import redirect_stderr, redirect_stdout
 import hashlib
 import importlib.util
 import json
@@ -7,6 +8,7 @@ import os
 import re
 import sys
 import time
+import traceback
 import uuid
 import zipfile
 from concurrent.futures import TimeoutError
@@ -20,8 +22,7 @@ import soundfile
 MODELS = "GPT_SoVITS/pretrained_models"
 BERT = f"{MODELS}/chinese-roberta-wwm-ext-large"
 HUBERT = f"{MODELS}/chinese-hubert-base"
-PORT_WEBUI = 9874
-PORT_TTS = 9872
+CONTRACT = json.loads(Path(__file__).with_name("20261006-contract.json").read_text(encoding="utf-8"))
 SPLITS = ("不切", "凑四句一切", "凑50字一切", "按中文句号。切", "按英文句号.切", "按标点符号切")
 FAMILIES = {
     "v2": (
@@ -104,8 +105,17 @@ def check_cancel(marker):
 
 def invoke(client, endpoint, *arguments, cancel=None, stop=None, on_wait=None):
     matches = [item for item in client.config["dependencies"] if item["api_name"] == endpoint]
-    if len(matches) != 1 or len(matches[0]["inputs"]) != len(arguments):
+    expected = CONTRACT["main"].get(endpoint) or CONTRACT["inference"].get(endpoint)
+    info = client.view_api(return_format="dict", print_info=False)["named_endpoints"].get(f"/{endpoint}", {})
+    if expected is None or len(matches) != 1 or len(matches[0]["inputs"]) != len(arguments):
         raise ValueError(f"目标引擎接口与适配契约不一致：{endpoint}")
+    components = {item["id"]: item for item in client.config["components"]}
+    inputs = [[param["parameter_name"], param["component"], param["type"].get("type"),
+               components[component]["props"].get("label", "")]
+              for param, component in zip(info.get("parameters", ()), matches[0]["inputs"])]
+    returns = [[item["component"], item["type"].get("type")] for item in info.get("returns", ())]
+    if inputs != expected["inputs"] or returns != expected["returns"]:
+        raise ValueError(f"目标引擎接口的入参顺序、类型或返回结构已变化：{endpoint}")
     if cancel is None:
         return client.predict(*arguments, api_name=f"/{endpoint}")
     check_cancel(cancel)
@@ -167,11 +177,12 @@ def stage_weight(source, root, kind, family, job, cancel):
     target = safe_path(root / relative, root)
     try:
         os.link(source, target)
+        return relative, 0
     except FileExistsError:
         raise
     except OSError:
         copy_with_cancel(source, target, cancel)
-    return relative
+        return relative, target.stat().st_size
 
 
 def copy_with_cancel(source, target, cancel):
@@ -186,34 +197,46 @@ def copy_with_cancel(source, target, cancel):
         raise
 
 
-def wait_for_inference(webui_pid, job, cancel):
+def inference_children(parent):
+    for child in parent.children(recursive=True):
+        try:
+            if child.name().lower() == "python.exe" and any(
+                arg.replace("\\", "/").split("/")[-1] == "inference_webui_fast.py" for arg in child.cmdline()
+            ):
+                yield child
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+
+def owns_listener(child, port):
+    return child.is_running() and any(
+        socket.status == psutil.CONN_LISTEN and socket.laddr.port == port
+        for socket in child.net_connections(kind="tcp4")
+    )
+
+
+def main_client(parent, port):
+    if not owns_listener(parent, port):
+        raise RuntimeError("主服务监听进程已变化，请重启引擎")
+    return connect(port)
+
+
+def wait_for_inference(parent, port, job, cancel):
     started = time.monotonic()
     seen = False
-    parent = psutil.Process(webui_pid)
     while time.monotonic() - started < 150:
         check_cancel(cancel)
-        children = []
         try:
-            descendants = parent.children(recursive=True)
+            children = list(inference_children(parent))
         except psutil.NoSuchProcess as error:
             raise RuntimeError("主引擎进程已退出，请重启引擎") from error
-        for child in descendants:
-            try:
-                if child.name().lower() == "python.exe" and any(
-                    arg.replace("\\", "/").endswith("/inference_webui_fast.py") for arg in child.cmdline()
-                ):
-                    children.append(child)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
         if not children and (seen or time.monotonic() - started >= 5):
             raise RuntimeError("快速推理进程在就绪前退出。请核对 GPT 和 SoVITS 权重，详见引擎启动日志。")
         seen |= bool(children)
         for child in children:
             try:
-                listening = any(socket.status == psutil.CONN_LISTEN and socket.laddr.port == PORT_TTS
-                                for socket in child.net_connections(kind="tcp4"))
-                if listening:
-                    return connect(PORT_TTS, download_files=job)
+                if owns_listener(child, port):
+                    return child, connect(port, download_files=job)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
             except Exception:
@@ -221,6 +244,77 @@ def wait_for_inference(webui_pid, job, cancel):
                 continue
         time.sleep(0.2)
     raise RuntimeError("推理服务启动超时。请查看引擎启动日志。")
+
+
+class SynthesisSession:
+    def __init__(self, engine, request):
+        self.engine = engine
+        self.parent = psutil.Process(request["webui_pid"])
+        self.main_port = request["main_port"]
+        self.inference_port = request["inference_port"]
+        self.client = main_client(self.parent, self.main_port)
+        self.key = None
+        self.child = None
+        self.arguments = None
+        self.staged = []
+
+    def close(self):
+        self.key = None
+        self.child = None
+        if self.arguments is not None:
+            if not owns_listener(self.parent, self.main_port):
+                raise RuntimeError("无法确认主服务归属，请重启引擎")
+            invoke(self.client, "change_tts_inference_1", *self.arguments)
+            deadline = time.monotonic() + 3
+            while list(inference_children(self.parent)):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("无法确认快速推理服务已停止，请重新启动引擎")
+                time.sleep(0.1)
+            self.arguments = None
+        for path in self.staged:
+            safe_path(self.engine / path, self.engine).unlink(missing_ok=True)
+        self.staged.clear()
+
+    def load(self, request, data, job, cancel, progress):
+        if not owns_listener(self.parent, self.main_port):
+            raise RuntimeError("主服务监听进程已变化，请重启引擎")
+        family = request["family"]
+        gpu = request.get("gpu", "0")
+        if not re.fullmatch(r"\d{1,2}", gpu):
+            raise ValueError("请选择有效的显卡编号")
+        weights = [safe_path(request[key], data) for key in ("gpt", "sovits")]
+        versions = []
+        for path in weights:
+            version = path.stat()
+            versions.append((path, version.st_dev, version.st_ino, version.st_size, version.st_mtime_ns))
+        key = (request.get("batch_id"), request.get("voice_id"), family, gpu, versions)
+        if key == self.key and self.child is not None:
+            try:
+                if owns_listener(self.child, self.inference_port) and self.child in inference_children(self.parent):
+                    progress("复用已加载的推理服务")
+                    return connect(self.inference_port, download_files=job), True, 0
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        self.close()
+        if list(inference_children(self.parent)):
+            raise RuntimeError("引擎中已有快速推理进程，请停止引擎后重试")
+        progress("准备两份模型权重")
+        copied = 0
+        for kind, source in zip(("GPT", "SoVITS"), weights, strict=True):
+            check_cancel(cancel)
+            staged, size = stage_weight(source, self.engine, kind, family, job, cancel)
+            self.staged.append(staged)
+            copied += size
+        invoke(self.client, "switch_version", family)
+        invoke(self.client, "change_choices")
+        check_cancel(cancel)
+        arguments = (BERT, HUBERT, gpu, *self.staged, True)
+        progress("启动推理服务并加载模型")
+        invoke(self.client, "change_tts_inference", *arguments)
+        self.arguments = arguments
+        self.child, tts = wait_for_inference(self.parent, self.inference_port, job, cancel)
+        self.key = key
+        return tts, False, copied
 
 
 def synthesis_parameters(request):
@@ -249,7 +343,7 @@ def synthesis_parameters(request):
     return parameters
 
 
-def synthesize(client, engine, data, job, request, cancel):
+def synthesize(session, data, job, request, cancel):
     progress = JobProgress(job)
     progress("检查声音预设和参考录音")
     family = request["family"]
@@ -262,73 +356,47 @@ def synthesize(client, engine, data, job, request, cancel):
     text = request["text"].strip()
     if not prompt or not text:
         raise ValueError("请填写参考文本和目标台词")
-    staged = []
     verification_hashes = {}
-    start_requested = False
-    gpu = request.get("gpu", "0")
-    if not re.fullmatch(r"\d{1,2}", gpu):
-        raise ValueError("请选择有效的显卡编号")
-    try:
-        progress("准备两份模型权重")
-        for kind, key in (("GPT", "gpt"), ("SoVITS", "sovits")):
-            check_cancel(cancel)
-            staged.append(stage_weight(safe_path(request[key], data), engine, kind, family, job, cancel))
-        if request.get("record_voice_verification"):
-            progress("校验模型和参考音频")
-            inputs = {"gpt": safe_path(engine / staged[0], engine),
-                      "sovits": safe_path(engine / staged[1], engine), "reference": reference}
-            cached = request.get("verification_hashes", {})
-            verification_hashes = {
-                key: cached[key] if re.fullmatch(r"[0-9a-f]{64}", cached.get(key, "")) else sha256_file(path, cancel)
-                for key, path in inputs.items()
-            }
-        invoke(client, "switch_version", family)
-        invoke(client, "change_choices")
-        check_cancel(cancel)
-        args = (BERT, HUBERT, gpu, *staged, True)
-        progress("启动推理服务并加载模型")
-        invoke(client, "change_tts_inference", *args)
-        start_requested = True
-
-        tts = wait_for_inference(request["webui_pid"], job, cancel)
-
-        seed = parameters["seed"]
-        progress("生成音频")
-        result = invoke(
-            tts, "inference", text, request.get("language", "中文"),
-            handle_file(str(reference)), None, prompt, request.get("prompt_language", "中文"),
-            parameters["top_k"], parameters["top_p"], parameters["temperature"], parameters["split"], 1,
-            parameters["speed"], False, True, 0.3, seed, seed < 0,
-            False, False, 1.35, 4 if family == "v5turbo" else 32, False,
-            1.30 if family == "v5dev" else 0.0, cancel=cancel,
-        )
-        audio_path, actual_seed = result
-        progress("校验并保存音频")
-        path = safe_path(audio_path, job)
-        info = inspect_wav(path)
-        temporary = safe_path(job / "verified.wav", job)
-        if info.format == "WAV":
-            os.replace(path, temporary)
-        else:
-            with soundfile.SoundFile(path) as source, soundfile.SoundFile(
-                temporary, mode="w", samplerate=source.samplerate, channels=source.channels
-            ) as destination:
-                for block in source.blocks(blocksize=65536):
-                    check_cancel(cancel)
-                    destination.write(block)
-        with temporary.open("rb") as audio:
-            digest = hashlib.file_digest(audio, "sha256").hexdigest()
-        check_cancel(cancel)
-        publish(audio=str(temporary), seed=int(actual_seed), duration=info.duration,
-                bytes=temporary.stat().st_size, sha256=digest, parameters=parameters,
-                verification_hashes=verification_hashes)
-    finally:
-        try:
-            if start_requested:
-                invoke(client, "change_tts_inference_1", *args)
-        finally:
-            for relative in staged:
-                safe_path(engine / relative, engine).unlink(missing_ok=True)
+    tts, reused, copied = session.load(request, data, job, cancel, progress)
+    if request.get("record_voice_verification"):
+        progress("校验模型和参考音频")
+        inputs = {key: safe_path(session.engine / relative, session.engine)
+                  for key, relative in zip(("gpt", "sovits"), session.staged, strict=True)}
+        inputs["reference"] = reference
+        cached = request.get("verification_hashes", {})
+        verification_hashes = {
+            key: cached[key] if re.fullmatch(r"[0-9a-f]{64}", cached.get(key, "")) else sha256_file(path, cancel)
+            for key, path in inputs.items()
+        }
+    seed = parameters["seed"]
+    progress("生成音频")
+    audio_path, actual_seed = invoke(
+        tts, "inference", text, request.get("language", "中文"),
+        handle_file(str(reference)), None, prompt, request.get("prompt_language", "中文"),
+        parameters["top_k"], parameters["top_p"], parameters["temperature"], parameters["split"], 1,
+        parameters["speed"], False, True, 0.3, seed, seed < 0,
+        False, False, 1.35, 4 if family == "v5turbo" else 32, False,
+        1.30 if family == "v5dev" else 0.0, cancel=cancel,
+    )
+    progress("校验并保存音频")
+    path = safe_path(audio_path, job)
+    info = inspect_wav(path)
+    temporary = safe_path(job / "verified.wav", job)
+    if info.format == "WAV":
+        os.replace(path, temporary)
+    else:
+        with soundfile.SoundFile(path) as source, soundfile.SoundFile(
+            temporary, mode="w", samplerate=source.samplerate, channels=source.channels
+        ) as destination:
+            for block in source.blocks(blocksize=65536):
+                check_cancel(cancel)
+                destination.write(block)
+    with temporary.open("rb") as audio:
+        digest = hashlib.file_digest(audio, "sha256").hexdigest()
+    check_cancel(cancel)
+    publish(audio=str(temporary), seed=int(actual_seed), duration=info.duration,
+            bytes=temporary.stat().st_size, sha256=digest, parameters=parameters,
+            verification_hashes=verification_hashes, inference_reused=reused, weight_bytes_copied=copied)
 
 
 def require_outputs(folder, glob, stage):
@@ -651,7 +719,36 @@ def run_training(client, engine, data, job, request, cancel):
             check_cancel(cancel)
             inspect_wav(clip, cancel=cancel)
             progress("校验切片音频", index, len(clips), "段")
-        publish(clips=[str(clip) for clip in clips])
+        added = []
+        prior = request.get("seed_clips")
+        previous = sorted(safe_path(prior, project).glob("*.wav")) if prior else []
+        discarded = set(request.get("discarded_clips", ()))
+        previous = [path for path in previous if path.name not in discarded]
+        taken = {path.name.casefold() for path in [*previous, *clips]}
+        occupied = {path.name.casefold() for path in previous}
+        for index, clip in enumerate(clips):
+            check_cancel(cancel)
+            match = re.fullmatch(r"(.*)_\d{10}_\d{10}\.wav", clip.name, re.IGNORECASE)
+            recording = match[1] if match else ""
+            if clip.name.casefold() in occupied:
+                target = destination / f"slice-{uuid.uuid4().hex}.wav"
+                while target.name.casefold() in taken:
+                    target = destination / f"slice-{uuid.uuid4().hex}.wav"
+                os.replace(clip, target)
+                clips[index] = clip = target
+                taken.add(target.name.casefold())
+            added.append({"name": clip.name, "recording": recording})
+        for prior_clip in previous:
+            target = safe_path(destination / prior_clip.name, destination)
+            check_cancel(cancel)
+            try:
+                os.link(safe_path(prior_clip, project), target)
+            except FileExistsError:
+                raise
+            except OSError:
+                copy_with_cancel(safe_path(prior_clip, project), target, cancel)
+            clips.append(target)
+        publish(clips=[str(clip) for clip in clips], added_clips=added)
         return
 
     if stage == "asr":
@@ -796,16 +893,58 @@ def main(request_file):
     job = safe_path(request["job"], data)
     cancel = safe_path(job / "cancel.requested", job)
     os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
-    client = connect(PORT_WEBUI)
     check_cancel(cancel)
     if request["operation"] == "synthesize":
-        synthesize(client, engine, data, job, request, cancel)
+        session = SynthesisSession(engine, request)
+        try:
+            synthesize(session, data, job, request, cancel)
+        finally:
+            session.close()
     else:
+        client = main_client(psutil.Process(request["webui_pid"]), request["main_port"])
         run_training(client, engine, data, job, request, cancel)
+
+
+def synthesis_worker():
+    protocol = sys.stdout
+    session = None
+    os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
+    try:
+        for line in sys.stdin:
+            request = json.loads(line)
+            engine = safe_path(request["engine"])
+            data = safe_path(request["data"])
+            job = safe_path(request["job"], data)
+            cancel = safe_path(job / "cancel.requested", job)
+            with (job / "result.log").open("w", encoding="utf-8") as output, \
+                    (job / "error.log").open("w", encoding="utf-8") as errors, \
+                    redirect_stdout(output), redirect_stderr(errors):
+                exit_code = 0
+                try:
+                    if session is None:
+                        session = SynthesisSession(engine, request)
+                    check_cancel(cancel)
+                    synthesize(session, data, job, request, cancel)
+                except Cancelled:
+                    exit_code = 10
+                    if session is not None:
+                        session.close()
+                except Exception:
+                    exit_code = 1
+                    traceback.print_exc()
+                    if session is not None:
+                        session.close()
+            print(f"EZ_DONE {job.name} {exit_code}", file=protocol, flush=True)
+    finally:
+        if session is not None:
+            session.close()
 
 
 if __name__ == "__main__":
     try:
-        main(sys.argv[1])
+        if sys.argv[1] == "--synthesis-worker":
+            synthesis_worker()
+        else:
+            main(sys.argv[1])
     except Cancelled:
         sys.exit(10)

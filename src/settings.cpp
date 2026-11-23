@@ -1,5 +1,6 @@
 #include "settings.h"
 #include "engine.h"
+#include "workspacepaths.h"
 
 #include <QSqlError>
 #include <QSqlQuery>
@@ -45,7 +46,7 @@ void setWorkspaceSetting(const QString &key, const QString &value)
 QString configuredOutputRoot(const QString &defaultRoot)
 {
     const auto configured = workspaceSetting("outputRoot");
-    return checkedPath(configured.isEmpty() ? defaultRoot : configured);
+    return checkedPath(configured.isEmpty() ? defaultRoot : resolvedOutputDirectory(configured));
 }
 
 }

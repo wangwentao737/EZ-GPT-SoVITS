@@ -1,0 +1,211 @@
+{
+  "id": "20261006",
+  "main_port": 9874,
+  "inference_port": 9872,
+  "gradio": "4.44.1",
+  "resume": {
+    "webui.py": "fb351d2094f48b3fef480a6bc2377043a91bbdd9a30cca1ba4b1e8da3d762330",
+    "GPT_SoVITS/s2_train_v3_lora.py": "9e1aa4a3b2f3450032831ca4a490dcfd13342f60c83ea2eaba36e4c987d99f4a",
+    "GPT_SoVITS/s1_train.py": "fa499153871d8ba79dd9e07a4494c5844bfb67875c2791718ea0fd787353bbbe"
+  },
+  "resume": {
+    "webui.py": "fb351d2094f48b3fef480a6bc2377043a91bbdd9a30cca1ba4b1e8da3d762330",
+    "GPT_SoVITS/s2_train_v3_lora.py": "9e1aa4a3b2f3450032831ca4a490dcfd13342f60c83ea2eaba36e4c987d99f4a",
+    "GPT_SoVITS/s1_train.py": "fa499153871d8ba79dd9e07a4494c5844bfb67875c2791718ea0fd787353bbbe"
+  },
+  "operations": {
+    "synthesize": ["switch_version", "change_choices", "change_tts_inference", "change_tts_inference_1"],
+    "slice": ["open_slice", "close_slice"],
+    "prepare": ["switch_version", "open1abc", "close1abc"],
+    "train_sovits": ["switch_version", "open1Ba", "close1Ba"],
+    "train_gpt": ["switch_version", "open1Bb", "close1Bb"]
+  },
+  "main": {
+    "change_choices": {
+      "inputs": [],
+      "returns": [
+        ["Dropdown", "string"],
+        ["Dropdown", "string"]
+      ]
+    },
+    "change_tts_inference": {
+      "inputs": [
+        ["bert_path", "Textbox", "string", "预训练中文BERT模型路径"],
+        ["cnhubert_base_path", "Textbox", "string", "预训练SSL模型路径"],
+        ["gpu_number", "Textbox", "string", "GPU卡号,只能填1个整数"],
+        ["gpt_path", "Dropdown", "string", "GPT模型列表"],
+        ["sovits_path", "Dropdown", "string", "SoVITS模型列表"],
+        ["batched_infer_enabled", "Checkbox", "boolean", "启用并行推理版本"]
+      ],
+      "returns": [
+        ["Textbox", "string"]
+      ]
+    },
+    "change_tts_inference_1": {
+      "inputs": [
+        ["bert_path", "Textbox", "string", "预训练中文BERT模型路径"],
+        ["cnhubert_base_path", "Textbox", "string", "预训练SSL模型路径"],
+        ["gpu_number", "Textbox", "string", "GPU卡号,只能填1个整数"],
+        ["gpt_path", "Dropdown", "string", "GPT模型列表"],
+        ["sovits_path", "Dropdown", "string", "SoVITS模型列表"],
+        ["batched_infer_enabled", "Checkbox", "boolean", "启用并行推理版本"]
+      ],
+      "returns": [
+        ["Textbox", "string"]
+      ]
+    },
+    "close1Ba": {
+      "inputs": [],
+      "returns": [
+        ["Textbox", "string"]
+      ]
+    },
+    "close1Bb": {
+      "inputs": [],
+      "returns": [
+        ["Textbox", "string"]
+      ]
+    },
+    "close1abc": {
+      "inputs": [],
+      "returns": [
+        ["Textbox", "string"]
+      ]
+    },
+    "close_slice": {
+      "inputs": [],
+      "returns": [
+        ["Textbox", "string"]
+      ]
+    },
+    "open1Ba": {
+      "inputs": [
+        ["version", "Radio", "string", "训练模型的版本"],
+        ["batch_size", "Slider", "number", "每张显卡的batch_size"],
+        ["total_epoch", "Slider", "number", "总训练轮数total_epoch，不建议太高"],
+        ["exp_name", "Textbox", "string", "*实验/模型名"],
+        ["text_low_lr_rate", "Slider", "number", "文本模块学习率权重"],
+        ["if_save_latest", "Checkbox", "boolean", "是否仅保存最新的权重文件以节省硬盘空间"],
+        ["if_save_every_weights", "Checkbox", "boolean", "是否在每次保存时间点将最终小模型保存至weights文件夹"],
+        ["save_every_epoch", "Slider", "number", "保存频率save_every_epoch"],
+        ["gpu_numbers1Ba", "Textbox", "string", "GPU卡号以-分割，每个卡号一个进程"],
+        ["pretrained_s2G", "Textbox", "string", "预训练SoVITS-G模型路径"],
+        ["pretrained_s2D", "Textbox", "string", "预训练SoVITS-D模型路径"],
+        ["if_grad_ckpt", "Checkbox", "boolean", "v3是否开启梯度检查点节省显存占用"],
+        ["lora_rank", "Radio", "string", "LoRA秩"]
+      ],
+      "returns": [
+        ["Textbox", "string"],
+        ["Dropdown", "string"],
+        ["Dropdown", "string"]
+      ]
+    },
+    "open1Bb": {
+      "inputs": [
+        ["batch_size", "Slider", "number", "每张显卡的batch_size"],
+        ["total_epoch", "Slider", "number", "总训练轮数total_epoch"],
+        ["exp_name", "Textbox", "string", "*实验/模型名"],
+        ["if_dpo", "Checkbox", "boolean", "是否开启DPO训练选项(实验性)"],
+        ["if_save_latest", "Checkbox", "boolean", "是否仅保存最新的权重文件以节省硬盘空间"],
+        ["if_save_every_weights", "Checkbox", "boolean", "是否在每次保存时间点将最终小模型保存至weights文件夹"],
+        ["save_every_epoch", "Slider", "number", "保存频率save_every_epoch"],
+        ["gpu_numbers", "Textbox", "string", "GPU卡号以-分割，每个卡号一个进程"],
+        ["pretrained_s1", "Textbox", "string", "预训练GPT模型路径"]
+      ],
+      "returns": [
+        ["Textbox", "string"],
+        ["Dropdown", "string"],
+        ["Dropdown", "string"]
+      ]
+    },
+    "open1abc": {
+      "inputs": [
+        ["version", "Radio", "string", "训练模型的版本"],
+        ["inp_text", "Textbox", "string", "*文本标注文件"],
+        ["inp_wav_dir", "Textbox", "string", "*训练集音频文件目录"],
+        ["exp_name", "Textbox", "string", "*实验/模型名"],
+        ["gpu_numbers1a", "Textbox", "string", "GPU卡号以-分割，每个卡号一个进程"],
+        ["gpu_numbers1Ba", "Textbox", "string", "GPU卡号以-分割，每个卡号一个进程"],
+        ["gpu_numbers1c", "Textbox", "string", "GPU卡号以-分割，每个卡号一个进程"],
+        ["bert_pretrained_dir", "Textbox", "string", "预训练中文BERT模型路径"],
+        ["ssl_pretrained_dir", "Textbox", "string", "预训练SSL模型路径"],
+        ["pretrained_s2G_path", "Textbox", "string", "预训练SoVITS-G模型路径"]
+      ],
+      "returns": [
+        ["Textbox", "string"]
+      ]
+    },
+    "open_slice": {
+      "inputs": [
+        ["inp", "Textbox", "string", "音频自动切分输入路径，可文件可文件夹"],
+        ["opt_root", "Textbox", "string", "切分后的子音频的输出根目录"],
+        ["threshold", "Textbox", "string", "threshold:音量小于这个值视作静音的备选切割点"],
+        ["min_length", "Textbox", "string", "min_length:每段最小多长，如果第一段太短一直和后面段连起来直到超过这个值"],
+        ["min_interval", "Textbox", "string", "min_interval:最短切割间隔"],
+        ["hop_size", "Textbox", "string", "hop_size:怎么算音量曲线，越小精度越大计算量越高（不是精度越大效果越好）"],
+        ["max_sil_kept", "Textbox", "string", "max_sil_kept:切完后静音最多留多长"],
+        ["_max", "Slider", "number", "max:归一化后最大值多少"],
+        ["alpha", "Slider", "number", "alpha_mix:混多少比例归一化后音频进来"],
+        ["n_parts", "Slider", "number", "切割使用的进程数"]
+      ],
+      "returns": [
+        ["Textbox", "string"],
+        ["Textbox", "string"],
+        ["Textbox", "string"],
+        ["Textbox", "string"]
+      ]
+    },
+    "switch_version": {
+      "inputs": [
+        ["version_", "Radio", "string", "训练模型的版本"]
+      ],
+      "returns": [
+        ["Textbox", "string"],
+        ["Textbox", "string"],
+        ["Textbox", "string"],
+        ["Dropdown", "string"],
+        ["Dropdown", "string"],
+        ["Slider", "number"],
+        ["Slider", "number"],
+        ["Slider", "number"],
+        ["Slider", "number"],
+        ["Checkbox", "boolean"],
+        ["Checkbox", "boolean"],
+        ["Radio", "string"]
+      ]
+    }
+  },
+  "inference": {
+    "inference": {
+      "inputs": [
+        ["text", "Textbox", "string", "需要合成的文本"],
+        ["text_lang", "Dropdown", "string", "需要合成的文本的语种"],
+        ["ref_audio_path", "Audio", "object", "主参考音频(请上传3~10秒内参考音频，超过会报错！)"],
+        ["aux_ref_audio_paths", "File", "array", "辅参考音频(可选多个，或不选)"],
+        ["prompt_text", "Textbox", "string", "主参考音频的文本"],
+        ["prompt_lang", "Dropdown", "string", "主参考音频的语种"],
+        ["top_k", "Slider", "number", "top_k"],
+        ["top_p", "Slider", "number", "top_p"],
+        ["temperature", "Slider", "number", "temperature"],
+        ["text_split_method", "Dropdown", "string", "怎么切"],
+        ["batch_size", "Slider", "number", "batch_size"],
+        ["speed_factor", "Slider", "number", "语速"],
+        ["ref_text_free", "Checkbox", "boolean", "开启无参考文本模式。不填参考文本亦相当于开启。v3、v4、v5 均不支持无参考文本模式，请填写参考文本！"],
+        ["split_bucket", "Checkbox", "boolean", "数据分桶(并行推理时会降低一点计算量)"],
+        ["fragment_interval", "Slider", "number", "分段间隔(秒)"],
+        ["seed", "Number", "number", "随机种子"],
+        ["keep_random", "Checkbox", "boolean", "保持随机"],
+        ["use_cuda_graph", "Checkbox", "boolean", "CUDA Graph"],
+        ["use_flash_attention", "Checkbox", "boolean", "flash_attn加速"],
+        ["repetition_penalty", "Slider", "number", "重复惩罚"],
+        ["sample_steps", "Radio", "string", "Euler steps (V3/V4/V5)"],
+        ["super_sampling", "Checkbox", "boolean", "音频超采样(仅对V3生效))"],
+        ["cfg_rate", "Slider", "number", "CFG"]
+      ],
+      "returns": [
+        ["Audio", "object"],
+        ["Number", "number"]
+      ]
+    }
+  }
+}

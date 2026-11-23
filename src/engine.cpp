@@ -6,6 +6,7 @@
 #include <iphlpapi.h>
 
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -17,6 +18,7 @@
 #include <QNetworkProxy>
 #include <QNetworkReply>
 #include <QProcessEnvironment>
+#include <QRegularExpression>
 #include <QStorageInfo>
 #include <QtConcurrentRun>
 #include <stdexcept>
@@ -24,9 +26,6 @@
 
 namespace ez {
 namespace {
-
-constexpr quint16 mainPort = 9874;
-constexpr quint16 inferencePort = 9872;
 
 [[noreturn]] void fail(const QString &message)
 {
@@ -50,11 +49,11 @@ DWORD listener(quint16 port)
     return 0;
 }
 
-EngineProbe probeApi()
+QJsonObject fetchApi(quint16 port, const QString &path)
 {
     QNetworkAccessManager network;
     network.setProxy(QNetworkProxy::NoProxy);
-    QNetworkRequest request(QUrl(QStringLiteral("http://127.0.0.1:9874/config")));
+    QNetworkRequest request(QUrl(QStringLiteral("http://127.0.0.1:%1/%2").arg(port).arg(path)));
     request.setTransferTimeout(2500);
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
     auto *reply = network.get(request);
@@ -64,42 +63,86 @@ EngineProbe probeApi()
         loop.exec();
     if (reply->error() != QNetworkReply::NoError)
         return {};
-    const auto config = QJsonDocument::fromJson(reply->readAll()).object();
-    EngineProbe result;
-    result.responded = true;
-    if (config.value("version").toString() != "4.44.1") {
-        result.error = QStringLiteral("WebUI 响应成功，但 Gradio 版本与 20261006 适配契约不符");
-        return result;
-    }
-    for (const auto &component : config.value("components").toArray()) {
-        const auto props = component.toObject().value("props").toObject();
-        const auto label = props.value("label").toString();
-        if (label == QStringLiteral("显卡信息") || label.compare("GPU Information", Qt::CaseInsensitive) == 0) {
-            result.devices = props.value("value").toString().trimmed();
-            break;
+    return QJsonDocument::fromJson(reply->readAll()).object();
+}
+
+QJsonObject engineContract()
+{
+    QFile file(":/engine/20261006-contract.json");
+    return file.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(file.readAll()).object() : QJsonObject{};
+}
+
+QString interfaceChange(const QString &method, const QJsonObject &expected, const QJsonArray &dependencies,
+                        const QMap<int, QJsonObject> &components, const QJsonObject &info)
+{
+    QJsonArray inputIds;
+    int matches = 0;
+    for (const auto &value : dependencies) {
+        const auto dependency = value.toObject();
+        if (dependency.value("api_name").toString() == method) {
+            inputIds = dependency.value("inputs").toArray();
+            ++matches;
         }
     }
-    const QMap<QString, QMap<QString, int>> expected{
-        {"synthesize", {{"switch_version", 1}, {"change_choices", 0}, {"change_tts_inference", 6},
-                        {"change_tts_inference_1", 6}}},
-        {"slice", {{"open_slice", 10}}},
-        {"prepare", {{"switch_version", 1}, {"open1abc", 10}}},
-        {"train_sovits", {{"switch_version", 1}, {"open1Ba", 13}}},
-        {"train_gpt", {{"switch_version", 1}, {"open1Bb", 9}}},
-    };
-    QMap<QString, int> published;
-    for (const auto &dependency : config.value("dependencies").toArray()) {
-        const auto endpoint = dependency.toObject();
-        const auto name = endpoint.value("api_name").toString();
-        const auto inputs = endpoint.value("inputs");
-        if (!name.isEmpty())
-            published.insert(name, !inputs.isArray() || published.contains(name) ? -1 : inputs.toArray().size());
+    if (matches != 1)
+        return method + QStringLiteral("（接口缺失或重名）");
+    const auto descriptor = info.value('/' + method).toObject();
+    const auto parameters = descriptor.value("parameters").toArray();
+    const auto inputs = expected.value("inputs").toArray();
+    if (descriptor.isEmpty() || inputIds.size() != inputs.size() || parameters.size() != inputs.size())
+        return method + QStringLiteral("（入参无法核对）");
+    for (qsizetype index = 0; index < inputs.size(); ++index) {
+        const auto parameter = parameters.at(index).toObject();
+        const auto component = components.value(inputIds.at(index).toInt(-1));
+        const QJsonArray observed{parameter.value("parameter_name"), parameter.value("component"),
+            parameter.value("type").toObject().value("type"),
+            component.value("props").toObject().value("label").toString()};
+        if (observed != inputs.at(index).toArray()
+            || component.value("type").toString().compare(parameter.value("component").toString(), Qt::CaseInsensitive) != 0)
+            return QStringLiteral("%1（第 %2 项入参的顺序、类型或控件已变化）").arg(method).arg(index + 1);
     }
-    for (auto operation = expected.cbegin(); operation != expected.cend(); ++operation) {
+    QJsonArray returns;
+    for (const auto &value : descriptor.value("returns").toArray()) {
+        const auto item = value.toObject();
+        returns.append(QJsonArray{item.value("component"), item.value("type").toObject().value("type")});
+    }
+    if (returns != expected.value("returns").toArray())
+        return method + QStringLiteral("（返回结构已变化）");
+    return {};
+}
+
+EngineProbe probeApi(quint16 port)
+{
+    const auto config = fetchApi(port, "config");
+    if (config.isEmpty())
+        return {};
+    EngineProbe result;
+    result.responded = true;
+    result.gradio = config.value("version").toString();
+    if (!config.value("dependencies").isArray() || result.gradio.isEmpty()) {
+        result.error = QStringLiteral("引擎未提供可识别的 Gradio 配置");
+        return result;
+    }
+    QMap<int, QJsonObject> components;
+    for (const auto &component : config.value("components").toArray()) {
+        components.insert(component.toObject().value("id").toInt(-1), component.toObject());
+        const auto props = component.toObject().value("props").toObject();
+        const auto label = props.value("label").toString();
+        if (label == QStringLiteral("显卡信息") || label.compare("GPU Information", Qt::CaseInsensitive) == 0)
+            result.devices = props.value("value").toString().trimmed();
+    }
+    const auto contract = engineContract();
+    const auto expected = contract.value("operations").toObject();
+    const auto methods = contract.value("main").toObject();
+    const auto info = fetchApi(port, "info").value("named_endpoints").toObject();
+    const auto dependencies = config.value("dependencies").toArray();
+    for (auto operation = expected.constBegin(); operation != expected.constEnd(); ++operation) {
         QStringList missing;
-        for (auto method = operation.value().cbegin(); method != operation.value().cend(); ++method) {
-            if (published.value(method.key(), -1) != method.value())
-                missing << method.key();
+        for (const auto &value : operation.value().toArray()) {
+            const auto method = value.toString();
+            const auto issue = interfaceChange(method, methods.value(method).toObject(), dependencies, components, info);
+            if (!issue.isEmpty())
+                missing << issue;
         }
         if (!missing.isEmpty())
             result.unavailable.insert(operation.key(), QStringLiteral("%1接口缺失或参数已变化（%2）。请检查整合包版本。")
@@ -155,6 +198,64 @@ QString engineRoot(const QString &launcher)
     return root;
 }
 
+EnginePorts enginePorts(const QString &directory)
+{
+    const auto contract = engineContract();
+    EnginePorts ports{quint16(contract.value("main_port").toInt(9874)),
+        quint16(contract.value("inference_port").toInt(9872))};
+    QFile file(checkedPath(directory + "/config.py"));
+    if (file.open(QIODevice::ReadOnly)) {
+        const auto configuration = QString::fromUtf8(file.read(1024 * 1024));
+        const auto read = [&](const QString &name, quint16 fallback) {
+            const QRegularExpression literal("^" + name + R"(\s*=\s*(\d{1,5})[ \t]*(?:#[^\r\n]*)?\r?$)",
+                QRegularExpression::MultilineOption);
+            const auto match = literal.match(configuration);
+            const auto value = match.captured(1).toInt();
+            if (!match.hasMatch())
+                return fallback;
+            if (value < 1 || value > 65535)
+                fail(QStringLiteral("引擎配置中的端口无效：%1").arg(name));
+            return quint16(value);
+        };
+        ports.main = read("webui_port_main", ports.main);
+        ports.inference = read("webui_port_infer_tts", ports.inference);
+    }
+    if (ports.main == ports.inference)
+        fail(QStringLiteral("主服务和推理服务需要分别配置端口。"));
+    return ports;
+}
+
+QString engineFingerprint(const QString &directory)
+{
+    QCryptographicHash fingerprint(QCryptographicHash::Sha256);
+    const QStringList files{"go-webui.bat", "webui.py", "config.py", "GPT_SoVITS/inference_webui_fast.py",
+        "GPT_SoVITS/s2_train_v3_lora.py", "GPT_SoVITS/s1_train.py"};
+    for (const auto &name : files) {
+        QFile file(checkedPath(directory + '/' + name));
+        QCryptographicHash hash(QCryptographicHash::Sha256);
+        fingerprint.addData(file.open(QIODevice::ReadOnly) && hash.addData(&file) ? hash.result() : QByteArray(32, '\0'));
+    }
+    const QDir packages(checkedPath(directory + "/runtime/Lib/site-packages"));
+    for (const auto &entry : packages.entryList({"gradio-*.dist-info", "gradio_client-*.dist-info"}, QDir::Dirs, QDir::Name))
+        fingerprint.addData(entry.toUtf8());
+    return QString::fromLatin1(fingerprint.result().toHex());
+}
+
+QString resumeEngineIssue(const QString &directory, const QString &family)
+{
+    if (family != "v5turbo")
+        return QStringLiteral("当前续训适配限定 v5turbo。");
+    const auto pinned = engineContract().value("resume").toObject();
+    for (auto item = pinned.constBegin(); item != pinned.constEnd(); ++item) {
+        QFile file(checkedPath(directory + '/' + item.key()));
+        QCryptographicHash hash(QCryptographicHash::Sha256);
+        if (!file.open(QIODevice::ReadOnly) || !hash.addData(&file)
+            || hash.result().toHex() != item.value().toString().toLatin1())
+            return QStringLiteral("续训脚本缺失或摘要变化 %1。可重新开始该训练阶段。").arg(item.key());
+    }
+    return {};
+}
+
 struct EngineManager::Process {
     HANDLE job = nullptr;
     HANDLE handle = nullptr;
@@ -189,12 +290,13 @@ EngineManager::EngineManager(QObject *parent) : QObject(parent)
         const auto result = probe_.result();
         if (!result.responded)
             return;
-        if (!result.error.isEmpty() || !ownsListener(mainPort)) {
+        if (!result.error.isEmpty() || !ownsListener(ports_.main)) {
             failInstance(result.error.isEmpty() ? QStringLiteral("引擎监听进程已变化") : result.error);
             return;
         }
         unavailable_ = result.unavailable;
         devices_ = result.devices;
+        gradio_ = result.gradio;
         ready_ = true;
         QStringList limited;
         for (const auto &operation : unavailable_.keys())
@@ -220,7 +322,8 @@ void EngineManager::start(const QString &launcher, const QString &logPath)
     const auto issue = resourceIssue(dir, "start", {});
     if (!issue.isEmpty())
         fail(issue);
-    for (auto port : {mainPort, inferencePort}) {
+    const auto ports = enginePorts(dir);
+    for (auto port : {ports.main, ports.inference}) {
         if (const auto pid = listener(port))
             fail(QStringLiteral("端口 %1 已被进程 %2 占用").arg(port).arg(pid));
     }
@@ -285,6 +388,7 @@ void EngineManager::start(const QString &launcher, const QString &logPath)
     CloseHandle(created.hThread);
     process_ = std::move(candidate);
     root_ = dir;
+    ports_ = ports;
     logPath_ = logPath;
     ticks_ = 0;
     timer_.start();
@@ -297,6 +401,7 @@ void EngineManager::stop()
     process_.reset();
     ready_ = false;
     unavailable_.clear();
+    gradio_.clear();
     emit readinessChanged(false);
     emit statusChanged(QStringLiteral("引擎未启动"));
 }
@@ -311,8 +416,8 @@ void EngineManager::poll()
     }
     if (ready_ || probe_.isRunning())
         return;
-    if (ownsListener(mainPort))
-        probe_.setFuture(QtConcurrent::run(probeApi));
+    if (ownsListener(ports_.main))
+        probe_.setFuture(QtConcurrent::run(probeApi, ports_.main));
 }
 
 void EngineManager::failInstance(const QString &message)
@@ -337,10 +442,12 @@ QMap<QString, QString> EngineManager::interfaceIssues() const
 }
 
 QString EngineManager::devices() const { return ready_ ? devices_ : QString(); }
+QString EngineManager::gradioVersion() const { return ready_ ? gradio_ : QString(); }
+EnginePorts EngineManager::ports() const { return ports_; }
 
 quint32 EngineManager::webuiPid() const
 {
-    const auto pid = listener(mainPort);
+    const auto pid = listener(ports_.main);
     if (!ready_ || !pid || !process_ || !process_->owns(pid))
         fail(QStringLiteral("引擎监听进程已变化，请重启引擎"));
     return pid;

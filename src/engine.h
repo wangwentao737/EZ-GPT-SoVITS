@@ -19,7 +19,17 @@ struct EngineProbe {
     QString error;
     QMap<QString, QString> unavailable;
     QString devices;
+    QString gradio;
 };
+
+struct EnginePorts {
+    quint16 main = 9874;
+    quint16 inference = 9872;
+};
+
+EnginePorts enginePorts(const QString &directory);
+QString engineFingerprint(const QString &directory);
+QString resumeEngineIssue(const QString &directory, const QString &family);
 
 class EngineManager final : public QObject {
     Q_OBJECT
@@ -34,6 +44,8 @@ public:
     QString interfaceIssue(const QString &operation) const;
     QMap<QString, QString> interfaceIssues() const;
     QString devices() const;
+    QString gradioVersion() const;
+    EnginePorts ports() const;
     quint32 webuiPid() const;
     bool ownsListener(quint16 port) const;
 
@@ -49,6 +61,8 @@ private:
     QFutureWatcher<EngineProbe> probe_;
     QMap<QString, QString> unavailable_;
     QString devices_;
+    QString gradio_;
+    EnginePorts ports_;
     QString root_;
     QString logPath_;
     int ticks_ = 0;

@@ -10,6 +10,8 @@ import sqlite3
 import subprocess
 import uuid
 
+from workspace_paths import workspace_path
+
 
 def run(program, *arguments):
     subprocess.run(
@@ -30,14 +32,14 @@ def copy_input(source, destination):
         shutil.copyfile(source, destination)
 
 
-def last_wave(database, home):
+def last_wave(database, data, home):
     state, request, result = database.execute(
         "SELECT state,request,result FROM jobs ORDER BY rowid DESC LIMIT 1"
     ).fetchone()
     assert state == "succeeded", state
-    assert Path(json.loads(request)["output_root"]).resolve() == home.resolve()
+    assert workspace_path(data, json.loads(request)["output_root"]).resolve() == home.resolve()
     result = json.loads(result)
-    wave = Path(result["audio"]).resolve(strict=True)
+    wave = workspace_path(data, result["audio"]).resolve(strict=True)
     assert wave.is_relative_to(home.resolve()), wave
     assert hashlib.sha256(wave.read_bytes()).hexdigest() == result["sha256"]
     return wave
@@ -77,7 +79,7 @@ def main():
 
     run(program, *options)
     with sqlite3.connect(database_path) as database:
-        previous = last_wave(database, data / "outputs")
+        previous = last_wave(database, data, data / "outputs")
         custom = test_root / "生成 输出 (设置)"
         custom.mkdir()
         database.execute("INSERT INTO workspace_settings(key,value) VALUES(?,?)",
@@ -85,9 +87,9 @@ def main():
 
     run(program, *options)
     with sqlite3.connect(database_path) as database:
-        current = last_wave(database, custom)
+        current = last_wave(database, data, custom)
         history = json.loads(database.execute("SELECT result FROM jobs ORDER BY rowid LIMIT 1").fetchone()[0])
-        assert Path(history["audio"]).resolve(strict=True) == previous
+        assert workspace_path(data, history["audio"]).resolve(strict=True) == previous
         assert current != previous
     print("Portable launch, bundled default WAV directory, custom directory, and original history passed.")
 

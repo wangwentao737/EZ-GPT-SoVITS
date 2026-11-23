@@ -11,6 +11,8 @@ import subprocess
 import time
 import uuid
 
+from workspace_paths import workspace_path
+
 
 def test_path(value, scratch):
     path = Path(value).resolve(strict=True)
@@ -117,7 +119,7 @@ def run_case(program, engine, data, request, voice, needle):
     assert stopped[1:3] == (request["operation"], "cancelled") and not json.loads(stopped[4]), stopped
     assert continued[1:3] == ("synthesize", "succeeded"), continued
     result = json.loads(continued[4])
-    wav = Path(result["audio"])
+    wav = workspace_path(data, result["audio"])
     assert wav.stat().st_size == result["bytes"]
     assert hashlib.sha256(wav.read_bytes()).hexdigest() == result["sha256"]
     assert sorted((data / "outputs").rglob("*.wav")) == [wav]

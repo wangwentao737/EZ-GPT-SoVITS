@@ -1,36 +1,52 @@
 #include "training.h"
+#include "workspacepaths.h"
 #include "engine.h"
 #include "jobs.h"
+#include "recordings.h"
 #include "resources.h"
 #include "ui.h"
 
 #include <QAction>
 #include <QAudioDevice>
 #include <QAudioOutput>
+#include <QCheckBox>
 #include <QComboBox>
+#include <QCryptographicHash>
 #include <QDesktopServices>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QEventLoop>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QFutureWatcher>
 #include <QHeaderView>
+#include <QInputDialog>
+#include <QJsonArray>
 #include <QJsonDocument>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMediaDevices>
 #include <QMediaPlayer>
+#include <QMessageBox>
+#include <QProgressDialog>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QSet>
+#include <QSignalBlocker>
 #include <QShowEvent>
 #include <QSpinBox>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QStyle>
+#include <QStyledItemDelegate>
 #include <QTableWidget>
+#include <QTimer>
 #include <QUuid>
+#include <QtConcurrentRun>
 #include <stdexcept>
 #include <utility>
 
@@ -63,9 +79,76 @@ QString directory(const QString &path)
 
 void invalidate(QJsonObject &project)
 {
-    for (const auto &key : {"dataset", "sampleCount", "gpt", "sovits", "engine"})
-        project.remove(key);
+    QJsonObject prior;
+    for (const auto &key : {"dataset", "sampleCount", "gpt", "sovits", "engine", "experiment"}) {
+        if (project.contains(key))
+            prior[key] = project.take(key);
+    }
+    if (prior.contains("dataset")) {
+        auto versions = project.value("training_versions").toArray();
+        versions.append(storedWorkspacePaths(prior));
+        project["training_versions"] = versions;
+    }
 }
+
+template <typename Work>
+auto recordingTask(QWidget *owner, const QString &title, int total, const Work &work)
+{
+    std::atomic_bool cancelled = false;
+    std::atomic_int completed = 0;
+    QProgressDialog progress(title, QStringLiteral("取消"), 0, total, owner);
+    progress.setAutoClose(false);
+    progress.setAutoReset(false);
+    progress.setMinimumDuration(0);
+    progress.setWindowModality(Qt::WindowModal);
+    const auto future = QtConcurrent::run([&] { return work(cancelled, completed); });
+    QFutureWatcher<decltype(work(cancelled, completed))> watcher;
+    QEventLoop wait;
+    QTimer timer;
+    QObject::connect(&progress, &QProgressDialog::canceled, &wait, [&] { cancelled.store(true); });
+    QObject::connect(&watcher, &QFutureWatcherBase::finished, &wait, &QEventLoop::quit);
+    QObject::connect(&timer, &QTimer::timeout, &wait, [&] {
+        if (!cancelled.load() && total > 0) {
+            progress.setValue(completed.load());
+            progress.setLabelText(QStringLiteral("%1\n已完成 %2 / %3 个文件").arg(title).arg(completed.load()).arg(total));
+        }
+    });
+    watcher.setFuture(future);
+    if (!future.isFinished()) {
+        progress.show();
+        timer.start(100);
+        wait.exec();
+    }
+    return future.result();
+}
+
+bool advanceReview(const QKeyEvent &event)
+{
+    return (event.key() == Qt::Key_Return || event.key() == Qt::Key_Enter)
+        && event.modifiers().testFlag(Qt::ControlModifier);
+}
+
+class ReviewDelegate final : public QStyledItemDelegate {
+public:
+    explicit ReviewDelegate(QPushButton *save, QWidget *parent) : QStyledItemDelegate(parent), save_(save) {}
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (event->type() == QEvent::KeyPress && advanceReview(*static_cast<QKeyEvent *>(event))) {
+            if (auto *editor = qobject_cast<QWidget *>(watched)) {
+                emit commitData(editor);
+                emit closeEditor(editor);
+                save_->click();
+                return true;
+            }
+        }
+        return QStyledItemDelegate::eventFilter(watched, event);
+    }
+
+private:
+    QPushButton *save_;
+};
 
 }
 
@@ -117,12 +200,13 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     });
     layout->addLayout(files);
 
-    labels_ = new QTableWidget(0, 3, this);
-    labels_->setHorizontalHeaderLabels({QStringLiteral("片段"), QStringLiteral("语言"), QStringLiteral("文本")});
+    labels_ = new QTableWidget(0, 4, this);
+    labels_->setHorizontalHeaderLabels({QStringLiteral("片段"), QStringLiteral("语言"), QStringLiteral("状态"), QStringLiteral("文本")});
     labels_->setAccessibleName(QStringLiteral("音频切片与标注"));
     ui::styleTable(labels_);
     labels_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Interactive);
     labels_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    labels_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
     labels_->setColumnWidth(0, 230);
     labels_->horizontalHeader()->setStretchLastSection(true);
     layout->addWidget(labels_, 1);
@@ -165,8 +249,12 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
         try {
             const auto source = playableClip();
             if (player_->source() == source && player_->playbackState() == QMediaPlayer::PlayingState) {
-                player_->stop();
-                playback->setText(QStringLiteral("已停止试听。"));
+                player_->pause();
+                playback->setText(QStringLiteral("已暂停试听。"));
+                return;
+            }
+            if (player_->source() == source && player_->playbackState() == QMediaPlayer::PausedState) {
+                player_->play();
                 return;
             }
             player_->stop();
@@ -190,6 +278,7 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
             playback->setText(QString::fromUtf8(error.what()));
         }
     });
+    playClip_ = playClip;
     auto *openClip = new QAction(QStringLiteral("用系统播放器打开"), this);
     connect(openClip, &QAction::triggered, this, [=, this] {
         try {
@@ -203,7 +292,7 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     });
     auto *editClip = button(labelsActions, QStringLiteral("编辑文本"), [this] {
         require(!busy(), QStringLiteral("请等待当前阶段完成"));
-        if (auto *item = labels_->item(ui::selectedRow(labels_), 2)) {
+        if (auto *item = labels_->item(ui::selectedRow(labels_), 3)) {
             labels_->setCurrentItem(item);
             labels_->editItem(item);
         }
@@ -211,8 +300,12 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     auto *excludeClip = button(labelsActions, QStringLiteral("排除片段"), [this] {
         require(!busy(), QStringLiteral("请等待当前阶段完成"));
         const int row = ui::selectedRow(labels_);
-        if (row >= 0)
-            labels_->removeRow(row);
+        if (row >= 0) {
+            auto *state = labels_->item(row, 2);
+            state->setText(state->text() == QStringLiteral("已排除") ? QStringLiteral("待校对") : QStringLiteral("已排除"));
+            reviewsDirty_ = true;
+            updateReviewFilter();
+        }
     });
     const auto updateClipActions = [=, this] {
         const auto path = selectedClip();
@@ -220,7 +313,7 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
         const bool canEdit = selected && !busy();
         const bool playing = player_->playbackState() == QMediaPlayer::PlayingState
             && player_->source() == QUrl::fromLocalFile(path);
-        playClip->setText(playing ? QStringLiteral("停止试听") : QStringLiteral("试听片段"));
+        playClip->setText(playing ? QStringLiteral("暂停试听") : QStringLiteral("试听片段"));
         playClip->setEnabled(selected);
         openClip->setEnabled(selected);
         editClip->setEnabled(canEdit);
@@ -249,6 +342,11 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     });
     ui::enableRowMenu(labels_, {playClip, editClip, excludeClip}, {openClip});
     button(labelsActions, QStringLiteral("保存标注"), [this] { saveLabels(); });
+    saveNext_ = button(labelsActions, QStringLiteral("保存并下一条"), [this] { saveAndAdvance(); });
+    saveNext_->setToolTip(QStringLiteral("Ctrl+Enter 保存校对并移动到下一条可见片段"));
+    labels_->setItemDelegate(new ReviewDelegate(saveNext_, labels_));
+    labels_->installEventFilter(this);
+    labels_->viewport()->installEventFilter(this);
     prepare_ = button(labelsActions, QStringLiteral("准备数据"), [this] {
         saveLabels();
         submit("prepare");
@@ -257,7 +355,23 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     layout->addLayout(labelsActions);
     auto *playbackRow = new QHBoxLayout;
     playbackRow->addWidget(playback, 1);
+    pendingOnly_ = new QCheckBox(QStringLiteral("只看待校对"), this);
+    auto *loop = new QCheckBox(QStringLiteral("循环试听"), this);
+    playbackRow->addWidget(pendingOnly_);
+    playbackRow->addWidget(loop);
     playbackRow->addWidget(outputChoice);
+    connect(pendingOnly_, &QCheckBox::toggled, this, &TrainingPanel::updateReviewFilter);
+    connect(loop, &QCheckBox::toggled, this, [this](bool enabled) {
+        player_->setLoops(enabled ? QMediaPlayer::Infinite : QMediaPlayer::Once);
+    });
+    connect(labels_, &QTableWidget::itemChanged, this, [this](QTableWidgetItem *item) {
+        if (item->column() != 1 && item->column() != 3)
+            return;
+        reviewsDirty_ = true;
+        auto *state = labels_->item(item->row(), 2);
+        if (state && state->text() != QStringLiteral("已排除"))
+            state->setText(QStringLiteral("待校对"));
+    });
     layout->addLayout(playbackRow);
 
     auto *training = new QHBoxLayout;
@@ -290,6 +404,21 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
 
     connect(projects_, &QComboBox::currentIndexChanged, this, [this] {
         try {
+            if (reviewsDirty_ && !project_.isEmpty()) {
+                const auto choice = QMessageBox::question(this, QStringLiteral("保存校对修改"),
+                    QStringLiteral("切换项目之前保存当前校对修改？"),
+                    QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Save);
+                if (choice == QMessageBox::Cancel) {
+                    const QSignalBlocker block(projects_);
+                    projects_->setCurrentIndex(projects_->findData(project_.value("id").toString()));
+                    return;
+                }
+                if (choice == QMessageBox::Save) {
+                    auto saved = project_;
+                    saved["reviews"] = reviewDrafts();
+                    saveProject(saved);
+                }
+            }
             loadProject();
         } catch (const std::exception &error) {
             status_->setText(QString::fromUtf8(error.what()));
@@ -353,7 +482,7 @@ void TrainingPanel::saveProject(const QJsonObject &project)
     query.prepare("INSERT INTO projects(id,name,state) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state");
     query.addBindValue(project.value("id").toString());
     query.addBindValue(project.value("name").toString());
-    query.addBindValue(QJsonDocument(project).toJson(QJsonDocument::Compact));
+    query.addBindValue(QJsonDocument(storedWorkspacePaths(project)).toJson(QJsonDocument::Compact));
     execute(query);
     if (projects_->currentData().toString() == project.value("id").toString())
         project_ = project;
@@ -365,7 +494,7 @@ void TrainingPanel::loadProject()
     query.prepare("SELECT state FROM projects WHERE id=?");
     query.addBindValue(projects_->currentData().toString());
     execute(query);
-    project_ = query.next() ? QJsonDocument::fromJson(query.value(0).toByteArray()).object() : QJsonObject{};
+    project_ = query.next() ? readWorkspaceRecord(query.value(0).toByteArray()) : QJsonObject{};
     query.finish();
     const auto pending = project_.value("pending").toString();
     if (!pending.isEmpty()) {
@@ -374,7 +503,7 @@ void TrainingPanel::loadProject()
         execute(query);
         const bool exists = query.next();
         const auto status = exists ? query.value(0).toString() : QString();
-        const auto result = exists ? QJsonDocument::fromJson(query.value(1).toByteArray()).object() : QJsonObject{};
+        const auto result = exists ? readWorkspaceRecord(query.value(1).toByteArray()) : QJsonObject{};
         query.finish();
         if (status == "succeeded") {
             complete(pending, result, false);
@@ -385,7 +514,8 @@ void TrainingPanel::loadProject()
     }
     readClips();
     if (project_.contains("annotation"))
-        loadLabels(project_.value("annotation").toString());
+        loadLabels(project_.value("annotation").toString(), project_.value("annotation_automatic").toBool());
+    reviewsDirty_ = false;
     const auto settings = project_.value("training_settings").toObject();
     if (!settings.isEmpty()) {
         gpu_->setValue(settings.value("gpu").toString().toInt());
@@ -404,76 +534,311 @@ void TrainingPanel::importAudio(bool clips)
         clips ? "WAV (*.wav)" : "Audio (*.wav *.flac *.mp3 *.m4a *.ogg)");
     if (sources.isEmpty())
         return;
-    const auto folder = clips ? "clips" : "raw";
-    const auto destination = directory(project_.value("directory").toString() + "/" + folder + "/" + newId());
-    int count = 0;
-    for (const auto &source : sources) {
-        const auto input = checkedPath(source);
-        const QFileInfo file(input);
-        const auto filename = clips ? file.fileName() : "clip-" + QString::number(count) + "." + file.suffix().toLower();
-        const auto output = checkedPath(destination + "/" + filename);
-        require(QFile::copy(input, output), QStringLiteral("无法复制录音：%1").arg(input));
-        ++count;
+    const QString folder = clips ? "clips" : "raw";
+    const auto current = project_.value(folder).toString();
+    const auto groupsKey = folder + "_batches";
+    const auto originalKey = folder + "_original_names";
+    const auto lastKey = "last_" + folder + "_batch";
+    QString replace;
+    if (!current.isEmpty()) {
+        QMessageBox method(QMessageBox::Question, QStringLiteral("导入录音"),
+            QStringLiteral("选择如何处理本次导入。"), QMessageBox::Cancel, this);
+        auto *append = method.addButton(QStringLiteral("追加"), QMessageBox::AcceptRole);
+        auto *overwrite = method.addButton(QStringLiteral("替换本批"), QMessageBox::DestructiveRole);
+        method.setDefaultButton(append);
+        method.exec();
+        if (method.clickedButton() == overwrite)
+            replace = project_.value(lastKey).toString("legacy");
+        else if (method.clickedButton() != append)
+            return;
     }
-    project_[folder] = destination;
-    if (!clips)
-        project_.remove("clips");
-    project_.remove("annotation");
-    invalidate(project_);
-    saveProject(project_);
+    const auto batch = newId();
+    const auto groups = project_.value(groupsKey).toObject();
+    const auto originalNames = project_.value(originalKey).toObject();
+    const auto plan = recordingTask(this, QStringLiteral("正在比较录音内容…"), 0, [&](const auto &cancel, auto &) {
+        return planRecordings(sources, current, groups, originalNames, replace, batch, cancel);
+    });
+    require(plan.error.isEmpty(), plan.error);
+    QStringList details;
+    if (!plan.duplicates.isEmpty())
+        details.append(QStringLiteral("重复录音\n%1").arg(plan.duplicates.join('\n')));
+    if (!plan.conflicts.isEmpty())
+        details.append(QStringLiteral("同名但内容不同，将保留两份\n%1").arg(plan.conflicts.join('\n')));
+    if (!plan.replaced.isEmpty())
+        details.append(QStringLiteral("将从当前素材批次移除\n%1").arg(plan.replaced.join('\n')));
+    QMessageBox preview(QMessageBox::Information, QStringLiteral("录音导入预览"),
+        QStringLiteral("新增 %1 条，保留 %2 条，跳过重复 %3 条，同名异内容 %4 条，替换原批次 %5 条。")
+            .arg(plan.additions).arg(plan.files.size() - plan.additions).arg(plan.duplicates.size())
+            .arg(plan.conflicts.size()).arg(plan.replaced.size()),
+        QMessageBox::Apply | QMessageBox::Cancel, this);
+    if (!details.isEmpty())
+        preview.setDetailedText(details.join("\n\n"));
+    if (plan.additions == 0 || preview.exec() != QMessageBox::Apply) {
+        if (plan.additions == 0)
+            status_->setText(QStringLiteral("本次没有新的录音，项目保持原样。"));
+        return;
+    }
+    const auto projectDirectory = project_.value("directory").toString();
+    const auto destination = checkedPath(projectDirectory + "/" + folder + "/" + batch);
+    const auto pendingDirectory = clips ? QString() : checkedPath(projectDirectory + "/raw-pending/" + batch);
+    QStringList pending;
+    for (const auto &name : project_.value("pending_recordings").toArray())
+        pending.append(name.toString());
+    if (!clips && !current.isEmpty() && !project_.contains("clips") && !project_.contains("pending_recordings")) {
+        for (const auto &recording : plan.files) {
+            if (!recording.incoming)
+                pending.append(recording.name);
+        }
+    }
+    const auto error = recordingTask(this, QStringLiteral("正在准备录音文件…"), int(plan.files.size()),
+        [&](const auto &cancel, auto &completed) {
+            return copyRecordings(plan, destination, pendingDirectory, pending, cancel, completed);
+        });
+    const auto rollback = [&] {
+        QDir(destination).removeRecursively();
+        if (!pendingDirectory.isEmpty())
+            QDir(pendingDirectory).removeRecursively();
+    };
+    if (!error.isEmpty()) {
+        rollback();
+        require(false, error);
+    }
+    try {
+        QJsonObject batches;
+        QJsonObject names;
+        QJsonObject ids;
+        QJsonArray pendingNames;
+        for (const auto &recording : plan.files) {
+            batches[recording.name] = recording.batch;
+            names[recording.name] = recording.originalName;
+            if (clips)
+                ids[recording.name] = recording.incoming ? newId() : clipId(recording.name);
+            else if (recording.incoming || pending.contains(recording.name))
+                pendingNames.append(recording.name);
+        }
+        auto state = project_;
+        state["reviews"] = reviewDrafts();
+        state[folder] = destination;
+        state[groupsKey] = batches;
+        state[originalKey] = names;
+        state[lastKey] = batch;
+        if (clips) {
+            state["clip_ids"] = ids;
+            state.remove("annotation");
+        } else {
+            state["raw_pending"] = pendingDirectory;
+            state["pending_recordings"] = pendingNames;
+            if (!replace.isEmpty()) {
+                auto replaced = state.value("replace_sliced_batches").toArray();
+                if (!replaced.contains(replace))
+                    replaced.append(replace);
+                state["replace_sliced_batches"] = replaced;
+            }
+        }
+        invalidate(state);
+        saveProject(state);
+    } catch (...) {
+        rollback();
+        throw;
+    }
+    reviewsDirty_ = false;
     readClips();
     showState();
-    status_->setText(QStringLiteral("已导入 %1 段录音").arg(count));
+    status_->setText(QStringLiteral("已导入 %1 段录音").arg(plan.additions));
 }
 
 void TrainingPanel::readClips()
 {
+    const QSignalBlocker block(labels_);
     labels_->setRowCount(0);
     const auto path = project_.value("clips").toString();
     if (path.isEmpty())
         return;
-    const auto clips = QDir(checkedPath(path)).entryInfoList({"*.wav"}, QDir::Files, QDir::Name);
+    const auto clips = QDir(checkedPath(path)).entryInfoList({"*.wav"}, QDir::Files | QDir::NoSymLinks, QDir::Name);
+    const auto reviewed = project_.value("reviews").toObject();
     for (const auto &clip : clips) {
         const auto row = labels_->rowCount();
         labels_->insertRow(row);
         auto *item = new QTableWidgetItem(clip.fileName());
         item->setFlags(item->flags() & ~Qt::ItemIsEditable);
         item->setData(Qt::UserRole, checkedPath(clip.absoluteFilePath()));
+        const auto id = clipId(clip.fileName());
+        item->setData(Qt::UserRole + 1, id);
         labels_->setItem(row, 0, item);
-        labels_->setItem(row, 1, new QTableWidgetItem(project_.value("language").toString()));
-        labels_->setItem(row, 2, new QTableWidgetItem);
+        const auto draft = reviewed.value(id).toObject();
+        labels_->setItem(row, 1, new QTableWidgetItem(draft.value("language").toString(project_.value("language").toString())));
+        auto *status = new QTableWidgetItem(draft.value("status").toString(QStringLiteral("待校对")));
+        status->setFlags(status->flags() & ~Qt::ItemIsEditable);
+        labels_->setItem(row, 2, status);
+        labels_->setItem(row, 3, new QTableWidgetItem(draft.value("text").toString()));
+    }
+    updateReviewFilter();
+}
+
+QString TrainingPanel::clipId(const QString &filename) const
+{
+    const auto id = project_.value("clip_ids").toObject().value(filename).toString();
+    if (!id.isEmpty())
+        return id;
+    const auto anchor = project_.value("id").toString() + '/' + filename.toCaseFolded();
+    return QString::fromLatin1(QCryptographicHash::hash(anchor.toUtf8(), QCryptographicHash::Sha256).toHex());
+}
+
+QJsonObject TrainingPanel::reviewDrafts() const
+{
+    auto drafts = project_.value("reviews").toObject();
+    for (int row = 0; row < labels_->rowCount(); ++row) {
+        drafts[labels_->item(row, 0)->data(Qt::UserRole + 1).toString()] = QJsonObject{
+            {"language", labels_->item(row, 1)->text()}, {"status", labels_->item(row, 2)->text()},
+            {"text", labels_->item(row, 3)->text()}};
+    }
+    return drafts;
+}
+
+void TrainingPanel::updateReviewFilter()
+{
+    for (int row = 0; row < labels_->rowCount(); ++row) {
+        labels_->setRowHidden(row, pendingOnly_->isChecked()
+            && labels_->item(row, 2)->text() != QStringLiteral("待校对"));
     }
 }
 
-void TrainingPanel::loadLabels(const QString &path)
+void TrainingPanel::saveAndAdvance()
+{
+    require(!busy(), QStringLiteral("请等待当前阶段完成"));
+    const int row = ui::selectedRow(labels_);
+    require(row >= 0, QStringLiteral("请选择要保存的片段"));
+    const auto text = labels_->item(row, 3)->text().trimmed();
+    const auto language = labels_->item(row, 1)->text().trimmed().toLower();
+    const QStringList languages{"zh", "en", "ja", "yue", "ko"};
+    require(!text.isEmpty() && !text.contains('|') && !text.contains('\n') && languages.contains(language),
+        QStringLiteral("请填写有效的文本和语言。"));
+    labels_->item(row, 2)->setText(QStringLiteral("已校对"));
+    auto state = project_;
+    state["reviews"] = reviewDrafts();
+    saveProject(state);
+    reviewsDirty_ = false;
+    updateReviewFilter();
+    for (int next = row + 1; next < labels_->rowCount(); ++next) {
+        if (!labels_->isRowHidden(next)) {
+            labels_->setCurrentCell(next, 0);
+            labels_->scrollToItem(labels_->item(next, 0));
+            break;
+        }
+    }
+    labels_->setFocus(Qt::ShortcutFocusReason);
+    status_->setText(QStringLiteral("已保存所选片段的校对。"));
+}
+
+void TrainingPanel::loadLabels(const QString &path, bool automatic)
 {
     require(labels_->rowCount() > 0, QStringLiteral("请先导入或生成切片"));
     QFile file(checkedPath(path));
     require(file.open(QIODevice::ReadOnly), QStringLiteral("无法读取标注"));
-    QMap<QString, int> rows;
-    for (int row = 0; row < labels_->rowCount(); ++row)
-        rows.insert(labels_->item(row, 0)->text(), row);
-    QList<int> matched;
-    const auto lines = QString::fromUtf8(file.readAll()).split('\n', Qt::SkipEmptyParts);
-    for (const auto &line : lines) {
-        const auto fields = line.trimmed().split('|');
-        if (fields.size() != 4)
+    const bool imported = !automatic && path != project_.value("annotation").toString();
+    QMap<QString, QList<int>> rows;
+    const auto aliases = project_.value("clips_original_names").toObject();
+    for (int row = 0; row < labels_->rowCount(); ++row) {
+        const auto name = labels_->item(row, 0)->text();
+        const auto original = aliases.value(name).toString(name);
+        rows[name.toCaseFolded()].append(row);
+        if (original.compare(name, Qt::CaseInsensitive) != 0)
+            rows[original.toCaseFolded()].append(row);
+    }
+    QMap<int, QStringList> matches;
+    QSet<int> repeated;
+    QStringList missingAudio;
+    QStringList malformed;
+    QStringList ambiguous;
+    const QStringList languages{"zh", "en", "ja", "yue", "ko"};
+    const auto lines = QString::fromUtf8(file.readAll()).split('\n');
+    for (qsizetype index = 0; index < lines.size(); ++index) {
+        if (lines[index].trimmed().isEmpty())
             continue;
-        const auto filename = QFileInfo(QDir::fromNativeSeparators(fields[0])).fileName();
-        if (auto row = rows.constFind(filename); row != rows.cend()) {
-            labels_->item(row.value(), 1)->setText(fields[2].toLower());
-            labels_->item(row.value(), 2)->setText(fields[3]);
-            matched.append(row.value());
+        auto fields = lines[index].trimmed().split('|');
+        if (fields.size() != 4 || fields[0].isEmpty() || fields[1].isEmpty()
+            || !languages.contains(fields[2].toLower()) || fields[3].trimmed().isEmpty()) {
+            malformed.append(QString::number(index + 1));
+            continue;
+        }
+        const auto clip = QDir::fromNativeSeparators(fields[0]);
+        const auto filename = QFileInfo(clip).fileName();
+        const auto candidates = rows.value(filename.toCaseFolded());
+        int row = -1;
+        for (const int candidate : candidates) {
+            if (labels_->item(candidate, 0)->data(Qt::UserRole).toString().compare(clip, Qt::CaseInsensitive) == 0)
+                row = candidate;
+        }
+        if (row < 0 && candidates.size() == 1)
+            row = candidates.first();
+        if (row < 0 && candidates.size() > 1 && imported) {
+            QStringList names;
+            for (const int candidate : candidates)
+                names.append(labels_->item(candidate, 0)->text());
+            bool selected = false;
+            const auto name = QInputDialog::getItem(this, QStringLiteral("选择同名片段"),
+                QStringLiteral("第 %1 行 · %2").arg(index + 1).arg(filename), names, 0, false, &selected);
+            if (selected)
+                row = candidates.at(names.indexOf(name));
+        }
+        if (row < 0) {
+            auto &list = candidates.isEmpty() ? missingAudio : ambiguous;
+            list.append(QStringLiteral("%1 · %2").arg(index + 1).arg(filename));
+            continue;
+        }
+        if (repeated.contains(row) || matches.contains(row)) {
+            repeated.insert(row);
+            matches.remove(row);
+            continue;
+        }
+        matches.insert(row, {fields[2].toLower(), fields[3]});
+    }
+    if (imported) {
+        QStringList unlabelled;
+        QStringList duplicateNames;
+        QStringList changes;
+        for (int row = 0; row < labels_->rowCount(); ++row) {
+            const auto name = labels_->item(row, 0)->text();
+            if (!matches.contains(row))
+                unlabelled.append(name);
+            else
+                changes.append(QStringLiteral("%1 · %2").arg(name, matches.value(row)[1]));
+            if (repeated.contains(row))
+                duplicateNames.append(name);
+        }
+        QMessageBox preview(QMessageBox::Information, QStringLiteral("标注导入差异"),
+            QStringLiteral("唯一匹配 %1 条，缺标片段 %2 条，音频缺失 %3 条，重复片段 %4 条，格式错误 %5 行，同名待确认 %6 条。")
+                .arg(matches.size()).arg(unlabelled.size()).arg(missingAudio.size()).arg(repeated.size())
+                .arg(malformed.size()).arg(ambiguous.size()),
+            QMessageBox::Apply | QMessageBox::Cancel, this);
+        preview.setDetailedText(QStringLiteral("将更新\n%1\n\n缺少标注\n%2\n\n找不到音频\n%3\n\n"
+            "重复条目\n%4\n\n格式错误行号\n%5\n\n同名待确认\n%6")
+            .arg(changes.join('\n'), unlabelled.join('\n'), missingAudio.join('\n'),
+                 duplicateNames.join('\n'), malformed.join(", "), ambiguous.join('\n')));
+        preview.button(QMessageBox::Apply)->setEnabled(!matches.isEmpty());
+        if (preview.exec() != QMessageBox::Apply)
+            return;
+    }
+    const QSignalBlocker block(labels_);
+    const auto drafts = project_.value("reviews").toObject();
+    for (int row = 0; row < labels_->rowCount(); ++row) {
+        const auto id = labels_->item(row, 0)->data(Qt::UserRole + 1).toString();
+        if (!imported && drafts.contains(id) && (!automatic || !labels_->item(row, 3)->text().isEmpty()
+                || labels_->item(row, 2)->text() == QStringLiteral("已排除")))
+            continue;
+        const auto found = matches.constFind(row);
+        if (found != matches.cend()) {
+            labels_->item(row, 1)->setText(found.value()[0]);
+            labels_->item(row, 3)->setText(found.value()[1]);
+            labels_->item(row, 2)->setText(imported || automatic ? QStringLiteral("待校对") : QStringLiteral("已校对"));
+        } else if (!imported && !automatic && drafts.isEmpty() && !matches.isEmpty()) {
+            labels_->item(row, 2)->setText(QStringLiteral("已排除"));
         }
     }
-    require(!matched.isEmpty(), QStringLiteral("标注中的文件名与项目切片不匹配"));
-    if (path == project_.value("annotation").toString()) {
-        for (int row = labels_->rowCount() - 1; row >= 0; --row) {
-            if (!matched.contains(row))
-                labels_->removeRow(row);
-        }
-    }
-    status_->setText(QStringLiteral("已载入 %1 条标注，请试听校对").arg(matched.size()));
+    if (imported)
+        reviewsDirty_ = true;
+    updateReviewFilter();
+    status_->setText(QStringLiteral("已载入 %1 条标注，可试听校对。").arg(matches.size()));
 }
 
 void TrainingPanel::saveLabels()
@@ -482,28 +847,43 @@ void TrainingPanel::saveLabels()
     QStringList rows;
     const QStringList supported{"zh", "en", "ja", "yue", "ko"};
     for (int row = 0; row < labels_->rowCount(); ++row) {
+        if (labels_->item(row, 2)->text() == QStringLiteral("已排除"))
+            continue;
         const auto ref = checkedPath(labels_->item(row, 0)->data(Qt::UserRole).toString());
         const auto lang = labels_->item(row, 1)->text().trimmed().toLower();
-        const auto text = labels_->item(row, 2)->text().trimmed();
+        const auto text = labels_->item(row, 3)->text().trimmed();
         require(!text.isEmpty() && !text.contains('|') && !text.contains('\n') && supported.contains(lang),
                 QStringLiteral("第 %1 条标注缺少文本、语言无效或含保留分隔符").arg(row + 1));
         rows.append(QStringList{ref, project_.value("speaker").toString(), lang, text}.join('|'));
     }
+    require(!rows.isEmpty(), QStringLiteral("请保留至少一个校对片段。"));
+    for (int row = 0; row < labels_->rowCount(); ++row) {
+        if (labels_->item(row, 2)->text() != QStringLiteral("已排除"))
+            labels_->item(row, 2)->setText(QStringLiteral("已校对"));
+    }
+    auto state = project_;
+    state["reviews"] = reviewDrafts();
     const auto content = rows.join('\n').toUtf8() + '\n';
     const auto previous = project_.value("annotation").toString();
     if (!previous.isEmpty()) {
         QFile file(checkedPath(previous));
-        if (file.open(QIODevice::ReadOnly) && file.readAll() == content)
+        if (file.open(QIODevice::ReadOnly) && file.readAll() == content) {
+            saveProject(state);
+            reviewsDirty_ = false;
+            updateReviewFilter();
             return;
+        }
     }
     const auto annotation = checkedPath(project_.value("directory").toString() + "/labels-" + newId() + ".list");
     QSaveFile out(annotation);
     require(out.open(QIODevice::WriteOnly) && out.write(content) == content.size() && out.commit(),
             QStringLiteral("无法保存校对结果"));
-    project_["annotation"] = annotation;
-    project_["experiment"] = "ez_" + newId();
-    invalidate(project_);
-    saveProject(project_);
+    invalidate(state);
+    state["annotation"] = annotation;
+    state.remove("annotation_automatic");
+    saveProject(state);
+    reviewsDirty_ = false;
+    updateReviewFilter();
     showState();
 }
 
@@ -522,6 +902,20 @@ void TrainingPanel::submit(const QString &operation, bool resume)
     request["batch"] = batch_->value();
     request["epochs"] = epochs_->value();
     request["source"] = project_.value(operation == "slice" ? "raw" : "clips");
+    if (operation == "slice" && project_.contains("raw_pending")) {
+        request["source"] = project_.value("raw_pending");
+        request["seed_clips"] = project_.value("clips");
+        const auto replaced = project_.value("replace_sliced_batches").toArray();
+        const auto groups = project_.value("sliced_from_batches").toObject();
+        QJsonArray discarded;
+        if (!replaced.isEmpty()) {
+            for (auto item = groups.constBegin(); item != groups.constEnd(); ++item) {
+                if (replaced.contains(item.value()))
+                    discarded.append(item.key());
+            }
+        }
+        request["discarded_clips"] = discarded;
+    }
     if (operation == "slice" || operation == "asr") {
         require(!request.value("source").toString().isEmpty(), QStringLiteral("请先导入该阶段所需的录音"));
         request["destination"] = project_.value("directory").toString() + "/" + operation + "-" + newId();
@@ -539,6 +933,8 @@ void TrainingPanel::submit(const QString &operation, bool resume)
         request["resume_job"] = previous;
     }
     auto state = project_;
+    if (operation == "slice" || operation == "asr")
+        state["reviews"] = reviewDrafts();
     if (training) {
         state["training_settings"] = QJsonObject{{"gpu", request.value("gpu")}, {"batch", request.value("batch")},
                                                   {"epochs", request.value("epochs")}};
@@ -559,34 +955,61 @@ void TrainingPanel::complete(const QString &id, const QJsonObject &result, bool 
         return;
     const auto launcher = query.value(0).toString();
     const auto operation = query.value(1).toString();
-    const auto request = QJsonDocument::fromJson(query.value(2).toByteArray()).object();
+    const auto request = readWorkspaceRecord(query.value(2).toByteArray());
     query.finish();
     query.prepare("SELECT state FROM projects WHERE id=?");
     query.addBindValue(request.value("id").toString());
     execute(query);
     if (!query.next())
         return;
-    auto state = QJsonDocument::fromJson(query.value(0).toByteArray()).object();
+    auto state = readWorkspaceRecord(query.value(0).toByteArray());
     query.finish();
     if (state.value("pending").toString() != id)
         return;
     state.remove("pending");
     if (operation == "slice") {
+        auto ids = state.value("clip_ids").toObject();
+        auto batches = state.value("sliced_from_batches").toObject();
+        const auto sourceBatches = state.value("raw_batches").toObject();
+        QSet<QString> names;
+        for (const auto &item : result.value("clips").toArray())
+            names.insert(QFileInfo(item.toString()).fileName());
+        for (const auto &name : ids.keys()) {
+            if (!names.contains(name))
+                ids.remove(name);
+        }
+        for (const auto &name : batches.keys()) {
+            if (!names.contains(name))
+                batches.remove(name);
+        }
+        for (const auto &item : result.value("added_clips").toArray()) {
+            const auto clip = item.toObject();
+            const auto name = clip.value("name").toString();
+            ids[name] = newId();
+            batches[name] = sourceBatches.value(clip.value("recording").toString()).toString("legacy");
+        }
+        state["clip_ids"] = ids;
+        state["sliced_from_batches"] = batches;
         state["clips"] = request.value("destination");
+        state.remove("raw_pending");
+        state.remove("pending_recordings");
+        state.remove("replace_sliced_batches");
         state.remove("annotation");
         invalidate(state);
     } else if (operation == "asr") {
         state["annotation"] = result.value("annotation");
+        state["annotation_automatic"] = true;
         state["experiment"] = "ez_" + newId();
         invalidate(state);
     } else if (operation == "prepare") {
         invalidate(state);
+        state.remove("training_recovery");
         state["experiment"] = request.value("experiment");
         state["dataset"] = result.value("dataset");
         const int sampleCount = result.value("sample_count").toInt();
         if (sampleCount > 0)
             state["sampleCount"] = sampleCount;
-        state["engine"] = launcher;
+        state["engine"] = resolvedEngineLauncher(launcher);
     } else if (operation == "train_sovits" || operation == "train_gpt") {
         state[operation == "train_sovits" ? "sovits" : "gpt"] = result.value("weight");
     }
@@ -594,8 +1017,11 @@ void TrainingPanel::complete(const QString &id, const QJsonObject &result, bool 
     const bool current = project_.value("id") == state.value("id");
     if (live && current && operation == "slice")
         readClips();
-    if (live && current && operation == "asr")
-        loadLabels(state.value("annotation").toString());
+    if (live && current && operation == "asr") {
+        loadLabels(state.value("annotation").toString(), true);
+        state["reviews"] = reviewDrafts();
+        saveProject(state);
+    }
     if (live && operation == "train_sovits") {
         auto next = request;
         next["operation"] = "train_gpt";
@@ -617,7 +1043,7 @@ void TrainingPanel::importVoice()
         {"ja", QStringLiteral("日文")}, {"ko", QStringLiteral("韩文")}, {"yue", QStringLiteral("粤语")}};
     auto values = project_;
     values["reference"] = clip->data(Qt::UserRole).toString();
-    values["prompt"] = labels_->item(row, 2)->text();
+    values["prompt"] = labels_->item(row, 3)->text();
     values["prompt_language"] = language.value(labels_->item(row, 1)->text());
     openVoice_(values);
 }
@@ -630,6 +1056,22 @@ bool TrainingPanel::busy() const
     query.prepare("SELECT 1 FROM jobs WHERE id=? AND state IN ('queued','running')");
     query.addBindValue(project_.value("pending").toString());
     return query.exec() && query.next();
+}
+
+bool TrainingPanel::eventFilter(QObject *watched, QEvent *event)
+{
+    if (event->type() == QEvent::KeyPress && (watched == labels_ || watched == labels_->viewport())) {
+        const auto &key = *static_cast<QKeyEvent *>(event);
+        if (key.key() == Qt::Key_Space && key.modifiers() == Qt::NoModifier) {
+            playClip_->click();
+            return true;
+        }
+        if (advanceReview(key)) {
+            saveNext_->click();
+            return true;
+        }
+    }
+    return QWidget::eventFilter(watched, event);
 }
 
 QString TrainingPanel::nextTrainingStage() const
@@ -652,7 +1094,7 @@ QString TrainingPanel::resumeJob(const QString &operation) const
     const QRegularExpression jobId("^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$");
     const QRegularExpression runId("^ez_[0-9a-f]{32}$");
     while (query.next()) {
-        const auto request = QJsonDocument::fromJson(query.value(2).toByteArray()).object();
+        const auto request = readWorkspaceRecord(query.value(2).toByteArray());
         if (request.value("id") != project_.value("id") || request.value("experiment") != project_.value("experiment"))
             continue;
         const auto id = query.value(0).toString();
@@ -696,7 +1138,16 @@ QString TrainingPanel::resumeJob(const QString &operation) const
 void TrainingPanel::showEvent(QShowEvent *event)
 {
     QWidget::showEvent(event);
-    showState();
+    if (!reviewsDirty_ && project_.contains("engine")
+        && resolvedEngineLauncher(project_.value("engine").toString()) != project_.value("engine").toString()) {
+        try {
+            loadProject();
+        } catch (const std::exception &error) {
+            status_->setText(QString::fromUtf8(error.what()));
+        }
+    } else {
+        showState();
+    }
 }
 
 void TrainingPanel::showState()
@@ -725,6 +1176,8 @@ void TrainingPanel::showState()
     } else if (active) {
         advise(nullptr, QStringLiteral("当前阶段已排队，等待引擎或前面的任务。可在「任务记录」取消。"));
         showActivity();
+    } else if (project_.contains("raw_pending")) {
+        advise(slice_, QStringLiteral("有新录音待切片。切片后可继续校对，已有片段的校对会保留。"));
     } else if (project_.contains("gpt") && project_.contains("sovits")) {
         advise(preview_, QStringLiteral("两份模型权重已完成。选一段清晰的参考录音，点「试听并入库」。"));
     } else if (canResume) {
@@ -736,7 +1189,8 @@ void TrainingPanel::showState()
         advise(train_, count > 0 ? QStringLiteral("%1 条训练样本已校验。确认显卡、批量和轮数后开始训练。").arg(count)
                                  : QStringLiteral("训练数据已就绪。确认显卡、批量和轮数后开始训练。"));
     } else if (project_.contains("annotation")) {
-        advise(prepare_, QStringLiteral("选中片段试听，双击「文本」校对。校对后点击「准备数据」，会自动保存标注。"));
+        advise(prepare_, project_.value("training_recovery").toString(
+            QStringLiteral("选中片段试听，双击「文本」校对。校对后点击「准备数据」，会自动保存标注。")));
     } else if (project_.contains("clips")) {
         advise(transcribe_, QStringLiteral("切片已就绪。可自动转写、导入已有标注，或双击「文本」手动填写。"));
     } else if (project_.contains("raw")) {

@@ -5,6 +5,7 @@
 #include "synthesis.h"
 #include "ui.h"
 #include "voiceverification.h"
+#include "workspacepaths.h"
 
 #include <QAction>
 #include <QComboBox>
@@ -102,7 +103,7 @@ QJsonObject readObject(const QVariant &value)
     const auto document = QJsonDocument::fromJson(value.toByteArray());
     if (!document.isObject())
         fail(QStringLiteral("素材库中有无法读取的引用记录。"));
-    return document.object();
+    return readWorkspaceRecord(value.toByteArray());
 }
 
 void addFile(Library &library, Kind kind, const QString &path, const QString &family = {},
@@ -198,7 +199,7 @@ Library readLibrary(QSqlDatabase database, const QString &root, bool scan)
         addFile(library, Annotation, request.value("annotation").toString(), {}, {}, project, id);
         if (query.value(4).toByteArray().isEmpty())
             continue;
-        const auto result = readObject(query.value(4));
+        const auto result = readWorkspaceResult(query.value(4).toByteArray(), request);
         addFile(library, Output, result.value("audio").toString(), family, voice, project, id);
         addFile(library, operation == "train_gpt" ? Gpt : SoVits, result.value("weight").toString(), family, {}, project, id);
         addFile(library, Annotation, result.value("annotation").toString(), {}, {}, project, id);

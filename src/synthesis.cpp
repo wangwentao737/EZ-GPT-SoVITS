@@ -3,6 +3,8 @@
 #include "jobs.h"
 #include "ui.h"
 #include "voiceverification.h"
+#include "scriptlines.h"
+#include "workspacepaths.h"
 
 #include <QAudioOutput>
 #include <QCheckBox>
@@ -255,6 +257,20 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
     export_->setEnabled(false);
     folder_->setEnabled(false);
     actions->addWidget(generate);
+    auto *script = new QPushButton(QStringLiteral("台词表"), this);
+    auto *toScript = new QPushButton(QStringLiteral("文本转为台词表"), this);
+    actions->addWidget(script);
+    actions->addWidget(toScript);
+    const auto showScript = [this](const QStringList &lines) {
+        try {
+            editScriptLines(this, scheduler_, launcher_(), voices_->currentData().toString(), lines,
+                [this](const QString &audio) { playAudio(audio); });
+        } catch (const std::exception &error) {
+            status_->setText(QString::fromUtf8(error.what()));
+        }
+    };
+    connect(script, &QPushButton::clicked, this, [showScript] { showScript({}); });
+    connect(toScript, &QPushButton::clicked, this, [this, showScript] { showScript(synthesisLines(text_->toPlainText())); });
     actions->addStretch(1);
     actions->addWidget(play_);
     actions->addWidget(export_);
@@ -352,7 +368,7 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
             query.prepare("INSERT INTO voices(id,name,settings) VALUES(?,?,?)");
             query.addBindValue(id);
             query.addBindValue(result.value("name").toString());
-            query.addBindValue(QJsonDocument(result).toJson(QJsonDocument::Compact));
+            query.addBindValue(QJsonDocument(storedWorkspacePaths(result)).toJson(QJsonDocument::Compact));
             execute(query);
             refreshVoices(id);
             status_->setText(QStringLiteral("声音已保存。输入短句生成试听，完成兼容性验证。"));
@@ -428,7 +444,7 @@ void SynthesisPanel::refreshVoices(const QString &selected)
     const QSignalBlocker block(voices_);
     voices_->clear();
     while (query.next()) {
-        const auto settings = QJsonDocument::fromJson(query.value(2).toByteArray()).object();
+        const auto settings = readWorkspaceRecord(query.value(2).toByteArray());
         const auto legacy = query.value(3).toString();
         const auto record = QJsonDocument::fromJson(query.value(4).toByteArray()).object();
         const auto state = voiceVerificationStatus(settings, record, legacy, launcher);
@@ -466,7 +482,7 @@ QJsonObject SynthesisPanel::selectedVoiceSettings() const
     execute(query);
     if (!query.next())
         throw std::runtime_error(QStringLiteral("声音预设已不存在").toStdString());
-    return QJsonDocument::fromJson(query.value(0).toByteArray()).object();
+    return readWorkspaceRecord(query.value(0).toByteArray());
 }
 
 QJsonObject SynthesisPanel::synthesisOptions() const
@@ -490,7 +506,7 @@ void SynthesisPanel::saveVoiceDefaults()
         settings["default_language"] = language_->currentText();
         QSqlQuery query;
         query.prepare("UPDATE voices SET settings=? WHERE id=?");
-        query.addBindValue(QJsonDocument(settings).toJson(QJsonDocument::Compact));
+        query.addBindValue(QJsonDocument(storedWorkspacePaths(settings)).toJson(QJsonDocument::Compact));
         query.addBindValue(voices_->currentData().toString());
         execute(query);
         refreshVoices();
@@ -709,7 +725,7 @@ void SynthesisPanel::receiveAudio(const QString &id, const QJsonObject &result)
     query.addBindValue(id);
     if (!query.exec() || !query.next())
         return;
-    const auto request = QJsonDocument::fromJson(query.value(0).toByteArray()).object();
+    const auto request = readWorkspaceRecord(query.value(0).toByteArray());
     const bool batch = !submittedBatch_.isEmpty();
     const bool visibleResult = batch ? request.value("batch_id").toString() == submittedBatch_
         : submittedJob_.isEmpty() || id == submittedJob_;
