@@ -1,5 +1,7 @@
 #pragma once
 
+#include "compatibility.h"
+
 #include <QElapsedTimer>
 #include <QFutureWatcher>
 #include <QJsonObject>
@@ -37,6 +39,7 @@ public:
     TaskScheduler(QString dataRoot, QString defaultOutputRoot, EngineManager &engine, QObject *parent = nullptr);
     ~TaskScheduler() override;
     QString enqueue(const QString &launcher, QJsonObject request, const QJsonObject &project = {});
+    QString enqueueTrial(const QString &launcher, const QJsonObject &request);
     QStringList enqueueBatch(const QString &launcher, const QList<QJsonObject> &requests);
     QString enqueueSynthesisBatch(const QString &launcher, QList<QJsonObject> requests);
     void startEngine(const QString &launcher);
@@ -45,6 +48,8 @@ public:
     void stop();
     bool running() const;
     const JobActivity &activity() const { return activity_; }
+    CompatibilityRegistry &compatibility() { return compatibility_; }
+    QString voiceIssue(const EngineInstallation &installation, QJsonObject voice, bool trial = false) const;
 
 signals:
     void changed();
@@ -56,7 +61,8 @@ signals:
 private:
     void next();
     void pollActivity();
-    QStringList enqueueRequests(const QString &launcher, const QList<QJsonObject> &requests, QJsonObject project = {});
+    QStringList enqueueRequests(const QString &launcher, const QList<QJsonObject> &requests,
+                                QJsonObject project = {}, bool trial = false);
     void failQueued(const QString &launcher, const QString &message);
     void finish(bool processSucceeded, QString message);
     void startArchive(QJsonObject result);
@@ -82,6 +88,7 @@ private:
     QJsonObject activeVoiceVersion_;
     QString activeEngineFingerprint_;
     EngineManager &engine_;
+    CompatibilityRegistry compatibility_;
     QProcess worker_;
     QProcess inferenceWorker_;
     QTimer inferenceTimeout_;

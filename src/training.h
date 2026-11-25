@@ -18,9 +18,16 @@ namespace ez {
 class TaskScheduler;
 
 class TrainingPanel final : public QWidget {
+    Q_OBJECT
 public:
     TrainingPanel(QString root, TaskScheduler &scheduler, std::function<QString()> launcher,
                   std::function<void(QJsonObject)> openVoice, QWidget *parent = nullptr);
+    void refreshEngineSelection();
+
+signals:
+    void engineDetailsRequested();
+    void engineRecheckRequested();
+    void engineSwitchRequested();
 
 private:
     void addProject();
@@ -70,6 +77,8 @@ private:
     QPushButton *suggested_ = nullptr;
     QLabel *status_ = nullptr;
     QLabel *stage_ = nullptr;
+    QLabel *compatibilityStatus_ = nullptr;
+    QWidget *compatibilityActions_ = nullptr;
     QMediaPlayer *player_ = nullptr;
 };
 

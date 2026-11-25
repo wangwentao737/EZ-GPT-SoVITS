@@ -8,11 +8,6 @@
     "GPT_SoVITS/s2_train_v3_lora.py": "9e1aa4a3b2f3450032831ca4a490dcfd13342f60c83ea2eaba36e4c987d99f4a",
     "GPT_SoVITS/s1_train.py": "fa499153871d8ba79dd9e07a4494c5844bfb67875c2791718ea0fd787353bbbe"
   },
-  "resume": {
-    "webui.py": "fb351d2094f48b3fef480a6bc2377043a91bbdd9a30cca1ba4b1e8da3d762330",
-    "GPT_SoVITS/s2_train_v3_lora.py": "9e1aa4a3b2f3450032831ca4a490dcfd13342f60c83ea2eaba36e4c987d99f4a",
-    "GPT_SoVITS/s1_train.py": "fa499153871d8ba79dd9e07a4494c5844bfb67875c2791718ea0fd787353bbbe"
-  },
   "operations": {
     "synthesize": ["switch_version", "change_choices", "change_tts_inference", "change_tts_inference_1"],
     "slice": ["open_slice", "close_slice"],

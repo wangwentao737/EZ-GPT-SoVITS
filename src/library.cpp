@@ -220,7 +220,7 @@ Library readLibrary(QSqlDatabase database, const QString &root, bool scan)
         }
     };
     scanCopies(assets + "/audio", {"*.wav", "*.flac", "*.mp3"}, Reference);
-    for (const auto &family : QStringList{"v5turbo", "v5dev", "v2", "v2Pro", "v2ProPlus"}) {
+    for (const auto &family : adapterFamilies()) {
         scanCopies(assets + "/models/" + family + "/GPT", {"*.ckpt"}, Gpt, family);
         scanCopies(assets + "/models/" + family + "/SoVITS", {"*.pth"}, SoVits, family);
     }

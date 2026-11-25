@@ -24,8 +24,11 @@
 #include <QMediaDevices>
 #include <QMediaPlayer>
 #include <QMessageBox>
+#include <QNetworkProxy>
 #include <QPushButton>
 #include <QSaveFile>
+#include <QScopeGuard>
+#include <QSignalSpy>
 #include <QSqlDatabase>
 #include <QSqlError>
 #include <QSqlQuery>
@@ -75,6 +78,141 @@ QString sha(const QString &path)
     QCryptographicHash hash(QCryptographicHash::Sha256);
     check(file.open(QIODevice::ReadOnly) && hash.addData(&file), "Cannot hash fixture");
     return QString::fromLatin1(hash.result().toHex());
+}
+
+void writeFixture(const QString &path, const QByteArray &contents = "fixture")
+{
+    check(QDir().mkpath(QFileInfo(path).path()), "Cannot create compatibility fixture directory");
+    QFile file(path);
+    check(file.open(QIODevice::WriteOnly) && file.write(contents) == contents.size(), "Cannot write compatibility fixture");
+}
+
+void engineCompatibility(const QDir &root)
+{
+    const auto data = root.filePath("compatibility");
+    const auto package = data + "/first/GPT-SoVITS";
+    const auto sameName = data + "/second/GPT-SoVITS";
+    const QString launcher = "/go-webui.bat";
+    const QString inference = "/GPT_SoVITS/inference_webui_fast.py";
+    const QString speaker = "/GPT_SoVITS/pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt";
+    for (const auto &file : QStringList{launcher, "/webui.py", "/config.py", "/runtime/python.exe", inference, speaker,
+             "/tools/slice_audio.py", "/GPT_SoVITS/pretrained_models/chinese-hubert-base/config.json",
+             "/GPT_SoVITS/pretrained_models/chinese-hubert-base/pytorch_model.bin",
+             "/GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large/config.json",
+             "/GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large/pytorch_model.bin",
+             "/GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large/tokenizer.json"})
+        writeFixture(package + file);
+    for (const auto &file : QStringList{launcher, "/webui.py", "/config.py", "/runtime/python.exe", inference})
+        writeFixture(sameName + file, "Different build");
+    writeFixture(data + "/compat-registry-v1.json", "{ broken first-run cache");
+
+    EngineManager engine;
+    CompatibilityRegistry registry(data, engine);
+    QFile baseline(":/compat/registry-v1.json");
+    check(baseline.open(QIODevice::ReadOnly), "Cannot load bundled registry");
+    auto updated = QJsonDocument::fromJson(baseline.readAll()).object();
+    const auto baselineRevision = updated.value("revision").toInt();
+    const auto nextRevision = baselineRevision + 1;
+    check(registry.revision() == baselineRevision && registry.inspect(package + launcher).package().isEmpty(),
+        "Offline baseline was not used");
+    auto packages = updated.value("packages").toArray();
+    const QJsonObject entry{{"id", "test-synthesis-only"}, {"name", "Synthesis-only fixture"},
+        {"identity_source", "Component test"}, {"adapter", defaultEngineAdapter()},
+        {"scripts", QJsonObject{{"go-webui.bat", sha(package + launcher)}, {"webui.py", sha(package + "/webui.py")},
+                                 {"GPT_SoVITS/inference_webui_fast.py", sha(package + inference)}}},
+        {"capabilities", QJsonArray{
+            QJsonObject{{"operation", "slice"}, {"resources", "20261006"}, {"result", "passed"}, {"report", "fixture"},
+                        {"scripts", QJsonObject{{"tools/slice_audio.py", sha(package + "/tools/slice_audio.py")}}}},
+            QJsonObject{{"operation", "synthesize"}, {"family", "v2"}, {"resources", "20261006"},
+                        {"result", "passed"}, {"report", "fixture"}},
+            QJsonObject{{"operation", "synthesize"}, {"family", "v2Pro"}, {"resources", "20261006"},
+                        {"result", "passed"}, {"report", "fixture"}}}}};
+    packages.append(entry);
+    updated["revision"] = nextRevision;
+    updated["packages"] = packages;
+    const auto candidate = QJsonDocument(updated).toJson();
+    registry.install(candidate);
+    check(registry.revision() == nextRevision && registry.install(candidate).contains(QStringLiteral("已是最新")),
+        "Registry revision was not refreshed or recognized on a repeat import");
+    const auto unsupportedLegacy = [&](const QString &operation, const QString &family) {
+        auto invalidRegistry = updated;
+        invalidRegistry["revision"] = nextRevision + 1;
+        auto invalidPackages = packages;
+        for (qsizetype index = 0; index < invalidPackages.size(); ++index) {
+            auto legacy = invalidPackages.at(index).toObject();
+            if (legacy.value("adapter") != "0725-cu124")
+                continue;
+            auto capabilities = legacy.value("capabilities").toArray();
+            capabilities.append(QJsonObject{{"operation", operation}, {"family", family}, {"resources", "20261006"},
+                                            {"result", "passed"}, {"report", "fixture"}});
+            legacy["capabilities"] = capabilities;
+            invalidPackages[index] = legacy;
+            break;
+        }
+        invalidRegistry["packages"] = invalidPackages;
+        return QJsonDocument(invalidRegistry).toJson();
+    };
+    for (const auto &invalid : {QByteArray("{ broken"), QByteArray(1024 * 1024 + 1, ' '),
+                                QJsonDocument(QJsonObject{{"format", 1}, {"revision", nextRevision + 1}}).toJson(),
+                                unsupportedLegacy("train_gpt", "v2"), unsupportedLegacy("synthesize", "v5turbo")}) {
+        bool rejected = false;
+        try {
+            registry.install(invalid);
+        } catch (const std::exception &) {
+            rejected = true;
+        }
+        check(rejected && registry.revision() == nextRevision, "An invalid import replaced an accepted revision");
+    }
+    CompatibilityRegistry reopened(data, engine);
+    check(reopened.revision() == nextRevision && reopened.inspect(package + launcher).package() == "test-synthesis-only",
+        "A valid revision did not persist across restart");
+    {
+        const auto previous = QNetworkProxy::applicationProxy();
+        const auto restore = qScopeGuard([&] { QNetworkProxy::setApplicationProxy(previous); });
+        QNetworkProxy::setApplicationProxy(QNetworkProxy(QNetworkProxy::HttpProxy, "127.0.0.1", 1));
+        QSignalSpy result(&reopened, &CompatibilityRegistry::updateFinished);
+        reopened.checkOnline();
+        check(result.wait(14000) && result.first().first().toString().contains(QStringLiteral("继续使用修订 %1").arg(nextRevision))
+            && reopened.revision() == nextRevision, "Network failure did not preserve the last good registry");
+    }
+    check(reopened.inspect(sameName + launcher).package().isEmpty(), "Directory name created a false match");
+    const auto renamed = data + "/first/Renamed build";
+    check(QDir().rename(package, renamed), "Cannot rename engine fixture");
+    writeFixture(renamed + launcher, "@rem Changed local launch arguments");
+    writeFixture(renamed + "/config.py", "webui_port_main = 19874\nwebui_port_infer_tts = 19872\n");
+    auto installation = reopened.inspect(renamed + launcher);
+    check(installation.package() == "test-synthesis-only" && !installation.identityNote.isEmpty()
+        && enginePorts(renamed, installation.adapter).inference == 19872,
+        "Renaming or local launcher and port edits invalidated the identity");
+    check(installation.families({"synthesize"}) == QStringList{"v2Pro", "v2"}
+        && installation.families({"prepare", "train_sovits", "train_gpt"}).isEmpty(),
+        "A synthesis-only family was exposed for full training");
+    check(QFile::remove(renamed + speaker), "Cannot remove capability-specific asset");
+    installation = reopened.inspect(renamed + launcher);
+    check(installation.families({"synthesize"}) == QStringList{"v2"}
+        && installation.issue("synthesize", "v2Pro").contains(speaker.mid(1)),
+        "A missing speaker resource changed unrelated choices or lost its path");
+    writeFixture(renamed + speaker);
+    check(reopened.inspect(renamed + launcher).families({"synthesize"}) == QStringList{"v2Pro", "v2"},
+        "Restoring a resource did not restore availability");
+    reopened.recordInferenceIssue(renamed + launcher, installation.fingerprint, "v2", "Recorded inference contract conflict");
+    installation = reopened.inspect(renamed + launcher);
+    check(installation.families({"synthesize"}) == QStringList{"v2Pro"} && installation.issue("slice").isEmpty(),
+        "An observed inference conflict was ignored or disabled other capabilities");
+    reopened.clearInterfaceIssues(renamed + launcher);
+    check(!reopened.inspect(renamed + launcher).families({"synthesize"}).isEmpty(), "Re-detection did not invalidate the conflict");
+    writeFixture(renamed + "/tools/slice_audio.py", "Changed slicer");
+    installation = reopened.inspect(renamed + launcher);
+    check(installation.issue("slice").contains("tools/slice_audio.py") && !installation.families({"synthesize"}).isEmpty(),
+        "A changed operation script affected the wrong capability");
+    writeFixture(renamed + "/tools/slice_audio.py");
+    writeFixture(renamed + inference, "Changed inference script");
+    installation = reopened.inspect(renamed + launcher);
+    check(installation.families({"synthesize"}).isEmpty() && installation.issue("slice").isEmpty()
+        && installation.issue("synthesize", "v2").contains(inference.mid(1)),
+        "The changed inference script was not isolated from package operations");
+    writeFixture(renamed + "/webui.py", "Changed main script");
+    check(reopened.inspect(renamed + launcher).package().isEmpty(), "An in-place upgrade retained registration");
 }
 
 void recordings(const QDir &root)
@@ -410,11 +548,12 @@ int main(int argc, char **argv)
     try {
         check(scratch.isValid(), "Cannot create temporary project fixtures");
         const QDir root(scratch.path());
+        engineCompatibility(root);
         recordings(root);
         exports(root);
         trainingReview(root);
         scriptReview(root);
-        QTextStream(stdout) << "Recording append, failed/cancelled copy, Qt label review, script revision and mixed-rate WAV export passed."
+        QTextStream(stdout) << "Compatibility registry, recording append, failed/cancelled copy, Qt label review, script revision and mixed-rate WAV export passed."
                             << Qt::endl;
     } catch (const std::exception &error) {
         QTextStream(stderr) << error.what() << Qt::endl;

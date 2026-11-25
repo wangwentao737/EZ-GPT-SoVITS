@@ -9,6 +9,7 @@
 #include <QMenu>
 #include <QPersistentModelIndex>
 #include <QPointer>
+#include <QPushButton>
 #include <QTableWidget>
 #include <QVBoxLayout>
 #include <functional>
@@ -264,6 +265,24 @@ void enableRowMenu(QTableWidget *table, const QList<QAbstractButton *> &buttons,
                    const QList<QAction *> &actions)
 {
     new TableRowMenu(table, buttons, actions);
+}
+
+QWidget *engineCompatibilityActions(QWidget *parent, const std::function<void()> &details,
+                                    const std::function<void()> &recheck, const std::function<void()> &switchPack)
+{
+    auto *widget = new QWidget(parent);
+    auto *row = new QHBoxLayout(widget);
+    row->setContentsMargins(0, 0, 0, 0);
+    const auto add = [widget, row](const QString &label, const std::function<void()> &action) {
+        auto *button = new QPushButton(label, widget);
+        row->addWidget(button);
+        QObject::connect(button, &QPushButton::clicked, widget, action);
+    };
+    add(QStringLiteral("查看引擎详情"), details);
+    add(QStringLiteral("重新检测"), recheck);
+    add(QStringLiteral("切换整合包"), switchPack);
+    row->addStretch();
+    return widget;
 }
 
 }

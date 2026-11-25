@@ -92,7 +92,8 @@ void initDatabase(const QString &root)
     ez::initWorkspaceSettings();
 }
 
-void startProbeJob(QProcess &worker, const ez::EngineManager &engine, const QString &root, const QString &requestPath)
+void startProbeJob(QProcess &worker, const ez::EngineManager &engine, const ez::EngineInstallation &installation,
+                   const QString &root, const QString &requestPath)
 {
     QFile source(ez::checkedPath(requestPath));
     if (!source.open(QIODevice::ReadOnly))
@@ -100,6 +101,10 @@ void startProbeJob(QProcess &worker, const ez::EngineManager &engine, const QStr
     auto request = QJsonDocument::fromJson(source.readAll()).object();
     if (request.value("operation").toString().isEmpty())
         throw std::runtime_error("The test request must name an operation.");
+    const auto issue = installation.issue(ez::compatibilityOperation(request), request.value("family").toString(),
+        request.value("asr_language").toString("zh"));
+    if (!issue.isEmpty())
+        throw std::runtime_error(issue.toStdString());
 
     ez::startJobProcess(worker, engine, root, root + "/probe-job", request);
 }
@@ -190,7 +195,7 @@ public:
         homeLayout->addWidget(engineLocation_);
         auto *selector = new QHBoxLayout;
         family_ = new QComboBox(this);
-        family_->addItems({"v5turbo", "v5dev", "v2Pro", "v2ProPlus", "v2"});
+        family_->addItems(ez::adapterFamilies());
         selector->addWidget(new QLabel(QStringLiteral("检查模型家族"), home));
         selector->addWidget(family_);
         checkVoice_ = new QComboBox(home);
@@ -257,6 +262,20 @@ public:
                 tabs->setCurrentWidget(synthesis);
                 synthesis->importVoice(settings);
             }, tabs);
+        const auto switchPack = [tabs, settings] { tabs->setCurrentWidget(settings); };
+        connect(synthesis, &ez::SynthesisPanel::engineDetailsRequested, this, &Workspace::showEngineDetails);
+        connect(training, &ez::TrainingPanel::engineDetailsRequested, this, &Workspace::showEngineDetails);
+        connect(synthesis, &ez::SynthesisPanel::engineRecheckRequested, this, &Workspace::recheckEngine);
+        connect(training, &ez::TrainingPanel::engineRecheckRequested, this, &Workspace::recheckEngine);
+        connect(synthesis, &ez::SynthesisPanel::engineSwitchRequested, tabs, switchPack);
+        connect(training, &ez::TrainingPanel::engineSwitchRequested, tabs, switchPack);
+        refreshSelection_ = [synthesis, training] {
+            synthesis->refreshEngineSelection();
+            training->refreshEngineSelection();
+        };
+        connect(profiles_, &QComboBox::currentIndexChanged, this, [this] { refreshSelection_(); });
+        connect(&scheduler_->compatibility(), &ez::CompatibilityRegistry::changed, this, [this] { resetReport(); });
+        connect(&scheduler_->compatibility(), &ez::CompatibilityRegistry::updateFinished, status_, &QLabel::setText);
         tabs->addTab(training, QStringLiteral("训练项目"));
         tabs->addTab(ez::createLibraryPage(root_, defaultOutput_, *scheduler_, synthesis, tabs), QStringLiteral("声音与素材"));
         tabs->addTab(createHistory(tabs, synthesis), QStringLiteral("任务记录"));
@@ -374,6 +393,7 @@ private:
     QLineEdit *enginePath_ = nullptr;
     QLabel *engineLocation_ = nullptr;
     QLabel *engineBadge_ = nullptr;
+    QLabel *registryRevision_ = nullptr;
     QPlainTextEdit *report_ = nullptr;
     QLabel *status_ = nullptr;
     QPushButton *check_ = nullptr;
@@ -383,6 +403,7 @@ private:
     QPushButton *start_ = nullptr;
     QPushButton *addEngine_ = nullptr;
     ez::TaskScheduler *scheduler_ = nullptr;
+    std::function<void()> refreshSelection_;
 
     QString logPath() const { return root_ + "/engine-start.log"; }
     QString currentLauncher() const { return profiles_->currentData().toString(); }
@@ -412,7 +433,7 @@ private:
             return form;
         };
         auto *engineForm = section(QStringLiteral("GPT-SoVITS 引擎"),
-            QStringLiteral("点「添加启动路径」，选择整合包目录中的 go-webui.bat，再回工作台启动。"));
+            QStringLiteral("选择整合包目录中的 go-webui.bat，EZ 会检测构建并列出可用功能。"));
         auto *options = new QHBoxLayout;
         options->setSpacing(8);
         profiles_ = new QComboBox(page);
@@ -420,16 +441,46 @@ private:
         addEngine_ = new QPushButton(QStringLiteral("添加启动路径"), page);
         auto *moveEngine = new QPushButton(QStringLiteral("重新定位引擎"), page);
         auto *engineDetails = new QPushButton(QStringLiteral("引擎详情"), page);
+        auto *recheck = new QPushButton(QStringLiteral("重新检测"), page);
         options->addWidget(profiles_, 1);
         options->addWidget(addEngine_);
         options->addWidget(moveEngine);
         options->addWidget(engineDetails);
+        options->addWidget(recheck);
         engineForm->addRow(QStringLiteral("当前引擎"), options);
 
         enginePath_ = new QLineEdit(page);
         enginePath_->setReadOnly(true);
         enginePath_->setPlaceholderText(QStringLiteral("请选择已安装的 GPT-SoVITS 中的 go-webui.bat"));
         engineForm->addRow(QStringLiteral("引擎启动文件"), enginePath_);
+        auto *registryActions = new QHBoxLayout;
+        registryRevision_ = ez::ui::hint({}, page);
+        auto *updateRegistry = new QPushButton(QStringLiteral("检查兼容清单更新"), page);
+        auto *importRegistry = new QPushButton(QStringLiteral("导入兼容清单"), page);
+        registryActions->addWidget(registryRevision_, 1);
+        registryActions->addWidget(updateRegistry);
+        registryActions->addWidget(importRegistry);
+        engineForm->addRow(QStringLiteral("兼容清单"), registryActions);
+        connect(recheck, &QPushButton::clicked, this, &Workspace::recheckEngine);
+        connect(updateRegistry, &QPushButton::clicked, this, [this] {
+            status_->setText(QStringLiteral("正在从 GitHub 检查兼容清单…"));
+            scheduler_->compatibility().checkOnline();
+        });
+        connect(importRegistry, &QPushButton::clicked, this, [this] {
+            const auto path = QFileDialog::getOpenFileName(this, QStringLiteral("导入兼容清单"),
+                {}, QStringLiteral("兼容清单 (*.json)"));
+            if (path.isEmpty())
+                return;
+            try {
+                QFile file(ez::checkedPath(path));
+                if (!file.open(QIODevice::ReadOnly))
+                    throw std::runtime_error(file.errorString().toStdString());
+                status_->setText(scheduler_->compatibility().install(file.read(1024 * 1024 + 1)));
+            } catch (const std::exception &error) {
+                status_->setText(QStringLiteral("%1 继续使用修订 %2。")
+                    .arg(failureMessage(error)).arg(scheduler_->compatibility().revision()));
+            }
+        });
         auto *outputForm = section(QStringLiteral("文件位置"),
             QStringLiteral("默认保存在程序同级的 data 文件夹。更改生成目录只影响随后提交的合成任务。"));
         const auto savedOutput = ez::workspaceSetting("outputRoot");
@@ -574,7 +625,7 @@ private:
         layout->addWidget(summary);
         auto *selectors = new QFormLayout;
         auto *family = new QComboBox(&dialog);
-        family->addItems({"v5turbo", "v5dev", "v2Pro", "v2ProPlus", "v2"});
+        family->addItems(ez::adapterFamilies(scheduler_->compatibility().inspect(launcher).adapter));
         family->setCurrentText(family_->currentText());
         auto *voices = new QComboBox(&dialog);
         QSqlQuery presets("SELECT id,name,settings FROM voices ORDER BY name");
@@ -596,58 +647,58 @@ private:
         layout->addWidget(table, 1);
         auto *actions = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
         auto *start = actions->addButton(QStringLiteral("启动并检查"), QDialogButtonBox::ActionRole);
+        auto *recheck = actions->addButton(QStringLiteral("重新检测"), QDialogButtonBox::ActionRole);
         auto *trial = actions->addButton(QStringLiteral("用当前声音试合成一句"), QDialogButtonBox::ActionRole);
         auto *notice = ez::ui::hint({}, &dialog);
         layout->addWidget(notice);
         layout->addWidget(actions);
         connect(actions, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
 
-        const QStringList operations{"start", "slice", "asr", "prepare", "synthesize", "train_sovits", "train_gpt", "resume"};
+        const auto operations = ez::compatibilityOperations();
         const auto refresh = [&, this] {
             try {
-                const auto fingerprint = ez::engineFingerprint(directory);
-                const auto ports = ez::enginePorts(directory);
-                const bool ready = engine_.ready() && engine_.root() == directory;
-                summary->setText(QStringLiteral("%1 · 主服务 %2 · 推理服务 %3 · Gradio %4\nSHA-256 %5")
-                    .arg(directory).arg(ports.main).arg(ports.inference)
-                    .arg(ready ? engine_.gradioVersion() : QStringLiteral("待检查"), fingerprint));
+                const auto installation = scheduler_->compatibility().inspect(launcher);
+                const auto ports = ez::enginePorts(directory, installation.adapter);
+                summary->setText(QStringLiteral("%1\n%2\n适配器 %3 · 清单修订 %4 · 主服务 %5 · 推理服务 %6 · Gradio %7\nSHA-256 %8")
+                    .arg(directory, installation.description(), installation.adapter)
+                    .arg(scheduler_->compatibility().revision()).arg(ports.main).arg(ports.inference)
+                    .arg(installation.connected ? engine_.gradioVersion() : QStringLiteral("待检查"), installation.fingerprint));
                 start->setEnabled(!engine_.active());
-                trial->setEnabled(voices->currentIndex() >= 0 && (!engine_.active() || ready)
-                    && engine_.interfaceIssue("synthesize").isEmpty());
+                recheck->setEnabled(!scheduler_->running());
+                const auto voice = ez::readWorkspaceRecord(voices->currentData(Qt::UserRole + 1).toByteArray());
+                const auto trialIssue = voice.isEmpty() ? QStringLiteral("请先选择已导入的声音。")
+                    : scheduler_->voiceIssue(installation, voice, true);
+                trial->setEnabled(trialIssue.isEmpty());
+                trial->setToolTip(trialIssue);
                 table->setRowCount(operations.size());
                 const auto selectedFamily = family->currentText();
                 for (int row = 0; row < operations.size(); ++row) {
                     const auto operation = operations[row];
-                    const auto label = operation == "resume" ? QStringLiteral("断点续训") : ez::operationLabel(operation);
-                    const auto interfaceIssue = ready
-                        ? engine_.interfaceIssue(operation == "resume" ? "train_sovits" : operation) : QString();
-                    const auto resources = operation == "resume" ? ez::resumeEngineIssue(directory, selectedFamily)
-                        : ez::resourceIssue(directory, operation, selectedFamily);
-                    QString status = QStringLiteral("待检查");
-                    QString detail = QStringLiteral("启动引擎后检查接口。");
-                    if (!interfaceIssue.isEmpty() || (operation == "resume" && !resources.isEmpty())) {
-                        status = QStringLiteral("接口有变化");
-                        detail = interfaceIssue.isEmpty() ? resources : interfaceIssue;
-                    } else if (!resources.isEmpty()) {
-                        status = QStringLiteral("资源缺失");
-                        detail = resources;
-                    } else if (ready) {
-                        status = operation == "start" ? QStringLiteral("实测通过") : QStringLiteral("接口已识别");
-                        detail = operation == "resume" ? QStringLiteral("每个项目还需校验输入签名和检查点。")
-                            : QStringLiteral("资源与调用契约已核对。");
-                    }
-                    if (status != QStringLiteral("资源缺失") && status != QStringLiteral("接口有变化") && operation != "start") {
+                    const auto label = ez::operationLabel(operation);
+                    auto detail = installation.issue(operation, selectedFamily);
+                    QString status = QStringLiteral("不可用");
+                    if (detail.isEmpty()) {
+                        status = QStringLiteral("已登记 · 可选");
+                        detail = installation.report(operation, selectedFamily);
+                        if (operation.startsWith("resume_"))
+                            detail += QStringLiteral("\n需核对当前项目的输入签名和检查点。");
+                    } else if (operation == "start" && installation.connected) {
+                        status = QStringLiteral("本机已启动");
+                    } else if (operation == "synthesize" && installation.entry.isEmpty()
+                               && !installation.interfaces.contains("synthesize")
+                               && !installation.interfaces.contains("synthesize_fast/" + selectedFamily)) {
+                        if (installation.connected && installation.issue(operation, selectedFamily, "zh", true).isEmpty())
+                            status = QStringLiteral("主服务接口已识别");
                         QSqlQuery proof;
-                        proof.prepare("SELECT created,request FROM jobs WHERE state='succeeded' AND launcher=? COLLATE NOCASE "
+                        proof.prepare("SELECT created FROM jobs WHERE state='succeeded' AND launcher=? COLLATE NOCASE "
                             "AND json_extract(CAST(result AS TEXT),'$.engine_fingerprint')=? "
-                            "AND (operation=? OR (?='resume' AND json_extract(CAST(result AS TEXT),'$.resume_epoch')>0)) "
-                            "AND (? IN ('slice','asr') OR json_extract(CAST(request AS TEXT),'$.family')=?) ORDER BY rowid DESC LIMIT 1");
-                        for (const auto &value : {launcher, fingerprint, operation, operation, operation, selectedFamily})
+                            "AND operation='synthesize' AND json_extract(CAST(request AS TEXT),'$.compatibility_trial')=1 "
+                            "AND json_extract(CAST(request AS TEXT),'$.family')=? ORDER BY rowid DESC LIMIT 1");
+                        for (const auto &value : {launcher, installation.fingerprint, selectedFamily})
                             proof.addBindValue(value);
                         if (proof.exec() && proof.next()) {
-                            const auto request = QJsonDocument::fromJson(proof.value(1).toByteArray()).object();
-                            detail = proof.value(0).toString() + " " + request.value("name").toString();
-                            status = QStringLiteral("实测通过");
+                            detail = QStringLiteral("%1 · 常规合成尚未登记。").arg(proof.value(0).toString());
+                            status = QStringLiteral("本机试音通过");
                         }
                     }
                     for (const auto &[column, text] : {std::pair{0, label}, {1, status}, {2, detail.simplified()}}) {
@@ -661,6 +712,7 @@ private:
             }
         };
         connect(start, &QPushButton::clicked, &dialog, [this, launcher] { scheduler_->startEngine(launcher); });
+        connect(recheck, &QPushButton::clicked, &dialog, [this] { recheckEngine(); });
         QString trialJob;
         connect(trial, &QPushButton::clicked, &dialog, [&, this] {
             try {
@@ -677,15 +729,17 @@ private:
                 request["name"] = voices->currentText();
                 request["text"] = line;
                 request["language"] = language;
-                request["compatibility_trial"] = true;
                 family->setCurrentText(request.value("family").toString());
-                trialJob = scheduler_->enqueue(launcher, request);
+                trialJob = scheduler_->enqueueTrial(launcher, request);
                 notice->setText(QStringLiteral("试音已提交，可在「任务记录」试听 WAV。"));
             } catch (const std::exception &error) {
                 notice->setText(failureMessage(error));
             }
         });
         connect(family, &QComboBox::currentIndexChanged, &dialog, refresh);
+        connect(voices, &QComboBox::currentIndexChanged, &dialog, refresh);
+        connect(&scheduler_->compatibility(), &ez::CompatibilityRegistry::changed, &dialog, refresh);
+        connect(scheduler_, &ez::TaskScheduler::changed, &dialog, refresh);
         connect(&engine_, &ez::EngineManager::statusChanged, &dialog, [&, this](const QString &message) {
             notice->setText(message);
             refresh();
@@ -1104,8 +1158,12 @@ private:
         const bool selected = !currentLauncher().isEmpty();
         enginePath_->setText(QDir::toNativeSeparators(currentLauncher()));
         enginePath_->setToolTip(enginePath_->text());
-        engineLocation_->setText(selected ? QStringLiteral("当前引擎：%1").arg(QDir::toNativeSeparators(currentLauncher()))
+        const auto installation = scheduler_->compatibility().inspect(currentLauncher());
+        registryRevision_->setText(QStringLiteral("修订 %1").arg(scheduler_->compatibility().revision()));
+        engineLocation_->setText(selected ? QStringLiteral("%1\n%2").arg(installation.description(),
+                                               QDir::toNativeSeparators(currentLauncher()))
             : QStringLiteral("请在「设置」中添加 GPT-SoVITS 引擎路径。"));
+        engineBadge_->setToolTip(engine_.active() ? engine_.root() : QString());
         engineBadge_->setText(engine_.ready() ? QStringLiteral("引擎可使用") : engine_.active() ? QStringLiteral("引擎正在启动")
             : selected ? QStringLiteral("引擎未启动") : QStringLiteral("引擎未配置"));
         check_->setEnabled(selected && !checking_);
@@ -1117,8 +1175,8 @@ private:
         checkVoice_->setEnabled(!checking_);
         start_->setEnabled(selected || engine_.active());
         start_->setText(engine_.active() ? QStringLiteral("停止引擎") : QStringLiteral("启动引擎"));
-        profiles_->setEnabled(!engine_.active() && !checking_);
-        addEngine_->setEnabled(!engine_.active() && !checking_);
+        profiles_->setEnabled(!checking_);
+        addEngine_->setEnabled(!checking_);
     }
 
     void reloadProfiles(const QString &selected = {})
@@ -1136,7 +1194,29 @@ private:
         const int match = profiles_->findData(saved);
         profiles_->setCurrentIndex(match >= 0 ? match : (profiles_->count() ? 0 : -1));
         resetReport();
-        refreshActions();
+        refreshSelection_();
+    }
+
+    void recheckEngine()
+    {
+        const auto launcher = currentLauncher();
+        if (launcher.isEmpty()) {
+            status_->setText(QStringLiteral("请在「设置」中选择整合包。"));
+            return;
+        }
+        const bool selectedIsRunning = engine_.active()
+            && QString::compare(engine_.root() + "/go-webui.bat", launcher, Qt::CaseInsensitive) == 0;
+        if (selectedIsRunning && (!engine_.ready() || scheduler_->running())) {
+            status_->setText(QStringLiteral("当前引擎正在工作。任务结束后可重新核对运行接口。"));
+            return;
+        }
+        scheduler_->compatibility().clearInterfaceIssues(launcher);
+        if (selectedIsRunning) {
+            engine_.stop();
+            scheduler_->startEngine(launcher);
+        } else
+            status_->setText(QStringLiteral("已重新检测当前整合包的脚本和本机资源。"));
+        checkEngine({});
     }
 
     void addEngine()
@@ -1244,13 +1324,13 @@ private:
             const auto configured = ez::workspaceSetting("outputRoot");
             const auto output = configured.isEmpty() ? defaultOutput_ : configured;
             const auto voice = ez::readWorkspaceRecord(checkVoice_->currentData(Qt::UserRole + 1).toByteArray());
-            const auto interfaces = engine_.interfaceIssues();
-            auto devices = engine_.devices();
+            const auto installation = scheduler_->compatibility().inspect(launcher);
+            auto devices = installation.connected ? engine_.devices() : QString();
             if (devices.isEmpty())
-                devices = engine_.ready() ? QStringLiteral("此引擎未报告设备信息") : QStringLiteral("启动引擎后可查看");
+                devices = installation.connected ? QStringLiteral("此引擎未报告设备信息") : QStringLiteral("启动当前引擎后可查看");
             const auto heading = QStringLiteral("引擎 · %1\n模型家族 · %2\n设备 · %3").arg(launcher, family, devices);
-            beginInspection(QStringLiteral("正在检查资源…"), [this, launcher, family, root, output, voice, interfaces, only, heading] {
-                const auto checks = ez::inspectResources(launcher, family, root, output, voice, interfaces, only, cancelled_);
+            beginInspection(QStringLiteral("正在检查资源…"), [this, launcher, family, root, output, voice, installation, only, heading] {
+                const auto checks = ez::inspectResources(launcher, family, root, output, voice, installation, only, cancelled_);
                 return InspectionResult{checks, heading, QStringLiteral("已取消资源检查"), only.isEmpty()};
             });
         } catch (const std::exception &error) {
@@ -1438,6 +1518,8 @@ int main(int argc, char **argv)
                 }
                 return app.exec();
             }
+            const auto launcher = parser.value(probeOption);
+            ez::CompatibilityRegistry registry(root, engine);
             QProcess worker;
             QObject::connect(&worker, &QProcess::errorOccurred, &app, [&app] { app.exit(3); });
             QObject::connect(&worker, &QProcess::finished, &app,
@@ -1452,7 +1534,7 @@ int main(int argc, char **argv)
                         return;
                     }
                     try {
-                        startProbeJob(worker, engine, root, parser.value(jobOption));
+                        startProbeJob(worker, engine, registry.inspect(launcher), root, parser.value(jobOption));
                     } catch (const std::exception &error) {
                         if (result.isOpen())
                             result.write(failureMessage(error).toUtf8() + '\n');
@@ -1462,7 +1544,7 @@ int main(int argc, char **argv)
                     app.exit(2);
                 }
             });
-            engine.start(parser.value(probeOption), root + "/engine-start.log");
+            engine.start(launcher, root + "/engine-start.log", registry.inspect(launcher).adapter);
             return app.exec();
         }
         Workspace window(root, defaultOutput);

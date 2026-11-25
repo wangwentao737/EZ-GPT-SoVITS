@@ -22,7 +22,8 @@ import soundfile
 MODELS = "GPT_SoVITS/pretrained_models"
 BERT = f"{MODELS}/chinese-roberta-wwm-ext-large"
 HUBERT = f"{MODELS}/chinese-hubert-base"
-CONTRACT = json.loads(Path(__file__).with_name("20261006-contract.json").read_text(encoding="utf-8"))
+ADAPTERS = {"20261006": "20261006-contract.json", "0725-cu124": "0725-cu124-contract.json"}
+CONTRACT = None
 SPLITS = ("不切", "凑四句一切", "凑50字一切", "按中文句号。切", "按英文句号.切", "按标点符号切")
 FAMILIES = {
     "v2": (
@@ -34,12 +35,9 @@ FAMILIES = {
     "v5dev": ("s1v3.ckpt", "gsv-v5-pretrained/s2Gv5dev.pth"),
     "v5turbo": ("s1v3.ckpt", "gsv-v5-pretrained/s2Gv5turbo.pth"),
 }
-RESUME_WEBUI = "fb351d2094f48b3fef480a6bc2377043a91bbdd9a30cca1ba4b1e8da3d762330"
 RESUME_TRAINERS = {
-    "train_sovits": ("GPT_SoVITS/s2_train_v3_lora.py",
-                     "9e1aa4a3b2f3450032831ca4a490dcfd13342f60c83ea2eaba36e4c987d99f4a"),
-    "train_gpt": ("GPT_SoVITS/s1_train.py",
-                  "fa499153871d8ba79dd9e07a4494c5844bfb67875c2791718ea0fd787353bbbe"),
+    "train_sovits": "GPT_SoVITS/s2_train_v3_lora.py",
+    "train_gpt": "GPT_SoVITS/s1_train.py",
 }
 
 
@@ -98,24 +96,42 @@ class Cancelled(Exception):
     pass
 
 
+class InterfaceChanged(ValueError):
+    pass
+
+
 def check_cancel(marker):
     if marker is not None and marker.exists():
         raise Cancelled
 
 
-def invoke(client, endpoint, *arguments, cancel=None, stop=None, on_wait=None):
-    matches = [item for item in client.config["dependencies"] if item["api_name"] == endpoint]
-    expected = CONTRACT["main"].get(endpoint) or CONTRACT["inference"].get(endpoint)
+def verify_interface(client, endpoint, expected):
+    matches = [item for item in client.config["dependencies"] if item.get("api_name") == endpoint]
+    if len(matches) != 1:
+        raise InterfaceChanged(f"接口已变化：{endpoint} 缺失或重名。")
     info = client.view_api(return_format="dict", print_info=False)["named_endpoints"].get(f"/{endpoint}", {})
-    if expected is None or len(matches) != 1 or len(matches[0]["inputs"]) != len(arguments):
-        raise ValueError(f"目标引擎接口与适配契约不一致：{endpoint}")
+    expected_count = len(expected["inputs"])
+    component_ids = matches[0]["inputs"]
+    parameters = info.get("parameters", ())
+    if len(component_ids) != expected_count or len(parameters) != expected_count:
+        raise InterfaceChanged(f"接口已变化：{endpoint} 有 {len(component_ids)} 项入参，适配契约需要 {expected_count} 项。")
     components = {item["id"]: item for item in client.config["components"]}
-    inputs = [[param["parameter_name"], param["component"], param["type"].get("type"),
-               components[component]["props"].get("label", "")]
-              for param, component in zip(info.get("parameters", ()), matches[0]["inputs"])]
+    for index, (parameter, component_id, required) in enumerate(zip(parameters, component_ids, expected["inputs"]), 1):
+        component = components.get(component_id, {})
+        observed = [parameter["parameter_name"], parameter["component"], parameter["type"].get("type"),
+                    component.get("props", {}).get("label", "")]
+        if observed != required or component.get("type", "").casefold() != parameter["component"].casefold():
+            raise InterfaceChanged(f"接口已变化：{endpoint} 第 {index} 项入参的顺序、类型或控件不一致。")
     returns = [[item["component"], item["type"].get("type")] for item in info.get("returns", ())]
-    if inputs != expected["inputs"] or returns != expected["returns"]:
-        raise ValueError(f"目标引擎接口的入参顺序、类型或返回结构已变化：{endpoint}")
+    if returns != expected["returns"]:
+        raise InterfaceChanged(f"接口已变化：{endpoint} 的返回结构与适配契约不一致。")
+
+
+def invoke(client, endpoint, *arguments, cancel=None, stop=None, on_wait=None):
+    expected = CONTRACT["main"].get(endpoint) or CONTRACT["inference"][endpoint]
+    verify_interface(client, endpoint, expected)
+    if len(arguments) != len(expected["inputs"]):
+        raise RuntimeError(f"桥接器的实参数量与适配契约不一致：{endpoint}")
     if cancel is None:
         return client.predict(*arguments, api_name=f"/{endpoint}")
     check_cancel(cancel)
@@ -343,11 +359,27 @@ def synthesis_parameters(request):
     return parameters
 
 
+def inference_arguments(request, reference, parameters):
+    seed = parameters["seed"]
+    common = (
+        request["text"].strip(), request.get("language", "中文"), handle_file(str(reference)), None,
+        request["prompt"].strip(), request.get("prompt_language", "中文"),
+        parameters["top_k"], parameters["top_p"], parameters["temperature"], parameters["split"], 1,
+        parameters["speed"], False, True, 0.3, seed, seed < 0,
+    )
+    if CONTRACT["id"] == "0725-cu124":
+        # This protocol places parallel_infer immediately after keep_random.
+        return (*common, True, 1.35, 32, False)
+    family = request["family"]
+    return (*common, False, False, 1.35, 4 if family == "v5turbo" else 32, False,
+            1.30 if family == "v5dev" else 0.0)
+
+
 def synthesize(session, data, job, request, cancel):
     progress = JobProgress(job)
     progress("检查声音预设和参考录音")
     family = request["family"]
-    if family not in FAMILIES:
+    if family not in CONTRACT.get("synthesis_families", FAMILIES):
         raise ValueError("当前模型家族尚未适配")
     parameters = synthesis_parameters(request)
     reference = safe_path(request["reference"], data)
@@ -358,6 +390,11 @@ def synthesize(session, data, job, request, cancel):
         raise ValueError("请填写参考文本和目标台词")
     verification_hashes = {}
     tts, reused, copied = session.load(request, data, job, cancel, progress)
+    try:
+        verify_interface(tts, "inference", CONTRACT["inference"]["inference"])
+    except InterfaceChanged as error:
+        (job / "interface-error.json").write_text(json.dumps({"issue": str(error)}), encoding="utf-8")
+        raise
     if request.get("record_voice_verification"):
         progress("校验模型和参考音频")
         inputs = {key: safe_path(session.engine / relative, session.engine)
@@ -368,16 +405,8 @@ def synthesize(session, data, job, request, cancel):
             key: cached[key] if re.fullmatch(r"[0-9a-f]{64}", cached.get(key, "")) else sha256_file(path, cancel)
             for key, path in inputs.items()
         }
-    seed = parameters["seed"]
     progress("生成音频")
-    audio_path, actual_seed = invoke(
-        tts, "inference", text, request.get("language", "中文"),
-        handle_file(str(reference)), None, prompt, request.get("prompt_language", "中文"),
-        parameters["top_k"], parameters["top_p"], parameters["temperature"], parameters["split"], 1,
-        parameters["speed"], False, True, 0.3, seed, seed < 0,
-        False, False, 1.35, 4 if family == "v5turbo" else 32, False,
-        1.30 if family == "v5dev" else 0.0, cancel=cancel,
-    )
+    audio_path, actual_seed = invoke(tts, "inference", *inference_arguments(request, reference, parameters), cancel=cancel)
     progress("校验并保存音频")
     path = safe_path(audio_path, job)
     info = inspect_wav(path)
@@ -588,10 +617,9 @@ def resume_signature(engine, dataset, artifacts, snapshot, settings, base, cance
     if settings["family"] != "v5turbo" or snapshot is None:
         return None
     stage = settings["operation"]
-    trainer, expected = RESUME_TRAINERS[stage]
-    if (sha256_file(safe_path(engine / "webui.py", engine), cancel) != RESUME_WEBUI
-            or sha256_file(safe_path(engine / trainer, engine), cancel) != expected):
-        return None
+    for path in ("webui.py", RESUME_TRAINERS[stage]):
+        if sha256_file(safe_path(engine / path, engine), cancel) != CONTRACT["resume"][path]:
+            return None
     config = ("s2.json" if stage == "train_sovits" else "s1longer-v2.yaml")
     inputs = hashlib.sha256()
     for path in artifacts:
@@ -888,6 +916,8 @@ def run_training(client, engine, data, job, request, cancel):
 
 def main(request_file):
     request = json.loads(Path(request_file).read_text(encoding="utf-8"))
+    if request.get("adapter") != CONTRACT["id"]:
+        raise ValueError("任务适配器与桥接契约不一致")
     engine = safe_path(request["engine"])
     data = safe_path(request["data"])
     job = safe_path(request["job"], data)
@@ -901,6 +931,8 @@ def main(request_file):
         finally:
             session.close()
     else:
+        if CONTRACT["id"] == "0725-cu124":
+            raise ValueError("0725-cu124 适配器当前只处理语音合成")
         client = main_client(psutil.Process(request["webui_pid"]), request["main_port"])
         run_training(client, engine, data, job, request, cancel)
 
@@ -921,6 +953,8 @@ def synthesis_worker():
                     redirect_stdout(output), redirect_stderr(errors):
                 exit_code = 0
                 try:
+                    if request.get("adapter") != CONTRACT["id"]:
+                        raise ValueError("任务适配器与桥接契约不一致")
                     if session is None:
                         session = SynthesisSession(engine, request)
                     check_cancel(cancel)
@@ -942,9 +976,13 @@ def synthesis_worker():
 
 if __name__ == "__main__":
     try:
-        if sys.argv[1] == "--synthesis-worker":
+        adapter = sys.argv[1]
+        CONTRACT = json.loads(Path(__file__).with_name(ADAPTERS[adapter]).read_text(encoding="utf-8"))
+        if CONTRACT["id"] != adapter:
+            raise ValueError("桥接器加载了错误的适配契约")
+        if sys.argv[2] == "--synthesis-worker":
             synthesis_worker()
         else:
-            main(sys.argv[1])
+            main(sys.argv[2])
     except Cancelled:
         sys.exit(10)

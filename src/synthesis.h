@@ -30,15 +30,21 @@ public:
     void playAudio(const QString &path);
     void loadRequest(const QJsonObject &request);
     void refreshVoices(const QString &selected = {});
+    void refreshEngineSelection();
     bool importing() const { return importing_; }
 
 signals:
     void viewBatchRequested(const QString &batch);
+    void engineDetailsRequested();
+    void engineRecheckRequested();
+    void engineSwitchRequested();
 
 private:
     void showEvent(QShowEvent *event) override;
     void generate();
     void refreshSubmission();
+    void refreshVoiceCompatibility();
+    void updateGenerateButton();
     void receiveAudio(const QString &id, const QJsonObject &result);
     void applyVoiceDefaults();
     void applySynthesisOptions(const QJsonObject &options);
@@ -52,6 +58,7 @@ private:
     QFutureWatcher<QJsonObject> importer_;
     QFutureWatcher<QString> exporter_;
     bool importing_ = false;
+    QComboBox *family_ = nullptr;
     QComboBox *voices_ = nullptr;
     QComboBox *language_ = nullptr;
     QPlainTextEdit *text_ = nullptr;
@@ -65,6 +72,10 @@ private:
     QDoubleSpinBox *temperature_ = nullptr;
     QLineEdit *seed_ = nullptr;
     QLabel *status_ = nullptr;
+    QLabel *compatibilityStatus_ = nullptr;
+    QLabel *lineCount_ = nullptr;
+    QWidget *compatibilityActions_ = nullptr;
+    QPushButton *generate_ = nullptr;
     QLabel *batchSummary_ = nullptr;
     QPushButton *viewBatch_ = nullptr;
     QMediaPlayer *player_ = nullptr;
@@ -74,6 +85,9 @@ private:
     QString audio_;
     QString submittedBatch_;
     QString submittedJob_;
+    QString rememberedVoice_;
+    QString rememberedFamily_;
+    QString voiceIssue_;
 };
 
 }

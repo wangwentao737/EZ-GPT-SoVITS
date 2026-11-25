@@ -143,13 +143,27 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
     ui::pageHeader(layout, this, QStringLiteral("语音合成"),
         QStringLiteral("选一个声音和台词语言，输入台词后点「生成语音」。首次使用可先导入权重和参考音频。"));
     auto *selectors = new QHBoxLayout;
+    family_ = new QComboBox(this);
+    family_->setPlaceholderText(QStringLiteral("无可选家族"));
+    family_->setAccessibleName(QStringLiteral("合成模型家族"));
+    selectors->addWidget(new QLabel(QStringLiteral("模型家族"), this));
+    selectors->addWidget(family_);
     voices_ = new QComboBox(this);
     voices_->setPlaceholderText(QStringLiteral("先导入一个声音"));
     voices_->setAccessibleName(QStringLiteral("声音预设"));
     language_ = new QComboBox(this);
     language_->addItems(languages);
     language_->setAccessibleName(QStringLiteral("台词语言"));
-    connect(voices_, &QComboBox::currentIndexChanged, this, &SynthesisPanel::applyVoiceDefaults);
+    connect(voices_, &QComboBox::currentIndexChanged, this, [this] {
+        rememberedVoice_ = voices_->currentData().toString();
+        applyVoiceDefaults();
+        refreshVoiceCompatibility();
+    });
+    connect(family_, &QComboBox::currentTextChanged, this, [this](const QString &family) {
+        rememberedFamily_ = family;
+        rememberedVoice_.clear();
+        refreshEngineSelection();
+    });
     auto *import = new QPushButton(QStringLiteral("导入声音"), this);
     auto *voiceLabel = new QLabel(QStringLiteral("声音"), this);
     voiceLabel->setObjectName("fieldLabel");
@@ -161,6 +175,11 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
     selectors->addWidget(language_);
     selectors->addWidget(import);
     layout->addLayout(selectors);
+    compatibilityStatus_ = ui::hint({}, this);
+    layout->addWidget(compatibilityStatus_);
+    compatibilityActions_ = ui::engineCompatibilityActions(this, [this] { emit engineDetailsRequested(); },
+        [this] { emit engineRecheckRequested(); }, [this] { emit engineSwitchRequested(); });
+    layout->addWidget(compatibilityActions_);
 
     text_ = new QPlainTextEdit(this);
     text_->setObjectName("scriptEditor");
@@ -237,26 +256,19 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
     });
 
     auto *actions = new QHBoxLayout;
-    auto *generate = new QPushButton(QStringLiteral("生成语音"), this);
-    generate->setObjectName("primary");
-    const auto updateMode = [this, lineCount, generate] {
-        const bool batch = batch_->isChecked();
-        const auto count = batch ? synthesisLines(text_->toPlainText()).size() : 0;
-        lineCount->setVisible(batch);
-        lineCount->setText(QStringLiteral("%1 条台词，空行会跳过").arg(count));
-        generate->setText(batch ? QStringLiteral("提交批量任务") : QStringLiteral("生成语音"));
-        generate->setEnabled(batch ? count > 0 : !text_->toPlainText().trimmed().isEmpty());
-    };
-    updateMode();
-    connect(batch_, &QCheckBox::toggled, this, updateMode);
-    connect(text_, &QPlainTextEdit::textChanged, this, updateMode);
+    lineCount_ = lineCount;
+    generate_ = new QPushButton(QStringLiteral("生成语音"), this);
+    generate_->setObjectName("primary");
+    updateGenerateButton();
+    connect(batch_, &QCheckBox::toggled, this, &SynthesisPanel::updateGenerateButton);
+    connect(text_, &QPlainTextEdit::textChanged, this, &SynthesisPanel::updateGenerateButton);
     play_ = new QPushButton(QStringLiteral("播放"), this);
     export_ = new QPushButton(QStringLiteral("另存 WAV"), this);
     folder_ = new QPushButton(QStringLiteral("所在目录"), this);
     play_->setEnabled(false);
     export_->setEnabled(false);
     folder_->setEnabled(false);
-    actions->addWidget(generate);
+    actions->addWidget(generate_);
     auto *script = new QPushButton(QStringLiteral("台词表"), this);
     auto *toScript = new QPushButton(QStringLiteral("文本转为台词表"), this);
     actions->addWidget(script);
@@ -294,7 +306,8 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
     player_ = new QMediaPlayer(this);
     player_->setAudioOutput(new QAudioOutput(player_));
     connect(import, &QPushButton::clicked, this, [this] { importVoice(); });
-    connect(generate, &QPushButton::clicked, this, &SynthesisPanel::generate);
+    connect(generate_, &QPushButton::clicked, this, &SynthesisPanel::generate);
+    connect(&scheduler_.compatibility(), &CompatibilityRegistry::changed, this, &SynthesisPanel::refreshEngineSelection);
     connect(&scheduler_, &TaskScheduler::completed, this, &SynthesisPanel::receiveAudio);
     connect(&scheduler_, &TaskScheduler::changed, this, &SynthesisPanel::refreshSubmission);
     connect(play_, &QPushButton::clicked, this, [this] {
@@ -401,9 +414,9 @@ void SynthesisPanel::playAudio(const QString &path)
 
 void SynthesisPanel::loadRequest(const QJsonObject &request)
 {
-    const auto index = voices_->findData(request.value("voice_id").toString());
-    if (index >= 0)
-        voices_->setCurrentIndex(index);
+    const auto voice = request.value("voice_id").toString();
+    if (!voice.isEmpty())
+        refreshVoices(voice);
     text_->setPlainText(request.value("text").toString());
     language_->setCurrentText(supportedLanguage(request.value("language").toString()));
     applySynthesisOptions(request);
@@ -436,19 +449,52 @@ void SynthesisPanel::applyVoiceDefaults()
 void SynthesisPanel::refreshVoices(const QString &selected)
 {
     const auto previous = voices_->currentData().toString();
-    const auto current = selected.isEmpty() ? previous : selected;
+    if (!selected.isEmpty())
+        rememberedVoice_ = selected;
     auto query = voicesWithVerification();
     if (query.lastError().isValid())
         throw std::runtime_error(query.lastError().text().toStdString());
     const auto launcher = launcher_();
+    const auto installation = scheduler_.compatibility().inspect(launcher);
+    const auto families = installation.families({"synthesize"});
+    struct Preset {
+        QString id;
+        QString name;
+        QJsonObject settings;
+        QString legacy;
+        QJsonObject verification;
+    };
+    QList<Preset> presets;
+    while (query.next()) {
+        const auto id = query.value(0).toString();
+        auto settings = readWorkspaceRecord(query.value(2).toByteArray());
+        if (id == rememberedVoice_)
+            rememberedFamily_ = settings.value("family").toString();
+        presets.append({id, query.value(1).toString(), std::move(settings), query.value(3).toString(),
+            QJsonDocument::fromJson(query.value(4).toByteArray()).object()});
+    }
+    const QSignalBlocker familyBlock(family_);
+    family_->clear();
+    family_->addItems(families);
+    const auto preferred = family_->findText(rememberedFamily_);
+    int familyIndex = preferred;
+    if (familyIndex < 0 && rememberedVoice_.isEmpty()) {
+        for (const auto &preset : presets) {
+            familyIndex = family_->findText(preset.settings.value("family").toString());
+            if (familyIndex >= 0)
+                break;
+        }
+        if (familyIndex < 0 && !families.isEmpty())
+            familyIndex = 0;
+    }
+    family_->setCurrentIndex(familyIndex);
     const QSignalBlocker block(voices_);
     voices_->clear();
-    while (query.next()) {
-        const auto settings = readWorkspaceRecord(query.value(2).toByteArray());
-        const auto legacy = query.value(3).toString();
-        const auto record = QJsonDocument::fromJson(query.value(4).toByteArray()).object();
+    for (const auto &[id, name, settings, legacy, record] : presets) {
+        if (settings.value("family") != family_->currentText())
+            continue;
         const auto state = voiceVerificationStatus(settings, record, legacy, launcher);
-        voices_->addItem(query.value(1).toString() + QStringLiteral(" · ") + state, query.value(0));
+        voices_->addItem(name + QStringLiteral(" · ") + state, id);
         const auto date = QDateTime::fromString(record.value("verified_at").toString(), Qt::ISODateWithMs).toLocalTime();
         auto details = state;
         if (date.isValid()) {
@@ -458,20 +504,58 @@ void SynthesisPanel::refreshVoices(const QString &selected)
         voices_->setItemData(voices_->count() - 1, details, Qt::ToolTipRole);
         voices_->setItemData(voices_->count() - 1, settings, voiceSettingsRole);
     }
-    const int index = voices_->findData(current);
+    const int index = voices_->findData(rememberedVoice_);
     voices_->setCurrentIndex(index >= 0 ? index : (voices_->count() ? 0 : -1));
+    if (voices_->currentIndex() >= 0)
+        rememberedVoice_ = voices_->currentData().toString();
     if (previous != voices_->currentData().toString())
         applyVoiceDefaults();
+    refreshVoiceCompatibility();
 }
 
-void SynthesisPanel::showEvent(QShowEvent *event)
+void SynthesisPanel::refreshEngineSelection()
 {
-    QWidget::showEvent(event);
     try {
         refreshVoices();
     } catch (const std::exception &error) {
         status_->setText(QString::fromUtf8(error.what()));
     }
+}
+
+void SynthesisPanel::showEvent(QShowEvent *event)
+{
+    QWidget::showEvent(event);
+    refreshEngineSelection();
+}
+
+void SynthesisPanel::refreshVoiceCompatibility()
+{
+    const auto installation = scheduler_.compatibility().inspect(launcher_());
+    const auto combined = voices_->currentData(voiceSettingsRole).toJsonObject();
+    voiceIssue_.clear();
+    if (!combined.isEmpty()) {
+        voiceIssue_ = scheduler_.voiceIssue(installation, combined);
+    } else if (family_->currentIndex() < 0) {
+        const auto family = rememberedFamily_.isEmpty() ? adapterFamilies().constFirst() : rememberedFamily_;
+        voiceIssue_ = installation.issue("synthesize", family);
+        if (!rememberedVoice_.isEmpty())
+            voiceIssue_ = QStringLiteral("所选声音属于 %1。%2\n可切回支持该家族的整合包。").arg(family, voiceIssue_);
+    }
+    compatibilityStatus_->setText(voiceIssue_);
+    compatibilityStatus_->setVisible(!voiceIssue_.isEmpty());
+    compatibilityActions_->setVisible(!voiceIssue_.isEmpty());
+    updateGenerateButton();
+}
+
+void SynthesisPanel::updateGenerateButton()
+{
+    const bool batch = batch_->isChecked();
+    const auto count = batch ? synthesisLines(text_->toPlainText()).size() : 0;
+    lineCount_->setVisible(batch);
+    lineCount_->setText(QStringLiteral("%1 条台词，空行会跳过").arg(count));
+    generate_->setText(batch ? QStringLiteral("提交批量任务") : QStringLiteral("生成语音"));
+    generate_->setEnabled(voices_->currentIndex() >= 0 && voiceIssue_.isEmpty()
+                          && (batch ? count > 0 : !text_->toPlainText().trimmed().isEmpty()));
 }
 
 QJsonObject SynthesisPanel::selectedVoiceSettings() const
@@ -529,11 +613,27 @@ void SynthesisPanel::importVoice(QJsonObject defaults)
     form->addRow(ui::hint(QStringLiteral("选择同一个声音的两份配套权重，再添加一段参考录音和对应原文。"), &dialog));
     auto *name = new QLineEdit(defaults.value("name").toString(), &dialog);
     auto *family = new QComboBox(&dialog);
-    family->addItems({"v5turbo", "v5dev", "v2Pro", "v2ProPlus", "v2"});
-    if (defaults.contains("family"))
-        family->setCurrentText(defaults.value("family").toString());
+    const auto installation = scheduler_.compatibility().inspect(launcher_());
+    family->addItems(installation.families({"synthesize"}));
+    const auto originalFamily = defaults.value("family").toString();
+    if (!originalFamily.isEmpty() && family->findText(originalFamily) < 0 && defaults.contains("id"))
+        family->addItem(originalFamily);
+    if (!originalFamily.isEmpty())
+        family->setCurrentIndex(family->findText(originalFamily));
     form->addRow(QStringLiteral("声音名称"), name);
     form->addRow(QStringLiteral("模型家族"), family);
+    auto *familyHint = ui::hint({}, &dialog);
+    form->addRow(familyHint);
+    const auto showFamilyIssue = [family, familyHint, installation, originalFamily] {
+        auto selected = family->currentText();
+        if (selected.isEmpty())
+            selected = originalFamily.isEmpty() ? adapterFamilies().constFirst() : originalFamily;
+        const auto issue = installation.issue("synthesize", selected);
+        familyHint->setText(issue);
+        familyHint->setVisible(!issue.isEmpty());
+    };
+    showFamilyIssue();
+    connect(family, &QComboBox::currentTextChanged, &dialog, showFamilyIssue);
     auto *gpt = fileRow(form, QStringLiteral("GPT 权重"), "GPT (*.ckpt)", defaults.value("gpt").toString(), &dialog);
     auto *sovits = fileRow(form, QStringLiteral("SoVITS 权重"), "SoVITS (*.pth)", defaults.value("sovits").toString(), &dialog);
     auto *ref = fileRow(form, QStringLiteral("参考音频"), "Audio (*.wav *.flac *.mp3)",
@@ -572,6 +672,10 @@ void SynthesisPanel::importVoice(QJsonObject defaults)
     form->addRow(QStringLiteral("默认台词语言"), target);
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
     buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("保存声音"));
+    buttons->button(QDialogButtonBox::Ok)->setEnabled(family->currentIndex() >= 0);
+    connect(family, &QComboBox::currentIndexChanged, &dialog, [family, buttons] {
+        buttons->button(QDialogButtonBox::Ok)->setEnabled(family->currentIndex() >= 0);
+    });
     buttons->button(QDialogButtonBox::Cancel)->setText(QStringLiteral("取消"));
     connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
@@ -621,6 +725,10 @@ void SynthesisPanel::generate()
 {
     try {
         refreshVoices();
+        if (!voiceIssue_.isEmpty()) {
+            status_->setText(voiceIssue_);
+            return;
+        }
         const auto launcher = launcher_();
         const auto voice = voices_->currentData().toString();
         if (launcher.isEmpty()) {

@@ -1,0 +1,35 @@
+{
+  "source": "0725-cu124, native v2 fast inference, capture run-3a77780b61",
+  "source_sha256": {
+    "config.json": "4ea8a061d0d80595a0fbc01bdf2d7d51fdc572eae4eca7e028adb0690ca511b6",
+    "info.json": "46e7c159de118d6b2fa158c3f6163396f00e83cc969b822a8bf65f6c3a674e5f"
+  },
+  "gradio": "4.44.1",
+  "inputs": [
+    ["text", "Textbox", "string", "需要合成的文本", "textbox"],
+    ["text_lang", "Dropdown", "string", "需要合成的文本的语种", "dropdown"],
+    ["ref_audio_path", "Audio", "object", "主参考音频(请上传3~10秒内参考音频，超过会报错！)", "audio"],
+    ["aux_ref_audio_paths", "File", "array", "辅参考音频(可选多个，或不选)", "file"],
+    ["prompt_text", "Textbox", "string", "主参考音频的文本", "textbox"],
+    ["prompt_lang", "Dropdown", "string", "主参考音频的语种", "dropdown"],
+    ["top_k", "Slider", "number", "top_k", "slider"],
+    ["top_p", "Slider", "number", "top_p", "slider"],
+    ["temperature", "Slider", "number", "temperature", "slider"],
+    ["text_split_method", "Dropdown", "string", "怎么切", "dropdown"],
+    ["batch_size", "Slider", "number", "batch_size", "slider"],
+    ["speed_factor", "Slider", "number", "语速", "slider"],
+    ["ref_text_free", "Checkbox", "boolean", "开启无参考文本模式。不填参考文本亦相当于开启。", "checkbox"],
+    ["split_bucket", "Checkbox", "boolean", "数据分桶(并行推理时会降低一点计算量)", "checkbox"],
+    ["fragment_interval", "Slider", "number", "分段间隔(秒)", "slider"],
+    ["seed", "Number", "number", "随机种子", "number"],
+    ["keep_random", "Checkbox", "boolean", "保持随机", "checkbox"],
+    ["parallel_infer", "Checkbox", "boolean", "并行推理", "checkbox"],
+    ["repetition_penalty", "Slider", "number", "重复惩罚", "slider"],
+    ["sample_steps", "Radio", "string", "采样步数(仅对V3/4生效)", "radio"],
+    ["super_sampling", "Checkbox", "boolean", "音频超采样(仅对V3生效))", "checkbox"]
+  ],
+  "returns": [
+    ["Audio", "object"],
+    ["Number", "number"]
+  ]
+}

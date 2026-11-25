@@ -1,14 +1,17 @@
 #pragma once
 
 #include <QJsonObject>
-#include <QMap>
 #include <QStringList>
 #include <atomic>
 
 namespace ez {
 
+struct EngineInstallation;
+
 QStringList engineOperations();
 QString operationLabel(const QString &operation);
+bool resourceRuleIncludesScript(const QString &operation, const QString &family,
+                                const QString &language, const QString &script);
 QString resourceIssue(const QString &engine, const QString &operation, const QString &family,
                       const QString &asrLanguage = QStringLiteral("zh"), const std::atomic_bool *cancelled = nullptr);
 QString jobResourceIssue(const QString &engine, const QString &data, const QJsonObject &request);
@@ -23,7 +26,7 @@ struct ResourceCheck {
 
 QList<ResourceCheck> inspectResources(const QString &launcher, const QString &family, const QString &data,
                                       const QString &output, const QJsonObject &voice,
-                                      const QMap<QString, QString> &interfaces, const QString &only,
+                                      const EngineInstallation &installation, const QString &only,
                                       const std::atomic_bool &cancelled);
 
 }

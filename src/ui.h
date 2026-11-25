@@ -2,6 +2,7 @@
 
 #include <QString>
 #include <QList>
+#include <functional>
 
 class QAbstractButton;
 class QAction;
@@ -19,5 +20,7 @@ void styleTable(QTableWidget *table);
 int selectedRow(const QTableWidget *table);
 void enableRowMenu(QTableWidget *table, const QList<QAbstractButton *> &buttons,
                    const QList<QAction *> &actions = {});
+QWidget *engineCompatibilityActions(QWidget *parent, const std::function<void()> &details,
+                                    const std::function<void()> &recheck, const std::function<void()> &switchPack);
 
 }

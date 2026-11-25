@@ -1,0 +1,95 @@
+{
+  "id": "0725-cu124",
+  "main_port": 9874,
+  "inference_port": 9872,
+  "gradio": "4.44.1",
+  "synthesis_families": ["v2", "v2Pro", "v2ProPlus"],
+  "operations": {
+    "synthesize": ["switch_version", "change_choices", "change_tts_inference", "change_tts_inference_1"]
+  },
+  "main": {
+    "change_choices": {
+      "inputs": [],
+      "returns": [
+        ["Dropdown", "string"],
+        ["Dropdown", "string"]
+      ]
+    },
+    "change_tts_inference": {
+      "inputs": [
+        ["bert_path", "Textbox", "string", "预训练中文BERT模型路径"],
+        ["cnhubert_base_path", "Textbox", "string", "预训练SSL模型路径"],
+        ["gpu_number", "Textbox", "string", "GPU卡号,只能填1个整数"],
+        ["gpt_path", "Dropdown", "string", "GPT模型列表"],
+        ["sovits_path", "Dropdown", "string", "SoVITS模型列表"],
+        ["batched_infer_enabled", "Checkbox", "boolean", "启用并行推理版本"]
+      ],
+      "returns": [
+        ["Textbox", "string"]
+      ]
+    },
+    "change_tts_inference_1": {
+      "inputs": [
+        ["bert_path", "Textbox", "string", "预训练中文BERT模型路径"],
+        ["cnhubert_base_path", "Textbox", "string", "预训练SSL模型路径"],
+        ["gpu_number", "Textbox", "string", "GPU卡号,只能填1个整数"],
+        ["gpt_path", "Dropdown", "string", "GPT模型列表"],
+        ["sovits_path", "Dropdown", "string", "SoVITS模型列表"],
+        ["batched_infer_enabled", "Checkbox", "boolean", "启用并行推理版本"]
+      ],
+      "returns": [
+        ["Textbox", "string"]
+      ]
+    },
+    "switch_version": {
+      "inputs": [
+        ["version_", "Radio", "string", "训练模型的版本"]
+      ],
+      "returns": [
+        ["Textbox", "string"],
+        ["Textbox", "string"],
+        ["Textbox", "string"],
+        ["Dropdown", "string"],
+        ["Dropdown", "string"],
+        ["Slider", "number"],
+        ["Slider", "number"],
+        ["Slider", "number"],
+        ["Slider", "number"],
+        ["Checkbox", "boolean"],
+        ["Checkbox", "boolean"],
+        ["Radio", "string"]
+      ]
+    }
+  },
+  "inference": {
+    "inference": {
+      "inputs": [
+        ["text", "Textbox", "string", "需要合成的文本"],
+        ["text_lang", "Dropdown", "string", "需要合成的文本的语种"],
+        ["ref_audio_path", "Audio", "object", "主参考音频(请上传3~10秒内参考音频，超过会报错！)"],
+        ["aux_ref_audio_paths", "File", "array", "辅参考音频(可选多个，或不选)"],
+        ["prompt_text", "Textbox", "string", "主参考音频的文本"],
+        ["prompt_lang", "Dropdown", "string", "主参考音频的语种"],
+        ["top_k", "Slider", "number", "top_k"],
+        ["top_p", "Slider", "number", "top_p"],
+        ["temperature", "Slider", "number", "temperature"],
+        ["text_split_method", "Dropdown", "string", "怎么切"],
+        ["batch_size", "Slider", "number", "batch_size"],
+        ["speed_factor", "Slider", "number", "语速"],
+        ["ref_text_free", "Checkbox", "boolean", "开启无参考文本模式。不填参考文本亦相当于开启。"],
+        ["split_bucket", "Checkbox", "boolean", "数据分桶(并行推理时会降低一点计算量)"],
+        ["fragment_interval", "Slider", "number", "分段间隔(秒)"],
+        ["seed", "Number", "number", "随机种子"],
+        ["keep_random", "Checkbox", "boolean", "保持随机"],
+        ["parallel_infer", "Checkbox", "boolean", "并行推理"],
+        ["repetition_penalty", "Slider", "number", "重复惩罚"],
+        ["sample_steps", "Radio", "string", "采样步数(仅对V3/4生效)"],
+        ["super_sampling", "Checkbox", "boolean", "音频超采样(仅对V3生效))"]
+      ],
+      "returns": [
+        ["Audio", "object"],
+        ["Number", "number"]
+      ]
+    }
+  }
+}

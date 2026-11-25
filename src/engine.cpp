@@ -1,4 +1,5 @@
 #include "engine.h"
+#include "compatibility.h"
 #include "resources.h"
 
 #include <winsock2.h>
@@ -66,10 +67,14 @@ QJsonObject fetchApi(quint16 port, const QString &path)
     return QJsonDocument::fromJson(reply->readAll()).object();
 }
 
-QJsonObject engineContract()
+QJsonObject engineContract(const QString &adapter)
 {
-    QFile file(":/engine/20261006-contract.json");
-    return file.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(file.readAll()).object() : QJsonObject{};
+    const auto selected = adapter.isEmpty() ? defaultEngineAdapter() : adapter;
+    QFile file(":/engine/" + adapterContractFile(selected));
+    const auto contract = file.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(file.readAll()).object() : QJsonObject{};
+    if (contract.value("id") != selected)
+        fail(QStringLiteral("当前程序缺少引擎适配契约：%1").arg(selected));
+    return contract;
 }
 
 QString interfaceChange(const QString &method, const QJsonObject &expected, const QJsonArray &dependencies,
@@ -111,7 +116,7 @@ QString interfaceChange(const QString &method, const QJsonObject &expected, cons
     return {};
 }
 
-EngineProbe probeApi(quint16 port)
+EngineProbe probeApi(quint16 port, QJsonObject contract)
 {
     const auto config = fetchApi(port, "config");
     if (config.isEmpty())
@@ -131,7 +136,6 @@ EngineProbe probeApi(quint16 port)
         if (label == QStringLiteral("显卡信息") || label.compare("GPU Information", Qt::CaseInsensitive) == 0)
             result.devices = props.value("value").toString().trimmed();
     }
-    const auto contract = engineContract();
     const auto expected = contract.value("operations").toObject();
     const auto methods = contract.value("main").toObject();
     const auto info = fetchApi(port, "info").value("named_endpoints").toObject();
@@ -198,9 +202,9 @@ QString engineRoot(const QString &launcher)
     return root;
 }
 
-EnginePorts enginePorts(const QString &directory)
+EnginePorts enginePorts(const QString &directory, const QString &adapter)
 {
-    const auto contract = engineContract();
+    const auto contract = engineContract(adapter);
     EnginePorts ports{quint16(contract.value("main_port").toInt(9874)),
         quint16(contract.value("inference_port").toInt(9872))};
     QFile file(checkedPath(directory + "/config.py"));
@@ -241,16 +245,16 @@ QString engineFingerprint(const QString &directory)
     return QString::fromLatin1(fingerprint.result().toHex());
 }
 
-QString resumeEngineIssue(const QString &directory, const QString &family)
+QString resumeEngineIssue(const QString &directory, const QString &family, const QString &operation, const QString &adapter)
 {
     if (family != "v5turbo")
         return QStringLiteral("当前续训适配限定 v5turbo。");
-    const auto pinned = engineContract().value("resume").toObject();
+    const auto pinned = engineContract(adapter).value("resume").toObject();
     for (auto item = pinned.constBegin(); item != pinned.constEnd(); ++item) {
-        QFile file(checkedPath(directory + '/' + item.key()));
-        QCryptographicHash hash(QCryptographicHash::Sha256);
-        if (!file.open(QIODevice::ReadOnly) || !hash.addData(&file)
-            || hash.result().toHex() != item.value().toString().toLatin1())
+        if ((operation == "train_sovits" && item.key() == "GPT_SoVITS/s1_train.py")
+            || (operation == "train_gpt" && item.key() == "GPT_SoVITS/s2_train_v3_lora.py"))
+            continue;
+        if (engineScriptDigest(directory, item.key()) != item.value().toString())
             return QStringLiteral("续训脚本缺失或摘要变化 %1。可重新开始该训练阶段。").arg(item.key());
     }
     return {};
@@ -314,7 +318,7 @@ EngineManager::~EngineManager()
     probe_.waitForFinished();
 }
 
-void EngineManager::start(const QString &launcher, const QString &logPath)
+void EngineManager::start(const QString &launcher, const QString &logPath, const QString &adapter)
 {
     if (process_ || probe_.isRunning())
         fail(QStringLiteral("已有引擎正在启动或运行"));
@@ -322,7 +326,8 @@ void EngineManager::start(const QString &launcher, const QString &logPath)
     const auto issue = resourceIssue(dir, "start", {});
     if (!issue.isEmpty())
         fail(issue);
-    const auto ports = enginePorts(dir);
+    const auto ports = enginePorts(dir, adapter);
+    const auto identity = engineFingerprint(dir);
     for (auto port : {ports.main, ports.inference}) {
         if (const auto pid = listener(port))
             fail(QStringLiteral("端口 %1 已被进程 %2 占用").arg(port).arg(pid));
@@ -388,6 +393,8 @@ void EngineManager::start(const QString &launcher, const QString &logPath)
     CloseHandle(created.hThread);
     process_ = std::move(candidate);
     root_ = dir;
+    adapter_ = adapter.isEmpty() ? defaultEngineAdapter() : adapter;
+    fingerprint_ = identity;
     ports_ = ports;
     logPath_ = logPath;
     ticks_ = 0;
@@ -417,7 +424,7 @@ void EngineManager::poll()
     if (ready_ || probe_.isRunning())
         return;
     if (ownsListener(ports_.main))
-        probe_.setFuture(QtConcurrent::run(probeApi, ports_.main));
+        probe_.setFuture(QtConcurrent::run(probeApi, ports_.main, engineContract(adapter_)));
 }
 
 void EngineManager::failInstance(const QString &message)
@@ -429,12 +436,8 @@ void EngineManager::failInstance(const QString &message)
 
 bool EngineManager::ready() const { return ready_; }
 bool EngineManager::active() const { return bool(process_); }
+bool EngineManager::canStart() const { return !process_ && !probe_.isRunning(); }
 QString EngineManager::root() const { return root_; }
-
-QString EngineManager::interfaceIssue(const QString &operation) const
-{
-    return unavailable_.value(operation);
-}
 
 QMap<QString, QString> EngineManager::interfaceIssues() const
 {

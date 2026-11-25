@@ -4,11 +4,15 @@ EZ-GPT-SoVITS 是使用本地 GPT-SoVITS 整合包的中文 Windows 语音工作
 
 ## 快速入门
 
-1. 将 Windows x64 便携 ZIP 完整解压到可写目录，双击 `EZ-GPT-SoVITS.exe`。准备好目标整合包 GPT-SoVITS-v5-20261006。
+1. 将 Windows x64 便携 ZIP 完整解压到可写目录，双击 `EZ-GPT-SoVITS.exe`。准备好本机的 GPT-SoVITS 20261006 或 0725-cu124 整合包。
 2. 进入「设置 → 添加启动路径」，选择整合包目录里的 `go-webui.bat`。引擎运行时会在该整合包目录中写入运行文件。
-3. 回到「工作台」，选择要检查的模型家族，点击「检查资源」。如果报告有缺项，按提示补齐文件，再选中失败项点击「复查所选项」。
+3. 在「语音合成」或「训练项目」选择当前整合包可用的家族。需要检查某项功能时，打开「引擎详情」。补齐缺失文件后点击「重新检测」。
 
-更换整合包后，可在「设置 → 引擎详情」按模型家族查看功能状态，并使用已有声音试合成一句。任务中的引擎指纹变化时，该功能会重新等待验证。
+完整训练项目需要切片、数据准备和两段训练能力。自动转写独立检查，已有项目可导入标注后跳过转写。换包后，声音和项目保留原家族，排队任务仍使用提交时的整合包，并在执行前复核。
+
+EZ 用脚本摘要识别整合包构建，启动后检查实际运行接口。可在「设置」检查 GitHub 上的兼容清单更新，或导入本地清单。首次离线启动使用内置清单。未知构建可以在「引擎详情」检查接口，满足试音条件时可用已有声音试音。该结果保存在本机。
+
+0725-cu124 可使用 v2、v2Pro 和 v2ProPlus 合成。实测记录见 [0725-cu124 验收](compat/acceptance-0725-cu124.md) 和 [20261006 基线验收](compat/acceptance-20261006.md)。
 
 ### 已有模型，合成台词
 
@@ -47,6 +51,21 @@ EZ-GPT-SoVITS 是使用本地 GPT-SoVITS 整合包的中文 Windows 语音工作
 - 启动报告端口冲突时，先退出占用端口的旧引擎，再从 EZ 启动。目标整合包的主服务使用 9874，快速推理服务使用 9872。
 - 「工作台 → 导出诊断」可预览、复制报告，并选择是否包含日志。针对一条历史任务，可右键选「导出所选任务诊断」。
 
+## 适配新的 GPT-SoVITS 整合包
+
+1. 将目标整合包复制到 `.test/engine-new`，启动副本的 WebUI。验证合成时，也从 WebUI 启动快速推理。采集主服务、推理服务和脚本摘要。有上游版本声明时一并记录出处。
+
+   ```powershell
+   python tests/collect-engine-compatibility.py --engine .test/engine-new --output .test/capture-new --main-port 9874 --inference-port 9872 --source "归档来源与标识"
+   ```
+
+   按副本的实际设置填写端口，每次采集使用新目录。只采集主服务时可省略 `--inference-port`。
+2. 将快照与 `engine/` 下的契约逐项比对，检查事件、参数顺序、控件类型、返回值和模型资源。接口与资源都匹配时可以复用现有适配器。若像 0725-cu124 一样需要不同的调用参数，则补充契约及桥接逻辑，构建测试版。
+3. 在测试数据目录导入候选清单，从 EZ 实测准备开放的操作。合成按家族检查归档 WAV、种子和摘要，训练与续训分别验收。切回 20261006 复测，再把通过项和报告写入 `compat/registry-v1.json`。
+4. 递增清单修订号，提交清单、报告及相关代码的 PR。合入 `main` 后，从「设置 → 检查兼容清单更新」核对线上修订与可用家族。新适配器随支持它的 EZ 版本发布。本机更新也可通过「导入兼容清单」完成。
+
+[单版本适配操作清单](compat/adaptation-checklist.md)包含采集、构建、实测、创建 PR 和撤回登记的命令。[验收报告模板](compat/registration-template.md)可用于记录每个家族和操作的测试结果。
+
 ## 构建
 
 需要 Windows x64、Visual Studio 2022 的 C++ 桌面开发工作负载、CMake 3.24 或更新版本，以及 Qt 6.8.3 MSVC 2022 x64。Qt 安装需包含 Qt Multimedia。
@@ -72,6 +91,8 @@ cmake --install build --config Release --prefix (Join-Path $PWD "out/portable")
 如已在 `.test` 中备好独立引擎和引擎联调样例，可运行 `python -X utf8 -B tests/live-cancellation.py` 验证运行中取消和后续任务续跑。脚本的 `--help` 列出样例路径选项。
 
 同一套夹具可用 `python -X utf8 -B tests/resource-preflight.py` 验证缺少启动资源、接口变化和损坏权重的处理，以及失败后的真实合成。
+
+`python -X utf8 -B tests/engine-compatibility.py` 用已采集的 0725 快速推理接口和同数量入参重排夹具验证拦截。添加 `--app` 和 `--matrix` 可回归四个已登记家族的真实合成。
 
 `python -X utf8 -B tests/training-integrity.py` 使用独立引擎实测预处理、样本错配拦截、两阶段训练和新权重试听。`python -X utf8 -B tests/training-resume.py` 验证 v5turbo 的 GPT 和 SoVITS 在完成一轮后中断、恢复，以及配置不匹配时的拦截。
 

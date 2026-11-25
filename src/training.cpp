@@ -53,6 +53,8 @@
 namespace ez {
 namespace {
 
+const QStringList fullTraining{"slice", "prepare", "train_sovits", "train_gpt"};
+
 QString newId()
 {
     return QUuid::createUuid().toString(QUuid::Id128);
@@ -173,6 +175,11 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     stage_ = ui::hint({}, this);
     stage_->setObjectName("stageHint");
     layout->addWidget(stage_);
+    compatibilityStatus_ = ui::hint({}, this);
+    layout->addWidget(compatibilityStatus_);
+    compatibilityActions_ = ui::engineCompatibilityActions(this, [this] { emit engineDetailsRequested(); },
+        [this] { emit engineRecheckRequested(); }, [this] { emit engineSwitchRequested(); });
+    layout->addWidget(compatibilityActions_);
     status_ = ui::hint({}, this);
     const auto button = [this](QHBoxLayout *row, const QString &label, auto action) {
         auto *control = new QPushButton(label, this);
@@ -432,6 +439,7 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
         }
     });
     connect(&scheduler_, &TaskScheduler::changed, this, [this] { showState(); });
+    connect(&scheduler_.compatibility(), &CompatibilityRegistry::changed, this, &TrainingPanel::refreshEngineSelection);
     connect(&scheduler_, &TaskScheduler::activityChanged, this, &TrainingPanel::showActivity);
     query.prepare("SELECT name,id FROM projects ORDER BY rowid DESC");
     execute(query);
@@ -447,11 +455,13 @@ void TrainingPanel::addProject()
     QDialog dialog(this);
     dialog.setWindowTitle(QStringLiteral("新建训练项目"));
     QFormLayout form(&dialog);
-    form.addRow(ui::hint(QStringLiteral("可先用默认的 v5turbo 模型家族。素材语言按录音中主要使用的语言选择。"), &dialog));
+    const auto installation = scheduler_.compatibility().inspect(launcher_());
+    const auto available = installation.families(fullTraining);
+    require(!available.isEmpty(), QStringLiteral("此整合包没有可完成全部训练阶段的模型家族。请查看引擎详情。"));
     auto *name = new QLineEdit(&dialog);
     auto *speaker = new QLineEdit("Speaker", &dialog);
     auto *family = new QComboBox(&dialog);
-    family->addItems({"v5turbo", "v5dev", "v2Pro", "v2ProPlus", "v2"});
+    family->addItems(available);
     auto *language = new QComboBox(&dialog);
     language->addItems({"zh", "en", "ja", "yue", "ko"});
     form.addRow(QStringLiteral("项目名称"), name);
@@ -893,6 +903,11 @@ void TrainingPanel::submit(const QString &operation, bool resume)
     const auto launcher = launcher_();
     require(!launcher.isEmpty(), QStringLiteral("请在「设置」中添加并选择引擎"));
     const auto training = operation == "train_sovits" || operation == "train_gpt";
+    const auto installation = scheduler_.compatibility().inspect(launcher);
+    const auto capability = resume ? "resume_" + operation.mid(6) : operation;
+    const auto issue = installation.issue(capability, project_.value("family").toString(),
+        project_.value("language") == "yue" ? "yue" : "zh");
+    require(issue.isEmpty(), issue);
     if (training && labels_->rowCount() > 0)
         saveLabels();
     auto request = project_;
@@ -1022,10 +1037,12 @@ void TrainingPanel::complete(const QString &id, const QJsonObject &result, bool 
         state["reviews"] = reviewDrafts();
         saveProject(state);
     }
-    if (live && operation == "train_sovits") {
+    if (live && operation == "train_sovits"
+        && scheduler_.compatibility().inspect(launcher).issue("train_gpt", request.value("family").toString()).isEmpty()) {
         auto next = request;
         next["operation"] = "train_gpt";
         next.remove("resume_job");
+        next.remove("compat_fingerprint");
         state["pending"] = scheduler_.enqueue(launcher, next, state);
         if (current)
             project_ = state;
@@ -1082,7 +1099,7 @@ QString TrainingPanel::nextTrainingStage() const
 QString TrainingPanel::resumeJob(const QString &operation) const
 {
     const auto launcher = launcher_();
-    if (launcher.isEmpty() || project_.value("family") != "v5turbo" || project_.value("engine") != launcher
+    if (launcher.isEmpty() || project_.value("engine") != launcher
         || project_.value("dataset").toString().isEmpty() || project_.contains("gpt"))
         return {};
     QSqlQuery query;
@@ -1153,8 +1170,65 @@ void TrainingPanel::showEvent(QShowEvent *event)
 void TrainingPanel::showState()
 {
     const auto active = busy();
-    const auto canResume = !active && !resumeJob(nextTrainingStage()).isEmpty();
+    const auto launcher = launcher_();
+    const auto installation = scheduler_.compatibility().inspect(launcher);
+    const auto family = project_.value("family").toString();
+    const auto language = project_.value("language") == "yue" ? "yue" : "zh";
+    const auto trainingStage = nextTrainingStage();
+    const auto training = installation.issue(trainingStage, family);
+    const auto resumeIssue = installation.issue("resume_" + trainingStage.mid(6), family);
+    const auto resumeJobId = !active && resumeIssue.isEmpty() ? resumeJob(trainingStage) : QString();
+    const auto canResume = !resumeJobId.isEmpty();
     resume_->setVisible(canResume);
+    const bool canCreate = !installation.families(fullTraining).isEmpty();
+    create_->setEnabled(canCreate);
+    const auto setAvailable = [this, active](QPushButton *button, const QString &issue, bool hasInputs) {
+        button->setEnabled(!active && !project_.isEmpty() && hasInputs && issue.isEmpty());
+        button->setToolTip(issue);
+    };
+    const auto slice = installation.issue("slice");
+    const auto asr = installation.issue("asr", {}, language);
+    const auto prepare = installation.issue("prepare", family);
+    const auto synthesis = installation.issue("synthesize", family);
+    const bool hasRaw = project_.contains("raw") || project_.contains("raw_pending");
+    const bool hasClips = project_.contains("clips");
+    const bool hasAnnotation = project_.contains("annotation");
+    const bool hasDataset = project_.contains("dataset");
+    const bool hasWeights = project_.contains("gpt") && project_.contains("sovits");
+    const bool sameEngine = project_.value("engine").toString().compare(launcher, Qt::CaseInsensitive) == 0;
+    const auto trainingIssue = hasDataset && !sameEngine
+        ? QStringLiteral("此项目的数据已在另一整合包中准备。可切回原整合包，或为当前整合包重新准备数据。") : training;
+    setAvailable(slice_, slice, hasRaw);
+    setAvailable(transcribe_, asr, hasClips);
+    setAvailable(prepare_, prepare, hasClips);
+    setAvailable(train_, trainingIssue, hasDataset && !hasWeights);
+    setAvailable(preview_, synthesis, hasWeights);
+    QString issue;
+    if (project_.isEmpty()) {
+        if (!canCreate) {
+            issue = QStringLiteral("此整合包没有可完成全部训练阶段的模型家族。");
+            if (!installation.error.isEmpty() || installation.package().isEmpty())
+                issue += "\n" + installation.description();
+        }
+    } else if (!active) {
+        if (hasWeights)
+            issue = synthesis;
+        else if (project_.contains("raw_pending") || (hasRaw && !hasClips))
+            issue = slice;
+        else if (hasDataset)
+            issue = trainingIssue;
+        else if (hasAnnotation)
+            issue = prepare;
+        else if (hasClips && !asr.isEmpty())
+            issue = asr + QStringLiteral("\n可以导入标注或手工校对。");
+        else if (!hasClips && !prepare.isEmpty())
+            issue = prepare;
+        if (!issue.isEmpty() && !family.isEmpty())
+            issue = QStringLiteral("项目家族 %1 · %2").arg(family, issue);
+    }
+    compatibilityStatus_->setText(issue);
+    compatibilityStatus_->setVisible(!issue.isEmpty());
+    compatibilityActions_->setVisible(!issue.isEmpty());
     const auto advise = [this](QPushButton *action, const QString &message) {
         stage_->setText(message);
         if (action == suggested_)
@@ -1197,6 +1271,15 @@ void TrainingPanel::showState()
         advise(slice_, QStringLiteral("原始录音已导入。点「切片」，将录音分成便于逐条标注的片段。"));
     } else {
         advise(recordings_, QStringLiteral("导入原始录音进行切片，或直接导入已切好的 WAV 片段。"));
+    }
+}
+
+void TrainingPanel::refreshEngineSelection()
+{
+    try {
+        showState();
+    } catch (const std::exception &error) {
+        status_->setText(QString::fromUtf8(error.what()));
     }
 }
 

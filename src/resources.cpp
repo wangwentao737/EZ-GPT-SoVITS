@@ -1,4 +1,5 @@
 #include "resources.h"
+#include "compatibility.h"
 #include "engine.h"
 
 #include <QDir>
@@ -131,8 +132,15 @@ QString operationLabel(const QString &operation)
         {"slice", QStringLiteral("切片")}, {"asr", QStringLiteral("自动转写")},
         {"prepare", QStringLiteral("准备训练数据")}, {"train_sovits", QStringLiteral("SoVITS 训练")},
         {"train_gpt", QStringLiteral("GPT 训练")},
+        {"resume_sovits", QStringLiteral("SoVITS 续训")}, {"resume_gpt", QStringLiteral("GPT 续训")},
     };
     return labels.value(operation, operation);
+}
+
+bool resourceRuleIncludesScript(const QString &operation, const QString &family,
+                                const QString &language, const QString &script)
+{
+    return script.endsWith(".py") && resourcesFor(operation, family, language).contains(script);
 }
 
 QString resourceIssue(const QString &engine, const QString &operation, const QString &family,
@@ -209,7 +217,7 @@ bool readableTrainingCheckpoint(const QString &path)
 
 QList<ResourceCheck> inspectResources(const QString &launcher, const QString &family, const QString &data,
                                       const QString &output, const QJsonObject &voice,
-                                      const QMap<QString, QString> &interfaces, const QString &only,
+                                      const EngineInstallation &installation, const QString &only,
                                       const std::atomic_bool &cancelled)
 {
     QList<ResourceCheck> checks;
@@ -226,17 +234,14 @@ QList<ResourceCheck> inspectResources(const QString &launcher, const QString &fa
         run(id, label, [&] { return checkDisk(id, label, path); });
     };
 
-    const auto operations = QStringList{"start"} + engineOperations() + QStringList{"asr-yue"};
+    const auto operations = compatibilityOperations() + QStringList{"asr-yue"};
     for (const auto &id : operations) {
         const auto operation = id == "asr-yue" ? QString("asr") : id;
         const auto label = id == "asr-yue" ? QStringLiteral("粤语自动转写")
             : id == "asr" ? QStringLiteral("普通话自动转写") : operationLabel(operation);
         run(id, label, [&] {
-            const auto engine = engineRoot(launcher);
-            auto issue = resourceIssue(engine, operation, family, id == "asr-yue" ? "yue" : "zh", &cancelled);
-            if (issue.isEmpty())
-                issue = interfaces.value(operation);
-            return ResourceCheck{id, label, issue.isEmpty() ? QStringLiteral("所需文件可读") : issue, issue.isEmpty()};
+            const auto issue = installation.issue(operation, family, id == "asr-yue" ? "yue" : "zh");
+            return ResourceCheck{id, label, issue.isEmpty() ? QStringLiteral("已登记，所需文件可读。") : issue, issue.isEmpty()};
         });
     }
     if (!voice.isEmpty()) {
@@ -244,7 +249,9 @@ QList<ResourceCheck> inspectResources(const QString &launcher, const QString &fa
         run("voice", label, [&] {
             auto request = voice;
             request["operation"] = "synthesize";
-            const auto issue = jobResourceIssue(engineRoot(launcher), data, request);
+            auto issue = installation.issue("synthesize", request.value("family").toString());
+            if (issue.isEmpty())
+                issue = jobResourceIssue(engineRoot(launcher), data, request);
             return ResourceCheck{"voice", label, issue.isEmpty()
                 ? QStringLiteral("两份权重和参考音频可读，可提交试音验证。") : issue, issue.isEmpty()};
         });

@@ -1,0 +1,58 @@
+{
+  "format": 1,
+  "revision": 2,
+  "ez_min": "0.1.22",
+  "ez_max": "0.1.99",
+  "packages": [
+    {
+      "id": "20261006",
+      "name": "GPT-SoVITS 20261006",
+      "identity_source": "独立测试副本的入口脚本 SHA-256",
+      "adapter": "20261006",
+      "scripts": {
+        "go-webui.bat": "56d3dafd65624c65a02485c5e39225e70308a3ffdc39ed1f3ce158bdaf93a5b5",
+        "webui.py": "fb351d2094f48b3fef480a6bc2377043a91bbdd9a30cca1ba4b1e8da3d762330",
+        "GPT_SoVITS/inference_webui_fast.py": "4b74448941b3a698a029af76e73d007560c415b8538a30c7989f39a154f14b17"
+      },
+      "capabilities": [
+        {"operation": "start", "resources": "20261006", "result": "passed", "report": "compat/acceptance-20261006.md#startup"},
+        {"operation": "slice", "resources": "20261006", "result": "passed", "report": "compat/acceptance-20261006.md#slice-and-asr",
+         "scripts": {"tools/slice_audio.py": "cb680f2d77d3f09803e1d8de25968d8ff46a4fbc6b19e8c1b5153c7f8befbca3"}},
+        {"operation": "asr", "language": "zh", "resources": "20261006", "result": "passed", "report": "compat/acceptance-20261006.md#slice-and-asr"},
+        {"operation": "synthesize", "family": "v5turbo", "resources": "20261006", "result": "passed", "report": "compat/acceptance-20261006.md#synthesis"},
+        {"operation": "synthesize", "family": "v2", "resources": "20261006", "result": "passed", "report": "compat/acceptance-20261006.md#synthesis"},
+        {"operation": "synthesize", "family": "v2Pro", "resources": "20261006", "result": "passed", "report": "compat/acceptance-20261006.md#synthesis"},
+        {"operation": "synthesize", "family": "v2ProPlus", "resources": "20261006", "result": "passed", "report": "compat/acceptance-20261006.md#synthesis"},
+        {"operation": "prepare", "family": "v5turbo", "resources": "20261006", "result": "passed", "report": "compat/acceptance-20261006.md#training",
+         "scripts": {
+           "GPT_SoVITS/prepare_datasets/1-get-text.py": "de50b7d45b1dd1986aa023dad7681541989ba8fa2b28cd7270702101d1bec4aa",
+           "GPT_SoVITS/prepare_datasets/2-get-hubert-wav32k.py": "e46d39e0c3f5f298507ff40540a38f6d50de0ae30a259759862f7efa61a60586",
+           "GPT_SoVITS/prepare_datasets/3-get-semantic.py": "d6cd2e5e26f8b72dfcfa8756ff17ac7c1654dea1a1c63c5d2aa52e0e1f67b5ef"
+         }},
+        {"operation": "train_sovits", "family": "v5turbo", "resources": "20261006", "result": "passed", "report": "compat/acceptance-20261006.md#training",
+         "scripts": {"GPT_SoVITS/s2_train_v3_lora.py": "9e1aa4a3b2f3450032831ca4a490dcfd13342f60c83ea2eaba36e4c987d99f4a"}},
+        {"operation": "train_gpt", "family": "v5turbo", "resources": "20261006", "result": "passed", "report": "compat/acceptance-20261006.md#training",
+         "scripts": {"GPT_SoVITS/s1_train.py": "fa499153871d8ba79dd9e07a4494c5844bfb67875c2791718ea0fd787353bbbe"}},
+        {"operation": "resume_sovits", "family": "v5turbo", "resources": "20261006", "result": "passed", "report": "compat/acceptance-20261006.md#resuming"},
+        {"operation": "resume_gpt", "family": "v5turbo", "resources": "20261006", "result": "passed", "report": "compat/acceptance-20261006.md#resuming"}
+      ]
+    },
+    {
+      "id": "0725-cu124",
+      "name": "GPT-SoVITS 0725-cu124",
+      "identity_source": "本机 0725-cu124 样本的脚本 SHA-256",
+      "adapter": "0725-cu124",
+      "scripts": {
+        "go-webui.bat": "56d3dafd65624c65a02485c5e39225e70308a3ffdc39ed1f3ce158bdaf93a5b5",
+        "webui.py": "da9444718a062c625a7cfbd8c4026c5f27fdf36bb5c3d3f60654a87090c77d3f",
+        "GPT_SoVITS/inference_webui_fast.py": "3a3d09cc29f38f665a2fb3954a8c1361f6765c422fba25baac36fd0e2d217afe"
+      },
+      "capabilities": [
+        {"operation": "start", "resources": "20261006", "result": "passed", "report": "compat/acceptance-0725-cu124.md#startup"},
+        {"operation": "synthesize", "family": "v2", "resources": "20261006", "result": "passed", "report": "compat/acceptance-0725-cu124.md#synthesis"},
+        {"operation": "synthesize", "family": "v2Pro", "resources": "20261006", "result": "passed", "report": "compat/acceptance-0725-cu124.md#synthesis"},
+        {"operation": "synthesize", "family": "v2ProPlus", "resources": "20261006", "result": "passed", "report": "compat/acceptance-0725-cu124.md#synthesis"}
+      ]
+    }
+  ]
+}

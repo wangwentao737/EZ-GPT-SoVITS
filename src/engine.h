@@ -27,21 +27,24 @@ struct EnginePorts {
     quint16 inference = 9872;
 };
 
-EnginePorts enginePorts(const QString &directory);
+EnginePorts enginePorts(const QString &directory, const QString &adapter = {});
 QString engineFingerprint(const QString &directory);
-QString resumeEngineIssue(const QString &directory, const QString &family);
+QString resumeEngineIssue(const QString &directory, const QString &family,
+                          const QString &operation = {}, const QString &adapter = {});
 
 class EngineManager final : public QObject {
     Q_OBJECT
 public:
     explicit EngineManager(QObject *parent = nullptr);
     ~EngineManager() override;
-    void start(const QString &launcher, const QString &logPath);
+    void start(const QString &launcher, const QString &logPath, const QString &adapter = {});
     void stop();
     bool ready() const;
     bool active() const;
+    bool canStart() const;
     QString root() const;
-    QString interfaceIssue(const QString &operation) const;
+    QString adapter() const { return adapter_; }
+    QString fingerprint() const { return fingerprint_; }
     QMap<QString, QString> interfaceIssues() const;
     QString devices() const;
     QString gradioVersion() const;
@@ -64,6 +67,8 @@ private:
     QString gradio_;
     EnginePorts ports_;
     QString root_;
+    QString adapter_;
+    QString fingerprint_;
     QString logPath_;
     int ticks_ = 0;
     bool ready_ = false;

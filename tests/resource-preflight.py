@@ -16,6 +16,32 @@ import zipfile
 
 from workspace_paths import workspace_path
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def fixture_file(engine, name):
+    path = engine / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("Compatibility simulation fixture.", encoding="ascii")
+
+
+def register_fixture(data, engine, operations, fixture_id="preflight-simulator"):
+    cache = data / "compat-registry-v1.json"
+    registry = json.loads((cache if cache.exists() else ROOT / "compat/registry-v1.json").read_bytes())
+    registry["revision"] += 1
+    registry["packages"].append({
+        "id": fixture_id, "name": fixture_id, "identity_source": "Isolated test fixture",
+        "adapter": "20261006",
+        "scripts": {path: hashlib.sha256((engine / path).read_bytes()).hexdigest()
+                    for path in ("go-webui.bat", "webui.py", "GPT_SoVITS/inference_webui_fast.py")},
+        "capabilities": [
+            {"operation": operation, **({} if operation == "slice" else {"family": "v5turbo"}),
+             "resources": "20261006", "result": "passed", "report": "isolated simulator"}
+            for operation in operations
+        ],
+    })
+    cache.write_text(json.dumps(registry), encoding="utf-8")
+
 
 def invoke(program, data, launcher, requests=None, expected=0):
     args = [str(program), "--data-root", str(data), "--probe-engine", str(launcher)]
@@ -49,15 +75,16 @@ def check_batch_startup_failures(program, workspace):
     engine.mkdir()
     launcher = engine / "go-webui.bat"
     launcher.write_text("@echo deliberate startup failure\n@exit /b 7\n", encoding="ascii")
-    requests = [{"operation": "synthesize", "text": f"Line {index}"} for index in range(1, 4)]
-
     for case, match in (("missing-runtime", "runtime/python.exe"), ("early-exit", "引擎启动超时或已经退出")):
-        if case == "early-exit":
-            (engine / "runtime").mkdir()
-            for name in ("runtime/python.exe", "webui.py", "config.py"):
-                (engine / name).write_text("Startup-only test fixture.", encoding="ascii")
+        requests = [{"operation": "slice", "text": f"Line {index}"} for index in range(1, 4)]
         data = workspace / case
         data.mkdir()
+        if case == "early-exit":
+            for name in ("runtime/python.exe", "webui.py", "config.py", "tools/slice_audio.py",
+                         "GPT_SoVITS/inference_webui_fast.py"):
+                fixture_file(engine, name)
+            (engine / "config.py").write_text("webui_port_main = 19884\nwebui_port_infer_tts = 19882\n", encoding="ascii")
+            register_fixture(data, engine, ("slice",))
         invoke(program, data, launcher, requests, expected=3)
         with sqlite3.connect(data / "library.sqlite") as database:
             rows = database.execute("SELECT state,request,message,result FROM jobs ORDER BY rowid").fetchall()
@@ -70,7 +97,7 @@ def check_batch_startup_failures(program, workspace):
 
     data = workspace / "invalid-batch"
     data.mkdir()
-    invoke(program, data, launcher, [requests[0], {**requests[1], "output_root": "relative/output"}], expected=1)
+    invoke(program, data, launcher, [requests[0], {"operation": "synthesize", "output_root": "relative/output"}], expected=1)
     with sqlite3.connect(data / "library.sqlite") as database:
         assert database.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
     assert not (data / "engine-start.log").exists()
@@ -117,6 +144,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
+        Path("listener-probed.txt").touch()
         self.wfile.write(Path(self.path[1:] + ".json").read_bytes())
     def do_POST(self):
         Path("unexpected-post.txt").touch()
@@ -127,6 +155,17 @@ HTTPServer(("127.0.0.1", config.webui_port_main), Handler).serve_forever()
     launcher = engine / "go-webui.bat"
     launcher.write_text(f'@"{sys.executable}" -B -u "%~dp0webui.py"\n', encoding="utf-8")
     (engine / "config.py").write_text("webui_port_main = 19874\nwebui_port_infer_tts = 19872\n", encoding="ascii")
+    for name in ("tools/slice_audio.py", "GPT_SoVITS/inference_webui_fast.py",
+                 "GPT_SoVITS/s2_train_v3_lora.py", "GPT_SoVITS/s1_train.py", "GPT_SoVITS/configs/s2.json",
+                 "GPT_SoVITS/configs/s1longer-v2.yaml", "GPT_SoVITS/pretrained_models/s1v3.ckpt",
+                 "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/s2Gv5turbo.pth",
+                 "GPT_SoVITS/pretrained_models/gsv-v5-pretrained/vocoder.pth",
+                 "GPT_SoVITS/pretrained_models/chinese-hubert-base/config.json",
+                 "GPT_SoVITS/pretrained_models/chinese-hubert-base/pytorch_model.bin",
+                 "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large/config.json",
+                 "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large/pytorch_model.bin",
+                 "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large/tokenizer.json"):
+        fixture_file(engine, name)
 
     for case, operation, affected, evidence in (
         ("new-version-and-port", None, None, None),
@@ -148,6 +187,7 @@ HTTPServer(("127.0.0.1", config.webui_port_main), Handler).serve_forever()
         (engine / "info.json").write_text(json.dumps(current_info), encoding="utf-8")
         data = workspace / f"interface-{case}"
         invoke(program, data, launcher)
+        register_fixture(data, engine, ("slice", "synthesize", "train_sovits", "train_gpt"))
         report = (data / "probe-result.txt").read_text(encoding="utf-8")
         if operation is None:
             assert "引擎可以使用" in report, report
@@ -158,7 +198,17 @@ HTTPServer(("127.0.0.1", config.webui_port_main), Handler).serve_forever()
             assert not (engine / "unexpected-post.txt").exists()
             continue
         assert f"{affected}暂不可用" in report and "切片暂不可用" not in report, report
-        invoke(program, data, launcher, [{"operation": operation, "family": "v5turbo"}], expected=3)
+        request = {"operation": operation, "family": "v5turbo"}
+        if operation == "synthesize":
+            for kind, suffix in (("sovits", "pth"), ("gpt", "ckpt")):
+                weight = data / f"test.{suffix}"
+                with zipfile.ZipFile(weight, "w") as checkpoint:
+                    checkpoint.writestr("test", "preflight")
+                request[kind] = weight.as_posix()
+            reference = data / "ref.wav"
+            fixture_file(data, reference.name)
+            request["reference"] = reference.as_posix()
+        invoke(program, data, launcher, [request], expected=3)
         with sqlite3.connect(data / "library.sqlite") as database:
             state, reason = database.execute("SELECT state,message FROM jobs").fetchone()
         assert state == "failed" and evidence in reason, (state, reason)
@@ -168,6 +218,40 @@ HTTPServer(("127.0.0.1", config.webui_port_main), Handler).serve_forever()
         assert not (engine / "unexpected-post.txt").exists()
     print("Interface: minor version and custom ports accepted with intact contracts; "
           "renamed endpoint, reordered parameters and changed return blocked only their operations.", flush=True)
+
+    # A queued job from an earlier session keeps its selected package when a new package is submitted.
+    old_config = copy.deepcopy(config)
+    next(dep for dep in old_config["dependencies"] if dep["api_name"] == "open_slice")["api_name"] = "renamed_slice"
+    (engine / "config.json").write_text(json.dumps(old_config), encoding="utf-8")
+    (engine / "info.json").write_text(json.dumps(info), encoding="utf-8")
+    other = workspace / "second-package"
+    shutil.copytree(engine, other)
+    (other / "webui.py").write_text(simulator + "\n# Second build\n", encoding="ascii")
+    (other / "config.py").write_text("webui_port_main = 19894\nwebui_port_infer_tts = 19892\n", encoding="ascii")
+    for package in (engine, other):
+        (package / "listener-probed.txt").unlink(missing_ok=True)
+    data = workspace / "switched-queue"
+    data.mkdir()
+    invoke(program, data, launcher, [{"operation": "synthesize", "family": "future-family"}], expected=3)
+    register_fixture(data, engine, ("slice",))
+    register_fixture(data, other, ("slice",), "second-simulator")
+    identifier = str(uuid.uuid4())
+    request = {"operation": "slice", "family": "v5turbo", "compat_package": "preflight-simulator",
+               "compat_adapter": "20261006", "compat_fingerprint": hashlib.sha256((engine / "webui.py").read_bytes()).hexdigest()}
+    with sqlite3.connect(data / "library.sqlite") as database:
+        database.execute("INSERT INTO jobs(id, created, launcher, operation, state, request)"
+                         " VALUES (?, '2026-01-01T00:00:00.000Z', ?, 'slice', 'queued', ?)",
+                         (identifier, launcher.as_posix(), json.dumps(request)))
+    invoke(program, data, other / "go-webui.bat", [{"operation": "slice", "family": "v5turbo"}], expected=3)
+    with sqlite3.connect(data / "library.sqlite") as database:
+        rows = database.execute("SELECT id,launcher,state,request,message FROM jobs WHERE operation='slice' ORDER BY rowid").fetchall()
+    assert rows[0][0] == identifier and rows[0][1] == launcher.as_posix() and json.loads(rows[0][3]) == request
+    assert rows[1][1] == (other / "go-webui.bat").as_posix()
+    assert all(state == "failed" and "open_slice" in message for _, _, state, _, message in rows), rows
+    assert all((package / "listener-probed.txt").is_file() and not (package / "unexpected-post.txt").exists()
+               for package in (engine, other))
+    print("Queue: both installations were probed in order and neither job changed package or reached a changed interface.",
+          flush=True)
 
 
 def check_real_batch(program, engine, fixture, data, scratch):
