@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -127,13 +128,19 @@ def run(program, engine, scratch, fixture, voices, name, terminate_row=None):
         assert state == "succeeded", (data, job, state)
         result = json.loads(result)
         audio = workspace_path(data, result["audio"])
-        assert audio.name == job + ".wav" and audio.parent.parent.name == voices[index]
+        if name == "baseline":
+            assert audio.name == job + ".wav"
+        else:
+            assert re.fullmatch(r"synth-[0-9]{12}(?:-[0-9]+)?\.wav", audio.name)
+            assert result["archive_job"] == job
+        assert audio.parent.parent.name == voices[index]
         assert hashlib.sha256(audio.read_bytes()).hexdigest() == result["sha256"]
         with wave.open(str(audio), "rb") as stream:
             assert stream.getnframes() > 0
         for index, suffix in enumerate((".ckpt", ".pth")):
             assert not (weights[index] / ("ez_" + job.replace("-", "") + suffix)).exists()
         results.append(result)
+    assert len({result["audio"] for result in results}) == len(results)
     log = (data / "engine-start.log").read_text(encoding="utf-8", errors="replace")
     launches = sum("Running on local URL:" in line and line.rstrip().endswith(":9872") for line in log.splitlines())
     metrics = {"first_seconds": round(first, 2), "batch_seconds": round(elapsed, 2),

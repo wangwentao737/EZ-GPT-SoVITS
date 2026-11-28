@@ -2,7 +2,6 @@
 #include "engine.h"
 #include "jobs.h"
 #include "ui.h"
-#include "voiceverification.h"
 #include "scriptlines.h"
 #include "workspacepaths.h"
 
@@ -11,7 +10,6 @@
 #include <QComboBox>
 #include <QCryptographicHash>
 #include <QDesktopServices>
-#include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -135,13 +133,11 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
 {
     QSqlQuery query;
     query.prepare("CREATE TABLE IF NOT EXISTS voices ("
-                  "id TEXT PRIMARY KEY, name TEXT NOT NULL, settings BLOB NOT NULL,"
-                  "verified_engine TEXT NOT NULL DEFAULT '')");
+                  "id TEXT PRIMARY KEY, name TEXT NOT NULL, settings BLOB NOT NULL)");
     execute(query);
 
     auto *layout = new QVBoxLayout(this);
-    ui::pageHeader(layout, this, QStringLiteral("语音合成"),
-        QStringLiteral("选一个声音和台词语言，输入台词后点「生成语音」。首次使用可先导入权重和参考音频。"));
+    ui::pageHeader(layout, this, QStringLiteral("语音合成"));
     auto *selectors = new QHBoxLayout;
     family_ = new QComboBox(this);
     family_->setPlaceholderText(QStringLiteral("无可选家族"));
@@ -151,6 +147,7 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
     voices_ = new QComboBox(this);
     voices_->setPlaceholderText(QStringLiteral("先导入一个声音"));
     voices_->setAccessibleName(QStringLiteral("声音预设"));
+    ui::fitComboBox(voices_, 12);
     language_ = new QComboBox(this);
     language_->addItems(languages);
     language_->setAccessibleName(QStringLiteral("台词语言"));
@@ -184,10 +181,11 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
     text_ = new QPlainTextEdit(this);
     text_->setObjectName("scriptEditor");
     text_->setAccessibleName(QStringLiteral("合成台词"));
-    text_->setPlaceholderText(QStringLiteral("在这里输入台词。批量生成时，每行输入一段。"));
+    text_->setPlaceholderText(QStringLiteral("输入要合成的台词…"));
     layout->addWidget(text_, 1);
     auto *parameters = new QHBoxLayout;
-    batch_ = new QCheckBox(QStringLiteral("每行生成一条音频"), this);
+    batch_ = new QCheckBox(QStringLiteral("按行生成"), this);
+    batch_->setToolTip(QStringLiteral("为每一行台词生成一条音频。"));
     parameters->addWidget(batch_);
     auto *lineCount = ui::hint({}, this);
     lineCount->setObjectName("batchLineCount");
@@ -384,7 +382,7 @@ SynthesisPanel::SynthesisPanel(QString root, TaskScheduler &scheduler, std::func
             query.addBindValue(QJsonDocument(storedWorkspacePaths(result)).toJson(QJsonDocument::Compact));
             execute(query);
             refreshVoices(id);
-            status_->setText(QStringLiteral("声音已保存。输入短句生成试听，完成兼容性验证。"));
+            status_->setText(QStringLiteral("声音已保存。"));
         } catch (const std::exception &error) {
             status_->setText(QString::fromUtf8(error.what()));
         }
@@ -451,7 +449,7 @@ void SynthesisPanel::refreshVoices(const QString &selected)
     const auto previous = voices_->currentData().toString();
     if (!selected.isEmpty())
         rememberedVoice_ = selected;
-    auto query = voicesWithVerification();
+    QSqlQuery query("SELECT id,name,settings FROM voices ORDER BY name");
     if (query.lastError().isValid())
         throw std::runtime_error(query.lastError().text().toStdString());
     const auto launcher = launcher_();
@@ -461,8 +459,6 @@ void SynthesisPanel::refreshVoices(const QString &selected)
         QString id;
         QString name;
         QJsonObject settings;
-        QString legacy;
-        QJsonObject verification;
     };
     QList<Preset> presets;
     while (query.next()) {
@@ -470,8 +466,7 @@ void SynthesisPanel::refreshVoices(const QString &selected)
         auto settings = readWorkspaceRecord(query.value(2).toByteArray());
         if (id == rememberedVoice_)
             rememberedFamily_ = settings.value("family").toString();
-        presets.append({id, query.value(1).toString(), std::move(settings), query.value(3).toString(),
-            QJsonDocument::fromJson(query.value(4).toByteArray()).object()});
+        presets.append({id, query.value(1).toString(), std::move(settings)});
     }
     const QSignalBlocker familyBlock(family_);
     family_->clear();
@@ -490,18 +485,10 @@ void SynthesisPanel::refreshVoices(const QString &selected)
     family_->setCurrentIndex(familyIndex);
     const QSignalBlocker block(voices_);
     voices_->clear();
-    for (const auto &[id, name, settings, legacy, record] : presets) {
+    for (const auto &[id, name, settings] : presets) {
         if (settings.value("family") != family_->currentText())
             continue;
-        const auto state = voiceVerificationStatus(settings, record, legacy, launcher);
-        voices_->addItem(name + QStringLiteral(" · ") + state, id);
-        const auto date = QDateTime::fromString(record.value("verified_at").toString(), Qt::ISODateWithMs).toLocalTime();
-        auto details = state;
-        if (date.isValid()) {
-            details += QStringLiteral("\n上次试音 · %1\n%2")
-                .arg(date.toString("yyyy-MM-dd HH:mm:ss"), record.value("launcher").toString());
-        }
-        voices_->setItemData(voices_->count() - 1, details, Qt::ToolTipRole);
+        voices_->addItem(name, id);
         voices_->setItemData(voices_->count() - 1, settings, voiceSettingsRole);
     }
     const int index = voices_->findData(rememberedVoice_);
@@ -607,13 +594,17 @@ void SynthesisPanel::importVoice(QJsonObject defaults)
         return;
     }
     QDialog dialog(this);
-    dialog.setWindowTitle(QStringLiteral("导入声音"));
+    const bool fromTraining = defaults.contains("id");
+    const auto launcher = launcher_();
+    dialog.setWindowTitle(fromTraining ? QStringLiteral("保存训练声音") : QStringLiteral("导入声音"));
     dialog.resize(650, 430);
     auto *form = new QFormLayout(&dialog);
-    form->addRow(ui::hint(QStringLiteral("选择同一个声音的两份配套权重，再添加一段参考录音和对应原文。"), &dialog));
+    form->addRow(ui::hint(fromTraining
+        ? QStringLiteral("核对声音名称和参考片段后保存。")
+        : QStringLiteral("选择配套权重，再添加参考录音和对应原文。"), &dialog));
     auto *name = new QLineEdit(defaults.value("name").toString(), &dialog);
     auto *family = new QComboBox(&dialog);
-    const auto installation = scheduler_.compatibility().inspect(launcher_());
+    const auto installation = scheduler_.compatibility().inspect(launcher);
     family->addItems(installation.families({"synthesize"}));
     const auto originalFamily = defaults.value("family").toString();
     if (!originalFamily.isEmpty() && family->findText(originalFamily) < 0 && defaults.contains("id"))
@@ -760,17 +751,22 @@ void SynthesisPanel::generate()
             submittedJob_ = scheduler_.enqueue(launcher, request);
             submittedBatch_.clear();
         }
-        audio_.clear();
-        player_->setSource({});
-        play_->setEnabled(false);
-        play_->setToolTip({});
-        export_->setEnabled(false);
-        folder_->setEnabled(false);
-        status_->setToolTip({});
+        resetAudio();
         refreshSubmission();
     } catch (const std::exception &error) {
         status_->setText(QString::fromUtf8(error.what()));
     }
+}
+
+void SynthesisPanel::resetAudio()
+{
+    audio_.clear();
+    player_->setSource({});
+    play_->setEnabled(false);
+    play_->setToolTip({});
+    export_->setEnabled(false);
+    folder_->setEnabled(false);
+    status_->setToolTip({});
 }
 
 void SynthesisPanel::refreshSubmission()
@@ -790,7 +786,7 @@ void SynthesisPanel::refreshSubmission()
         if (state == "queued")
             status_->setText(QStringLiteral("已加入队列，等待引擎或前面的任务。"));
         else if (state == "running")
-            status_->setText(query.value(1).toString().isEmpty() ? QStringLiteral("正在生成语音…") : query.value(1).toString());
+            status_->clear();
         else if (state == "failed")
             status_->setText(query.value(1).toString());
         else if (state == "cancelled")
@@ -847,14 +843,6 @@ void SynthesisPanel::receiveAudio(const QString &id, const QJsonObject &result)
         folder_->setEnabled(true);
         if (!batch)
             status_->setText(QStringLiteral("语音已生成 · %1 秒").arg(result.value("duration").toDouble(), 0, 'f', 2));
-    }
-    if (result.contains("voice_verification")) {
-        query.finish();
-        try {
-            refreshVoices();
-        } catch (const std::exception &error) {
-            status_->setText(QString::fromUtf8(error.what()));
-        }
     }
 }
 

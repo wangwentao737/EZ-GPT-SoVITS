@@ -38,6 +38,9 @@ QString compatibilityOperation(const QJsonObject &request);
 QString adapterContractFile(const QString &adapter);
 QString defaultEngineAdapter();
 QString engineScriptDigest(const QString &directory, const QString &relativePath);
+QJsonObject validatedCompatibilityRegistry(const QByteArray &contents);
+QStringList supportedEngineAdapters();
+QStringList adapterOperations(const QString &adapter);
 
 class CompatibilityRegistry final : public QObject {
     Q_OBJECT

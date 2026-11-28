@@ -3,6 +3,7 @@
 #include "settings.h"
 
 #include <QCryptographicHash>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -304,6 +305,19 @@ void invalidateTraining(QJsonObject &project)
 QString resolvedWorkspacePath(const QString &path)
 {
     return mapPath(path, false);
+}
+
+QString nextArtifactPath(const QString &directory, const QString &type, const QString &extension,
+                         const QString &temporarySuffix)
+{
+    const QDir parent(checkedPath(directory));
+    const auto stem = type + '-' + QDateTime::currentDateTime().toString("yyyyMMddHHmm");
+    for (int sequence = 1;; ++sequence) {
+        const auto name = sequence == 1 ? stem : stem + '-' + QString::number(sequence);
+        const auto path = parent.filePath(name + extension);
+        if (!QFileInfo::exists(path) && (temporarySuffix.isEmpty() || !QFileInfo::exists(path + temporarySuffix)))
+            return checkedPath(path);
+    }
 }
 
 QJsonObject storedWorkspacePaths(QJsonObject object)

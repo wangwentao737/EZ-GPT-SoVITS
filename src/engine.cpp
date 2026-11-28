@@ -20,9 +20,11 @@
 #include <QNetworkReply>
 #include <QProcessEnvironment>
 #include <QRegularExpression>
+#include <QScopeGuard>
 #include <QStorageInfo>
 #include <QtConcurrentRun>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace ez {
@@ -31,6 +33,30 @@ namespace {
 [[noreturn]] void fail(const QString &message)
 {
     throw std::runtime_error(message.toStdString());
+}
+
+QMap<int, QString> localCudaDevices()
+{
+    const auto library = LoadLibraryExW(L"nvcuda.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!library)
+        return {};
+    const auto unload = qScopeGuard([library] { FreeLibrary(library); });
+    const auto init = reinterpret_cast<int (WINAPI *)(unsigned int)>(GetProcAddress(library, "cuInit"));
+    const auto count = reinterpret_cast<int (WINAPI *)(int *)>(GetProcAddress(library, "cuDeviceGetCount"));
+    const auto device = reinterpret_cast<int (WINAPI *)(int *, int)>(GetProcAddress(library, "cuDeviceGet"));
+    const auto name = reinterpret_cast<int (WINAPI *)(char *, int, int)>(GetProcAddress(library, "cuDeviceGetName"));
+    int total = 0;
+    if (!init || !count || !device || !name || init(0) != 0 || count(&total) != 0)
+        return {};
+
+    QMap<int, QString> result;
+    for (int index = 0; index < qMin(total, 100); ++index) {
+        int handle = 0;
+        char model[256]{};
+        if (device(&handle, index) == 0 && name(model, int(sizeof(model)), handle) == 0 && model[0])
+            result.insert(index, QString::fromUtf8(model));
+    }
+    return result;
 }
 
 DWORD listener(quint16 port)
@@ -58,23 +84,28 @@ QJsonObject fetchApi(quint16 port, const QString &path)
     request.setTransferTimeout(2500);
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
     auto *reply = network.get(request);
+    QTimer::singleShot(5000, reply, &QNetworkReply::abort);
+    constexpr qsizetype limit = 4 * 1024 * 1024;
+    QByteArray body;
+    bool oversized = false;
+    const auto read = [&] {
+        if (reply->bytesAvailable() > limit - body.size()) {
+            oversized = true;
+            reply->abort();
+        } else {
+            body += reply->readAll();
+        }
+    };
+    QObject::connect(reply, &QNetworkReply::readyRead, reply, read);
     QEventLoop loop;
     QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
     if (!reply->isFinished())
         loop.exec();
-    if (reply->error() != QNetworkReply::NoError)
+    read();
+    if (oversized || reply->error() != QNetworkReply::NoError
+        || reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() != 200)
         return {};
-    return QJsonDocument::fromJson(reply->readAll()).object();
-}
-
-QJsonObject engineContract(const QString &adapter)
-{
-    const auto selected = adapter.isEmpty() ? defaultEngineAdapter() : adapter;
-    QFile file(":/engine/" + adapterContractFile(selected));
-    const auto contract = file.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(file.readAll()).object() : QJsonObject{};
-    if (contract.value("id") != selected)
-        fail(QStringLiteral("当前程序缺少引擎适配契约：%1").arg(selected));
-    return contract;
+    return QJsonDocument::fromJson(body).object();
 }
 
 QString interfaceChange(const QString &method, const QJsonObject &expected, const QJsonArray &dependencies,
@@ -155,6 +186,61 @@ EngineProbe probeApi(quint16 port, QJsonObject contract)
     return result;
 }
 
+}
+
+QJsonObject engineContract(const QString &adapter)
+{
+    const auto selected = adapter.isEmpty() ? defaultEngineAdapter() : adapter;
+    QFile file(":/engine/" + adapterContractFile(selected));
+    const auto contract = file.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(file.readAll()).object() : QJsonObject{};
+    if (contract.value("id") != selected)
+        fail(QStringLiteral("当前程序缺少引擎适配契约：%1").arg(selected));
+    return contract;
+}
+
+EngineInterfaceSnapshot capturePackageInterface(const QString &directory, quint16 port)
+{
+    const auto expected = checkedPath(directory + "/runtime/python.exe");
+    const auto confirmOwner = [&] {
+        const auto pid = listener(port);
+        if (!pid)
+            fail(QStringLiteral("端口 %1 尚未启动。请先在所选副本中启动对应服务。").arg(port));
+        const auto process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!process)
+            fail(QStringLiteral("无法检查端口 %1 的进程归属。").arg(port));
+        const auto close = qScopeGuard([process] { CloseHandle(process); });
+        std::wstring image(32768, L'\0');
+        auto size = static_cast<DWORD>(image.size());
+        if (!QueryFullProcessImageNameW(process, 0, image.data(), &size)
+            || QDir::fromNativeSeparators(QString::fromWCharArray(image.data(), size))
+                   .compare(expected, Qt::CaseInsensitive) != 0)
+            fail(QStringLiteral("端口 %1 由其他程序占用。请确认启动的是所选整合包副本。").arg(port));
+        return pid;
+    };
+    const auto pid = confirmOwner();
+    const EngineInterfaceSnapshot snapshot{fetchApi(port, "config"), fetchApi(port, "info")};
+    if (confirmOwner() != pid || !snapshot.config.value("dependencies").isArray()
+        || snapshot.config.value("version").toString().isEmpty() || !snapshot.info.value("named_endpoints").isObject())
+        fail(QStringLiteral("端口 %1 的服务已变化，或无法读取完整的接口快照。").arg(port));
+    return snapshot;
+}
+
+QStringList compareEngineInterface(const EngineInterfaceSnapshot &observed, const QJsonObject &expected)
+{
+    QMap<int, QJsonObject> components;
+    for (const auto &item : observed.config.value("components").toArray()) {
+        const auto component = item.toObject();
+        components.insert(component.value("id").toInt(-1), component);
+    }
+    const auto dependencies = observed.config.value("dependencies").toArray();
+    const auto endpoints = observed.info.value("named_endpoints").toObject();
+    QStringList differences;
+    for (auto method = expected.constBegin(); method != expected.constEnd(); ++method) {
+        const auto issue = interfaceChange(method.key(), method.value().toObject(), dependencies, components, endpoints);
+        if (!issue.isEmpty())
+            differences.append(issue);
+    }
+    return differences;
 }
 
 QString checkedPath(const QString &path)
@@ -286,6 +372,10 @@ struct EngineManager::Process {
 
 EngineManager::EngineManager(QObject *parent) : QObject(parent)
 {
+    connect(&localDeviceProbe_, &QFutureWatcherBase::finished, this, [this] {
+        localDevices_ = localDeviceProbe_.result();
+        emit trainingDevicesChanged();
+    });
     timer_.setInterval(750);
     connect(&timer_, &QTimer::timeout, this, &EngineManager::poll);
     connect(&probe_, &QFutureWatcher<EngineProbe>::finished, this, [this] {
@@ -316,6 +406,7 @@ EngineManager::~EngineManager()
     timer_.stop();
     process_.reset();
     probe_.waitForFinished();
+    localDeviceProbe_.waitForFinished();
 }
 
 void EngineManager::start(const QString &launcher, const QString &logPath, const QString &adapter)
@@ -445,6 +536,36 @@ QMap<QString, QString> EngineManager::interfaceIssues() const
 }
 
 QString EngineManager::devices() const { return ready_ ? devices_ : QString(); }
+
+QMap<int, QString> reportedTrainingDevices(const QString &report)
+{
+    static const QRegularExpression row(R"(^\s*(\d{1,2})\s+(.+)$)");
+    QMap<int, QString> result;
+    for (const auto &line : report.split('\n')) {
+        const auto match = row.match(line.trimmed());
+        if (!match.hasMatch())
+            continue;
+        const auto label = match.captured(2).simplified();
+        result.insert(match.captured(1).toInt(), label.startsWith("CPU ") ? QStringLiteral("CPU") : label);
+    }
+    return result;
+}
+
+QMap<int, QString> EngineManager::trainingDevices(const QString &launcher) const
+{
+    if (ready_ && (root_ + "/go-webui.bat").compare(QDir::fromNativeSeparators(launcher), Qt::CaseInsensitive) == 0) {
+        const auto reported = reportedTrainingDevices(devices_);
+        if (!reported.isEmpty())
+            return reported;
+    }
+    return localDevices_;
+}
+
+void EngineManager::discoverLocalDevices()
+{
+    localDeviceProbe_.setFuture(QtConcurrent::run(localCudaDevices));
+}
+
 QString EngineManager::gradioVersion() const { return ready_ ? gradio_ : QString(); }
 EnginePorts EngineManager::ports() const { return ports_; }
 

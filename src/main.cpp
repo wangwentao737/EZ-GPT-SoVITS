@@ -9,10 +9,12 @@
 #include "training.h"
 #include "ui.h"
 
+#include <windows.h>
+#include <dwmapi.h>
+
 #include <QApplication>
 #include <QClipboard>
 #include <QCloseEvent>
-#include <QColor>
 #include <QComboBox>
 #include <QCommandLineParser>
 #include <QCryptographicHash>
@@ -40,6 +42,7 @@
 #include <QProcess>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QScrollArea>
 #include <QScrollBar>
 #include <QSignalBlocker>
 #include <QSqlDatabase>
@@ -62,6 +65,11 @@ namespace {
 QString failureMessage(const std::exception &error)
 {
     return QString::fromUtf8(error.what());
+}
+
+ez::ui::Theme workspaceTheme()
+{
+    return ez::workspaceSetting("appearanceTheme") == "light" ? ez::ui::Theme::Light : ez::ui::Theme::Dark;
 }
 
 void checkQuery(const QSqlQuery &query)
@@ -124,13 +132,13 @@ public:
         resize(1120, 740);
         setMinimumSize(900, 600);
         setObjectName("workspace");
-        setStyleSheet(ez::ui::stylesheet());
+        ez::ui::applyTheme(workspaceTheme());
         auto *shell = new QHBoxLayout(this);
         shell->setContentsMargins(0, 0, 0, 0);
         shell->setSpacing(0);
         auto *sidebar = new QWidget(this);
         sidebar->setObjectName("sidebar");
-        sidebar->setFixedWidth(182);
+        sidebar->setFixedWidth(170);
         auto *rail = new QVBoxLayout(sidebar);
         rail->setContentsMargins(13, 21, 13, 16);
         rail->setSpacing(12);
@@ -159,7 +167,7 @@ public:
 
         auto *content = new QWidget(this);
         auto *layout = new QVBoxLayout(content);
-        layout->setContentsMargins(25, 22, 25, 15);
+        layout->setContentsMargins(22, 19, 22, 14);
         layout->setSpacing(10);
         shell->addWidget(content, 1);
         auto *tabs = new QTabWidget(content);
@@ -168,8 +176,7 @@ public:
         auto *home = new QWidget(tabs);
         tabs->addTab(home, QStringLiteral("工作台"));
         auto *homeLayout = new QVBoxLayout(home);
-        ez::ui::pageHeader(homeLayout, home, QStringLiteral("工作台"),
-            QStringLiteral("首次使用先在设置添加 GPT-SoVITS 启动路径，再选择合成或训练。"));
+        ez::ui::pageHeader(homeLayout, home, QStringLiteral("工作台"));
 
         auto *paths = new QHBoxLayout;
         paths->setSpacing(11);
@@ -184,8 +191,8 @@ public:
             paths->addWidget(card, 1);
             return button;
         };
-        auto *existing = workflow(QStringLiteral("使用已有模型"), QStringLiteral("导入两份权重和参考录音，直接合成台词。"));
-        auto *newVoice = workflow(QStringLiteral("用录音训练声音"), QStringLiteral("从录音切片、标注，训练并保存一个新声音。"));
+        auto *existing = workflow(QStringLiteral("使用已有模型"), QStringLiteral("导入权重与参考音频，合成台词。"));
+        auto *newVoice = workflow(QStringLiteral("用录音训练声音"), QStringLiteral("切片、校对，再训练新声音。"));
         homeLayout->addLayout(paths);
 
         auto *engineTitle = new QLabel(QStringLiteral("引擎与资源"), home);
@@ -196,9 +203,10 @@ public:
         auto *selector = new QHBoxLayout;
         family_ = new QComboBox(this);
         family_->addItems(ez::adapterFamilies());
-        selector->addWidget(new QLabel(QStringLiteral("检查模型家族"), home));
+        selector->addWidget(new QLabel(QStringLiteral("模型家族"), home));
         selector->addWidget(family_);
         checkVoice_ = new QComboBox(home);
+        ez::ui::fitComboBox(checkVoice_, 12);
         selector->addWidget(checkVoice_, 1);
         auto *configure = new QPushButton(QStringLiteral("引擎设置"), home);
         selector->addWidget(configure);
@@ -206,11 +214,11 @@ public:
 
         auto *actions = new QHBoxLayout;
         check_ = new QPushButton(QStringLiteral("检查资源"), this);
-        digest_ = new QPushButton(QStringLiteral("计算文件 SHA-256"), this);
+        digest_ = new QPushButton(QStringLiteral("计算 SHA-256"), this);
         cancelCheck_ = new QPushButton(QStringLiteral("取消检查"), this);
         start_ = new QPushButton(QStringLiteral("启动引擎"), this);
         start_->setObjectName("primary");
-        auto *log = new QPushButton(QStringLiteral("打开启动日志"), this);
+        auto *log = new QPushButton(QStringLiteral("启动日志"), this);
         auto *diagnostic = new QPushButton(QStringLiteral("导出诊断"), this);
         actions->addWidget(start_);
         actions->addWidget(check_);
@@ -235,11 +243,13 @@ public:
         report_->setPlaceholderText(QStringLiteral("点「检查资源」查看可用能力。补齐缺失文件后，可选择失败项单独复查。"));
         report_->setReadOnly(true);
         homeLayout->addWidget(report_, 1);
-        status_ = new QLabel(QStringLiteral("请先选择引擎，再开始合成或训练。"), content);
+        status_ = new QLabel(content);
+        status_->hide();
         status_->setWordWrap(true);
         status_->setTextFormat(Qt::PlainText);
         status_->setObjectName("statusLine");
         auto *activityLine = ez::ui::hint({}, content);
+        activityLine->setObjectName("stageHint");
         activityLine->setAccessibleName(QStringLiteral("当前任务阶段与耗时"));
         activityLine->hide();
         layout->addWidget(activityLine);
@@ -253,7 +263,7 @@ public:
             activityLine->setVisible(!text.isEmpty());
         });
         connect(scheduler_, &ez::TaskScheduler::failed, this, [this](const QString &message) {
-            status_->setText(message.section('\n', 0, 0));
+            showStatus(message.section('\n', 0, 0));
         });
         auto *synthesis = new ez::SynthesisPanel(root_, *scheduler_, [this] { return currentLauncher(); }, tabs);
         tabs->addTab(synthesis, QStringLiteral("语音合成"));
@@ -269,13 +279,19 @@ public:
         connect(training, &ez::TrainingPanel::engineRecheckRequested, this, &Workspace::recheckEngine);
         connect(synthesis, &ez::SynthesisPanel::engineSwitchRequested, tabs, switchPack);
         connect(training, &ez::TrainingPanel::engineSwitchRequested, tabs, switchPack);
-        refreshSelection_ = [synthesis, training] {
+        const auto refreshDevices = [this, training] {
+            training->setDeviceNames(engine_.trainingDevices(currentLauncher()));
+        };
+        connect(&engine_, &ez::EngineManager::trainingDevicesChanged, training, refreshDevices);
+        connect(&engine_, &ez::EngineManager::readinessChanged, training, refreshDevices);
+        refreshSelection_ = [synthesis, training, refreshDevices] {
             synthesis->refreshEngineSelection();
+            refreshDevices();
             training->refreshEngineSelection();
         };
         connect(profiles_, &QComboBox::currentIndexChanged, this, [this] { refreshSelection_(); });
         connect(&scheduler_->compatibility(), &ez::CompatibilityRegistry::changed, this, [this] { resetReport(); });
-        connect(&scheduler_->compatibility(), &ez::CompatibilityRegistry::updateFinished, status_, &QLabel::setText);
+        connect(&scheduler_->compatibility(), &ez::CompatibilityRegistry::updateFinished, this, &Workspace::showStatus);
         tabs->addTab(training, QStringLiteral("训练项目"));
         tabs->addTab(ez::createLibraryPage(root_, defaultOutput_, *scheduler_, synthesis, tabs), QStringLiteral("声音与素材"));
         tabs->addTab(createHistory(tabs, synthesis), QStringLiteral("任务记录"));
@@ -320,11 +336,11 @@ public:
             if (QFileInfo::exists(logPath()))
                 QDesktopServices::openUrl(QUrl::fromLocalFile(logPath()));
             else
-                status_->setText(QStringLiteral("启动引擎后可查看日志"));
+                showStatus(QStringLiteral("启动引擎后可查看日志"));
         });
         connect(diagnostic, &QPushButton::clicked, this, [this] { showDiagnostics(); });
         connect(&engine_, &ez::EngineManager::statusChanged, this, [this](const QString &message) {
-            status_->setText(message);
+            showStatus(message);
             refreshActions();
         });
         connect(profiles_, &QComboBox::currentIndexChanged, this, [this] {
@@ -334,7 +350,7 @@ public:
                 resetReport();
                 refreshActions();
             } catch (const std::exception &error) {
-                status_->setText(failureMessage(error));
+                showStatus(failureMessage(error));
             }
         });
         connect(&inspection_, &QFutureWatcher<InspectionResult>::finished, this, [this] {
@@ -349,6 +365,7 @@ public:
         });
         reloadCheckVoices();
         reloadProfiles();
+        engine_.discoverLocalDevices();
     }
 
     ~Workspace() override
@@ -358,6 +375,12 @@ public:
     }
 
 protected:
+    void showEvent(QShowEvent *event) override
+    {
+        QWidget::showEvent(event);
+        updateTitleBar();
+    }
+
     void closeEvent(QCloseEvent *event) override
     {
         if (scheduler_->running()) {
@@ -408,12 +431,39 @@ private:
     QString logPath() const { return root_ + "/engine-start.log"; }
     QString currentLauncher() const { return profiles_->currentData().toString(); }
 
+    void updateTitleBar()
+    {
+        const auto handle = reinterpret_cast<HWND>(winId());
+        const auto setColor = [handle](DWORD attribute, const QColor &color) {
+            const auto rgb = RGB(color.red(), color.green(), color.blue());
+            DwmSetWindowAttribute(handle, attribute, &rgb, sizeof(rgb));
+        };
+        const auto colors = QApplication::palette();
+        setColor(DWMWA_CAPTION_COLOR, colors.color(QPalette::Window));
+        setColor(DWMWA_TEXT_COLOR, colors.color(QPalette::WindowText));
+    }
+
+    void showStatus(const QString &message)
+    {
+        status_->setText(message);
+        status_->setVisible(!message.isEmpty());
+    }
+
     QWidget *createSettings(QWidget *parent)
     {
         auto *page = new QWidget(parent);
-        auto *layout = new QVBoxLayout(page);
-        ez::ui::pageHeader(layout, page, QStringLiteral("设置"),
-            QStringLiteral("选择已安装的 GPT-SoVITS，并查看音频和项目的保存位置。"));
+        auto *pageLayout = new QVBoxLayout(page);
+        ez::ui::pageHeader(pageLayout, page, QStringLiteral("设置"));
+        auto *scroll = new QScrollArea(page);
+        scroll->setFrameShape(QFrame::NoFrame);
+        scroll->setWidgetResizable(true);
+        auto *body = new QWidget;
+        body->setObjectName("settingsBody");
+        auto *layout = new QVBoxLayout(body);
+        layout->setContentsMargins(0, 0, 0, 0);
+        layout->setSpacing(10);
+        scroll->setWidget(body);
+        pageLayout->addWidget(scroll, 1);
         const auto section = [page, layout](const QString &title, const QString &description) {
             auto *card = new QWidget(page);
             card->setObjectName("card");
@@ -422,7 +472,8 @@ private:
             auto *label = new QLabel(title, card);
             label->setObjectName("sectionTitle");
             stack->addWidget(label);
-            stack->addWidget(ez::ui::hint(description, card));
+            if (!description.isEmpty())
+                stack->addWidget(ez::ui::hint(description, card));
             auto *form = new QFormLayout;
             form->setContentsMargins(0, 0, 0, 0);
             form->setHorizontalSpacing(14);
@@ -432,63 +483,95 @@ private:
             layout->addWidget(card);
             return form;
         };
+        auto *appearance = section(QStringLiteral("外观"), {});
+        auto *theme = new QComboBox(page);
+        theme->addItem(QStringLiteral("深色"), QStringLiteral("dark"));
+        theme->addItem(QStringLiteral("浅色"), QStringLiteral("light"));
+        theme->setAccessibleName(QStringLiteral("界面主题"));
+        theme->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+        theme->setMinimumWidth(116);
+        theme->setCurrentIndex(workspaceTheme() == ez::ui::Theme::Light ? 1 : 0);
+        connect(theme, &QComboBox::activated, page, [this, theme](int index) {
+            const auto value = theme->itemData(index).toString();
+            const auto selected = value == "light" ? ez::ui::Theme::Light : ez::ui::Theme::Dark;
+            if (selected == workspaceTheme())
+                return;
+            try {
+                ez::setWorkspaceSetting("appearanceTheme", value);
+                ez::ui::applyTheme(selected);
+                updateTitleBar();
+            } catch (const std::exception &error) {
+                const QSignalBlocker block(theme);
+                theme->setCurrentIndex(workspaceTheme() == ez::ui::Theme::Light ? 1 : 0);
+                showStatus(failureMessage(error));
+            }
+        }, Qt::QueuedConnection);
+        appearance->addRow(QStringLiteral("主题"), theme);
+
         auto *engineForm = section(QStringLiteral("GPT-SoVITS 引擎"),
-            QStringLiteral("选择整合包目录中的 go-webui.bat，EZ 会检测构建并列出可用功能。"));
+            QStringLiteral("添加整合包里的 go-webui.bat。"));
         auto *options = new QHBoxLayout;
         options->setSpacing(8);
         profiles_ = new QComboBox(page);
         profiles_->setPlaceholderText(QStringLiteral("尚未配置引擎"));
+        ez::ui::fitComboBox(profiles_, 15);
         addEngine_ = new QPushButton(QStringLiteral("添加启动路径"), page);
         auto *moveEngine = new QPushButton(QStringLiteral("重新定位引擎"), page);
         auto *engineDetails = new QPushButton(QStringLiteral("引擎详情"), page);
         auto *recheck = new QPushButton(QStringLiteral("重新检测"), page);
         options->addWidget(profiles_, 1);
         options->addWidget(addEngine_);
-        options->addWidget(moveEngine);
-        options->addWidget(engineDetails);
-        options->addWidget(recheck);
         engineForm->addRow(QStringLiteral("当前引擎"), options);
 
         enginePath_ = new QLineEdit(page);
         enginePath_->setReadOnly(true);
         enginePath_->setPlaceholderText(QStringLiteral("请选择已安装的 GPT-SoVITS 中的 go-webui.bat"));
-        engineForm->addRow(QStringLiteral("引擎启动文件"), enginePath_);
+        engineForm->addRow(QStringLiteral("启动文件"), enginePath_);
+        auto *engineActions = new QHBoxLayout;
+        engineActions->setSpacing(8);
+        engineActions->addWidget(moveEngine);
+        engineActions->addWidget(engineDetails);
+        engineActions->addWidget(recheck);
+        engineActions->addStretch();
+        engineForm->addRow(engineActions);
         auto *registryActions = new QHBoxLayout;
+        registryActions->setSpacing(8);
         registryRevision_ = ez::ui::hint({}, page);
-        auto *updateRegistry = new QPushButton(QStringLiteral("检查兼容清单更新"), page);
-        auto *importRegistry = new QPushButton(QStringLiteral("导入兼容清单"), page);
+        auto *updateRegistry = new QPushButton(QStringLiteral("检查清单更新"), page);
+        auto *importRegistry = new QPushButton(QStringLiteral("导入清单"), page);
         registryActions->addWidget(registryRevision_, 1);
         registryActions->addWidget(updateRegistry);
         registryActions->addWidget(importRegistry);
-        engineForm->addRow(QStringLiteral("兼容清单"), registryActions);
+        engineForm->addRow(QStringLiteral("整合包兼容清单"), registryActions);
         connect(recheck, &QPushButton::clicked, this, &Workspace::recheckEngine);
         connect(updateRegistry, &QPushButton::clicked, this, [this] {
-            status_->setText(QStringLiteral("正在从 GitHub 检查兼容清单…"));
+            showStatus(QStringLiteral("正在从 GitHub 检查整合包兼容清单…"));
             scheduler_->compatibility().checkOnline();
         });
         connect(importRegistry, &QPushButton::clicked, this, [this] {
-            const auto path = QFileDialog::getOpenFileName(this, QStringLiteral("导入兼容清单"),
-                {}, QStringLiteral("兼容清单 (*.json)"));
+            const auto path = QFileDialog::getOpenFileName(this, QStringLiteral("导入整合包兼容清单"),
+                {}, QStringLiteral("整合包兼容清单 (*.json)"));
             if (path.isEmpty())
                 return;
             try {
                 QFile file(ez::checkedPath(path));
                 if (!file.open(QIODevice::ReadOnly))
                     throw std::runtime_error(file.errorString().toStdString());
-                status_->setText(scheduler_->compatibility().install(file.read(1024 * 1024 + 1)));
+                showStatus(scheduler_->compatibility().install(file.read(1024 * 1024 + 1)));
             } catch (const std::exception &error) {
-                status_->setText(QStringLiteral("%1 继续使用修订 %2。")
+                showStatus(QStringLiteral("%1 继续使用修订 %2。")
                     .arg(failureMessage(error)).arg(scheduler_->compatibility().revision()));
             }
         });
         auto *outputForm = section(QStringLiteral("文件位置"),
-            QStringLiteral("默认保存在程序同级的 data 文件夹。更改生成目录只影响随后提交的合成任务。"));
+            QStringLiteral("更改成品目录只影响新提交的任务。"));
         const auto savedOutput = ez::workspaceSetting("outputRoot");
         auto *output = new QLineEdit(QDir::toNativeSeparators(savedOutput.isEmpty() ? defaultOutput_
             : ez::resolvedOutputDirectory(savedOutput)), page);
         output->setReadOnly(true);
+        output->setCursorPosition(0);
         output->setToolTip(output->text());
-        outputForm->addRow(QStringLiteral("成品生成目录"), output);
+        outputForm->addRow(QStringLiteral("成品目录"), output);
 
         auto *actions = new QHBoxLayout;
         actions->setSpacing(8);
@@ -504,13 +587,14 @@ private:
         outputForm->addRow(actions);
         auto *dataFolder = new QLineEdit(QDir::toNativeSeparators(root_), page);
         dataFolder->setReadOnly(true);
+        dataFolder->setCursorPosition(0);
         dataFolder->setToolTip(dataFolder->text());
         auto *openData = new QPushButton(QStringLiteral("打开数据目录"), page);
         auto *dataActions = new QHBoxLayout;
         dataActions->setSpacing(8);
         dataActions->addWidget(dataFolder, 1);
         dataActions->addWidget(openData);
-        outputForm->addRow(QStringLiteral("素材和项目数据"), dataActions);
+        outputForm->addRow(QStringLiteral("项目数据"), dataActions);
         layout->addStretch(1);
 
         const auto saveOutput = [this, output](const QString &selected) {
@@ -520,17 +604,18 @@ private:
                     throw std::runtime_error(QStringLiteral("此目录无法写入，请选择可写目录").toStdString());
                 ez::setWorkspaceSetting("outputRoot", selected.isEmpty() ? QStringLiteral("") : path);
                 output->setText(QDir::toNativeSeparators(path));
+                output->setCursorPosition(0);
                 output->setToolTip(output->text());
-                status_->setText(QStringLiteral("生成目录已更新，新提交的合成任务将使用此目录。"));
+                showStatus(QStringLiteral("生成目录已更新，新提交的合成任务将使用此目录。"));
             } catch (const std::exception &error) {
-                status_->setText(failureMessage(error));
+                showStatus(failureMessage(error));
             }
         };
         connect(addEngine_, &QPushButton::clicked, this, &Workspace::addEngine);
         connect(engineDetails, &QPushButton::clicked, page, [this] { showEngineDetails(); });
         connect(moveEngine, &QPushButton::clicked, page, [this] {
             if (engine_.active() || scheduler_->running() || checking_) {
-                status_->setText(QStringLiteral("请先结束任务并停止引擎。"));
+                showStatus(QStringLiteral("请先结束任务并停止引擎。"));
                 return;
             }
             const auto previous = currentLauncher();
@@ -545,21 +630,21 @@ private:
                         return QMessageBox::question(this, QStringLiteral("重新定位引擎"), details) == QMessageBox::Yes;
                     })) {
                     reloadProfiles(ez::workspaceSetting("currentEngine"));
-                    status_->setText(QStringLiteral("引擎位置已更新。"));
+                    showStatus(QStringLiteral("引擎位置已更新。"));
                 }
             } catch (const std::exception &error) {
-                status_->setText(failureMessage(error));
+                showStatus(failureMessage(error));
             }
         });
         connect(moveOutput, &QPushButton::clicked, page, [this, output] {
             if (scheduler_->running()) {
-                status_->setText(QStringLiteral("请先等待当前任务结束。"));
+                showStatus(QStringLiteral("请先等待当前任务结束。"));
                 return;
             }
             try {
                 const auto choices = ez::workspaceOutputDirectories();
                 if (choices.isEmpty()) {
-                    status_->setText(QStringLiteral("默认成品随数据目录搬迁。目前没有可重新定位的自定义成品目录。"));
+                    showStatus(QStringLiteral("默认成品随数据目录搬迁。目前没有可重新定位的自定义成品目录。"));
                     return;
                 }
                 bool accepted = true;
@@ -574,10 +659,10 @@ private:
                         return QMessageBox::question(this, QStringLiteral("重新定位成品"), details) == QMessageBox::Yes;
                     })) {
                     output->setText(QDir::toNativeSeparators(ez::configuredOutputRoot(defaultOutput_)));
-                    status_->setText(QStringLiteral("自定义成品位置已更新。"));
+                    showStatus(QStringLiteral("自定义成品位置已更新。"));
                 }
             } catch (const std::exception &error) {
-                status_->setText(failureMessage(error));
+                showStatus(failureMessage(error));
             }
         });
         connect(choose, &QPushButton::clicked, page, [this, output, saveOutput] {
@@ -590,14 +675,14 @@ private:
             try {
                 openFolder(ez::configuredOutputRoot(defaultOutput_));
             } catch (const std::exception &error) {
-                status_->setText(failureMessage(error));
+                showStatus(failureMessage(error));
             }
         });
         connect(openData, &QPushButton::clicked, page, [this] {
             try {
                 openFolder(root_);
             } catch (const std::exception &error) {
-                status_->setText(failureMessage(error));
+                showStatus(failureMessage(error));
             }
         });
         return page;
@@ -607,14 +692,14 @@ private:
     {
         const auto launcher = currentLauncher();
         if (launcher.isEmpty()) {
-            status_->setText(QStringLiteral("请先选择要检查的引擎。"));
+            showStatus(QStringLiteral("请先选择要检查的引擎。"));
             return;
         }
         QString directory;
         try {
             directory = ez::engineRoot(launcher);
         } catch (const std::exception &error) {
-            status_->setText(failureMessage(error));
+            showStatus(failureMessage(error));
             return;
         }
         QDialog dialog(this);
@@ -766,10 +851,10 @@ private:
     {
         auto *page = new QWidget(parent);
         auto *layout = new QVBoxLayout(page);
-        ez::ui::pageHeader(layout, page, QStringLiteral("任务记录"),
-            QStringLiteral("左键选中一条任务。右键可查看产物或日志，并按任务状态选择播放、复用、重试或取消。"));
+        ez::ui::pageHeader(layout, page, QStringLiteral("任务记录"));
         auto *filters = new QHBoxLayout;
         auto *batches = new QComboBox(page);
+        ez::ui::fitComboBox(batches, 13);
         batches->setAccessibleName(QStringLiteral("按批次筛选任务"));
         batches->addItem(QStringLiteral("全部任务"));
         auto *retryBatch = new QPushButton(QStringLiteral("重试本批失败项"), page);
@@ -783,11 +868,14 @@ private:
                                           QStringLiteral("状态"), QStringLiteral("结果")});
         table->setEditTriggers(QAbstractItemView::NoEditTriggers);
         ez::ui::styleTable(table);
+        ez::ui::styleTaskStatus(table, 2);
         table->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
         table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
         table->horizontalHeader()->setStretchLastSection(true);
         layout->addWidget(table, 1);
-        auto *pageControls = new QHBoxLayout;
+        auto *pagination = new QWidget(page);
+        auto *pageControls = new QHBoxLayout(pagination);
+        pageControls->setContentsMargins(0, 0, 0, 0);
         auto *older = new QPushButton(QStringLiteral("下一页"), page);
         auto *newer = new QPushButton(QStringLiteral("上一页"), page);
         auto *pageNumber = ez::ui::hint({}, page);
@@ -795,13 +883,16 @@ private:
         pageControls->addWidget(newer);
         pageControls->addWidget(pageNumber);
         pageControls->addWidget(older);
-        layout->addLayout(pageControls);
         auto *empty = new QLabel(page);
         empty->setObjectName("emptyState");
         empty->setAlignment(Qt::AlignCenter);
         empty->setWordWrap(true);
+        empty->setText(QStringLiteral("生成语音或开始训练后，任务会出现在这里。"));
         layout->addWidget(empty, 1);
-        auto *actions = new QHBoxLayout;
+        layout->addWidget(pagination);
+        auto *actionBar = new QWidget(page);
+        auto *actions = new QHBoxLayout(actionBar);
+        actions->setContentsMargins(0, 0, 0, 0);
         auto *cancel = new QPushButton(QStringLiteral("取消所选任务"), page);
         auto *retry = new QPushButton(QStringLiteral("重试所选任务"), page);
         auto *open = new QPushButton(QStringLiteral("产物或日志"), page);
@@ -821,7 +912,7 @@ private:
         actions->addWidget(cancel);
         actions->addWidget(more);
         actions->addStretch();
-        layout->addLayout(actions);
+        layout->addWidget(actionBar);
         const auto selection = [table] {
             const auto *item = table->item(ez::ui::selectedRow(table), 0);
             return item ? item->data(Qt::UserRole).toString() : QString();
@@ -933,10 +1024,6 @@ private:
                 table->item(row, 0)->setData(Qt::UserRole + 1, taskBatch);
                 table->item(row, 1)->setData(Qt::UserRole, operation);
                 table->item(row, 2)->setData(Qt::UserRole, state);
-                if (state == "succeeded")
-                    table->item(row, 2)->setForeground(QColor("#9ae0c9"));
-                else if (state == "failed" || state == "interrupted")
-                    table->item(row, 2)->setForeground(QColor("#ffb6a6"));
                 table->item(row, 3)->setData(Qt::UserRole, audio);
                 table->item(row, 3)->setData(Qt::UserRole + 1, message);
                 table->item(row, 3)->setData(Qt::UserRole + 2, payload);
@@ -952,9 +1039,10 @@ private:
             pageNumber->setText(QStringLiteral("第 %1 页").arg(pageAnchors->size()));
             newer->setEnabled(pageAnchors->size() > 1);
             older->setEnabled(nextAnchor->rowid != 0);
-            table->setVisible(table->rowCount() > 0);
-            empty->setVisible(table->rowCount() == 0);
-            empty->setText(QStringLiteral("生成语音或开始训练后，任务会出现在这里。"));
+            table->setVisible(row > 0);
+            empty->setVisible(row == 0);
+            actionBar->setVisible(row > 0);
+            pagination->setVisible(row > 0 || pageAnchors->size() > 1);
             bool hasQueued = false;
             bool hasFailed = false;
             if (!batch.isEmpty()) {
@@ -1043,7 +1131,7 @@ private:
             try {
                 scheduler_->cancelQueuedBatch(batches->currentData().toString());
             } catch (const std::exception &error) {
-                status_->setText(failureMessage(error));
+                showStatus(failureMessage(error));
             }
         });
         connect(retryBatch, &QPushButton::clicked, page, [this, batches, showBatch] {
@@ -1065,7 +1153,7 @@ private:
                 if (!requests.isEmpty())
                     showBatch(scheduler_->enqueueSynthesisBatch(launcher, requests));
             } catch (const std::exception &error) {
-                status_->setText(failureMessage(error));
+                showStatus(failureMessage(error));
             }
         });
         connect(copyResult, &QAction::triggered, page, [table] {
@@ -1085,7 +1173,7 @@ private:
                 try {
                     scheduler_->cancel(id);
                 } catch (const std::exception &error) {
-                    status_->setText(failureMessage(error));
+                    showStatus(failureMessage(error));
                 }
             }
         });
@@ -1096,7 +1184,7 @@ private:
             if (!query.exec() || !query.next())
                 return;
             if (query.value(2).toString() != "synthesize") {
-                status_->setText(QStringLiteral("请从训练项目重跑该阶段"));
+                showStatus(QStringLiteral("请从训练项目重跑该阶段"));
                 return;
             }
             const auto launcher = query.value(0).toString();
@@ -1105,7 +1193,7 @@ private:
             try {
                 scheduler_->enqueue(launcher, request);
             } catch (const std::exception &error) {
-                status_->setText(failureMessage(error));
+                showStatus(failureMessage(error));
             }
         });
         connect(open, &QPushButton::clicked, page, [this, table, selection] {
@@ -1123,10 +1211,10 @@ private:
                     box.setTextFormat(Qt::PlainText);
                     box.exec();
                 } else {
-                    status_->setText(QStringLiteral("此任务暂无可打开的产物或日志。"));
+                    showStatus(QStringLiteral("此任务暂无可打开的产物或日志。"));
                 }
             } catch (const std::exception &error) {
-                status_->setText(failureMessage(error));
+                showStatus(failureMessage(error));
             }
         });
         connect(play, &QPushButton::clicked, page, [this, parent, synthesis, table] {
@@ -1137,7 +1225,7 @@ private:
                 synthesis->playAudio(item->data(Qt::UserRole).toString());
                 parent->setCurrentWidget(synthesis);
             } catch (const std::exception &error) {
-                status_->setText(failureMessage(error));
+                showStatus(failureMessage(error));
             }
         });
         connect(reuse, &QPushButton::clicked, page, [parent, synthesis, selection] {
@@ -1157,12 +1245,14 @@ private:
     {
         const bool selected = !currentLauncher().isEmpty();
         enginePath_->setText(QDir::toNativeSeparators(currentLauncher()));
+        enginePath_->setCursorPosition(0);
         enginePath_->setToolTip(enginePath_->text());
         const auto installation = scheduler_->compatibility().inspect(currentLauncher());
         registryRevision_->setText(QStringLiteral("修订 %1").arg(scheduler_->compatibility().revision()));
-        engineLocation_->setText(selected ? QStringLiteral("%1\n%2").arg(installation.description(),
-                                               QDir::toNativeSeparators(currentLauncher()))
+        const auto description = installation.description();
+        engineLocation_->setText(selected ? description.section('\n', 0, 0)
             : QStringLiteral("请在「设置」中添加 GPT-SoVITS 引擎路径。"));
+        engineLocation_->setToolTip(selected ? description + '\n' + QDir::toNativeSeparators(currentLauncher()) : QString());
         engineBadge_->setToolTip(engine_.active() ? engine_.root() : QString());
         engineBadge_->setText(engine_.ready() ? QStringLiteral("引擎可使用") : engine_.active() ? QStringLiteral("引擎正在启动")
             : selected ? QStringLiteral("引擎未启动") : QStringLiteral("引擎未配置"));
@@ -1201,13 +1291,13 @@ private:
     {
         const auto launcher = currentLauncher();
         if (launcher.isEmpty()) {
-            status_->setText(QStringLiteral("请在「设置」中选择整合包。"));
+            showStatus(QStringLiteral("请在「设置」中选择整合包。"));
             return;
         }
         const bool selectedIsRunning = engine_.active()
             && QString::compare(engine_.root() + "/go-webui.bat", launcher, Qt::CaseInsensitive) == 0;
         if (selectedIsRunning && (!engine_.ready() || scheduler_->running())) {
-            status_->setText(QStringLiteral("当前引擎正在工作。任务结束后可重新核对运行接口。"));
+            showStatus(QStringLiteral("当前引擎正在工作。任务结束后可重新核对运行接口。"));
             return;
         }
         scheduler_->compatibility().clearInterfaceIssues(launcher);
@@ -1215,7 +1305,7 @@ private:
             engine_.stop();
             scheduler_->startEngine(launcher);
         } else
-            status_->setText(QStringLiteral("已重新检测当前整合包的脚本和本机资源。"));
+            showStatus(QStringLiteral("已重新检测当前整合包的脚本和本机资源。"));
         checkEngine({});
     }
 
@@ -1236,7 +1326,7 @@ private:
             checkQuery(query);
             ez::setWorkspaceSetting("currentEngine", path);
             reloadProfiles(path);
-            status_->setText(QStringLiteral("引擎已保存，可回到工作台检查资源或启动。"));
+            showStatus(QStringLiteral("引擎已保存，可回到工作台检查资源或启动。"));
         } catch (const std::exception &error) {
             QMessageBox::warning(this, QStringLiteral("无法添加引擎"), failureMessage(error));
         }
@@ -1334,7 +1424,7 @@ private:
                 return InspectionResult{checks, heading, QStringLiteral("已取消资源检查"), only.isEmpty()};
             });
         } catch (const std::exception &error) {
-            status_->setText(failureMessage(error));
+            showStatus(failureMessage(error));
         }
     }
 
@@ -1352,7 +1442,7 @@ private:
         if (!accepted)
             return;
         if (!expected.isEmpty() && !QRegularExpression("^[0-9a-f]{64}$").match(expected).hasMatch()) {
-            status_->setText(QStringLiteral("参考摘要应为 64 位十六进制字符"));
+            showStatus(QStringLiteral("参考摘要应为 64 位十六进制字符"));
             return;
         }
         beginInspection(QStringLiteral("正在计算 SHA-256…"), [this, chosen, expected] {
@@ -1389,9 +1479,9 @@ private:
             const auto state = engine_.ready() ? QStringLiteral("已就绪")
                 : engine_.active() ? QStringLiteral("正在启动") : QStringLiteral("未启动");
             if (ez::exportDiagnostics(this, root_, state, resourceReport_, job))
-                status_->setText(QStringLiteral("已保存诊断报告"));
+                showStatus(QStringLiteral("已保存诊断报告"));
         } catch (const std::exception &error) {
-            status_->setText(failureMessage(error));
+            showStatus(failureMessage(error));
         }
     }
 
@@ -1399,7 +1489,7 @@ private:
     {
         if (engine_.active()) {
             if (scheduler_->running()) {
-                status_->setText(QStringLiteral("请先在任务记录取消运行中的任务"));
+                showStatus(QStringLiteral("请先在任务记录取消运行中的任务"));
                 return;
             }
             engine_.stop();
@@ -1408,7 +1498,7 @@ private:
         try {
             scheduler_->startEngine(currentLauncher());
         } catch (const std::exception &error) {
-            status_->setText(failureMessage(error));
+            showStatus(failureMessage(error));
         }
     }
 };
@@ -1420,6 +1510,7 @@ int main(int argc, char **argv)
     if (argc == 3 && std::string_view(argv[1]) == ez::engineBrowserNotification)
         return 0;
     QApplication app(argc, argv);
+    QApplication::setStyle("Fusion");
     app.setApplicationName("EZ-GPT-SoVITS");
     app.setOrganizationName("EZ-GPT-SoVITS");
     app.setApplicationVersion(QStringLiteral(EZ_APP_VERSION));

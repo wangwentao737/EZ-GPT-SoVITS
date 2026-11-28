@@ -21,6 +21,7 @@
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QFutureWatcher>
+#include <QGuiApplication>
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QJsonArray>
@@ -52,6 +53,81 @@
 
 namespace ez {
 namespace {
+
+class AudioOutputChoice final : public QComboBox {
+public:
+    AudioOutputChoice(QAudioOutput &output, QWidget *parent) : QComboBox(parent), output_(output)
+    {
+        setObjectName("clipAudioOutput");
+        setAccessibleName(QStringLiteral("试听输出设备"));
+        ui::fitComboBox(this, 16);
+        auto *devices = new QMediaDevices(this);
+        connect(devices, &QMediaDevices::audioOutputsChanged, this, [this] { refresh(); });
+        connect(qGuiApp, &QGuiApplication::applicationStateChanged, this, [this](Qt::ApplicationState state) {
+            if (state == Qt::ApplicationActive)
+                refresh();
+        });
+        connect(this, &QComboBox::currentIndexChanged, this, [this] { route(); });
+        refresh();
+    }
+
+    void refresh()
+    {
+        const auto selected = currentData().toByteArray();
+        const auto system = QMediaDevices::defaultAudioOutput();
+        const auto available = QMediaDevices::audioOutputs();
+        const auto label = system.isNull() ? QStringLiteral("无可用音频输出")
+            : QStringLiteral("系统默认 · %1").arg(system.description());
+        bool changed = count() != available.size() + 1 || itemText(0) != label;
+        for (int index = 0; !changed && index < available.size(); ++index) {
+            const auto &device = available.at(index);
+            changed = itemData(index + 1).toByteArray() != device.id()
+                || itemText(index + 1) != device.description();
+        }
+        if (changed) {
+            const QSignalBlocker block(this);
+            clear();
+            addItem(label, QByteArray());
+            for (const auto &device : available)
+                addItem(device.description(), device.id());
+            setCurrentIndex(qMax(0, findData(selected)));
+        }
+        route();
+    }
+
+protected:
+    void showEvent(QShowEvent *event) override
+    {
+        QComboBox::showEvent(event);
+        refresh();
+    }
+
+    void showPopup() override
+    {
+        refresh();
+        QComboBox::showPopup();
+    }
+
+private:
+    void route()
+    {
+        auto device = QMediaDevices::defaultAudioOutput();
+        const auto selected = currentData().toByteArray();
+        if (!selected.isEmpty()) {
+            for (const auto &output : QMediaDevices::audioOutputs()) {
+                if (output.id() == selected) {
+                    device = output;
+                    break;
+                }
+            }
+        }
+        if (output_.device() != device)
+            output_.setDevice(device);
+        setToolTip(currentText());
+    }
+
+    QAudioOutput &output_;
+};
 
 const QStringList fullTraining{"slice", "prepare", "train_sovits", "train_gpt"};
 
@@ -164,12 +240,12 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     execute(query);
 
     auto *layout = new QVBoxLayout(this);
-    ui::pageHeader(layout, this, QStringLiteral("训练项目"),
-        QStringLiteral("已有切片或标注时可直接导入。左键选中片段，右键可试听、编辑文本或排除片段。"));
+    ui::pageHeader(layout, this, QStringLiteral("训练项目"));
     auto *selection = new QHBoxLayout;
     projects_ = new QComboBox(this);
     projects_->setPlaceholderText(QStringLiteral("创建或选择训练项目"));
     projects_->setAccessibleName(QStringLiteral("选择训练项目"));
+    ui::fitComboBox(projects_, 15);
     selection->addWidget(projects_, 1);
     layout->addLayout(selection);
     stage_ = ui::hint({}, this);
@@ -195,10 +271,10 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     };
     create_ = button(selection, QStringLiteral("新建项目"), [this] { addProject(); });
     auto *files = new QHBoxLayout;
-    recordings_ = button(files, QStringLiteral("导入原始录音"), [this] { importAudio(false); });
+    recordings_ = button(files, QStringLiteral("导入录音"), [this] { importAudio(false); });
     slice_ = button(files, QStringLiteral("切片"), [this] { submit("slice"); });
     button(files, QStringLiteral("导入已切片录音"), [this] { importAudio(true); });
-    transcribe_ = button(files, QStringLiteral("中文自动转写"), [this] { submit("asr"); });
+    transcribe_ = button(files, QStringLiteral("中文转写"), [this] { submit("asr"); });
     button(files, QStringLiteral("导入标注"), [this] {
         require(!busy(), QStringLiteral("请等待当前阶段完成"));
         const auto path = QFileDialog::getOpenFileName(this, QStringLiteral("导入已有标注"), {}, "List (*.list *.txt)");
@@ -210,6 +286,7 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     labels_ = new QTableWidget(0, 4, this);
     labels_->setHorizontalHeaderLabels({QStringLiteral("片段"), QStringLiteral("语言"), QStringLiteral("状态"), QStringLiteral("文本")});
     labels_->setAccessibleName(QStringLiteral("音频切片与标注"));
+    labels_->setToolTip(QStringLiteral("双击文本开始校对，右键打开片段操作。"));
     ui::styleTable(labels_);
     labels_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Interactive);
     labels_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
@@ -220,22 +297,7 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     player_ = new QMediaPlayer(this);
     auto *audioOutput = new QAudioOutput(player_);
     player_->setAudioOutput(audioOutput);
-    auto *devices = new QMediaDevices(this);
-    auto *outputChoice = new QComboBox(this);
-    outputChoice->setAccessibleName(QStringLiteral("试听输出设备"));
-    outputChoice->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
-    outputChoice->setMinimumContentsLength(14);
-    outputChoice->setToolTip(QStringLiteral("选择试听片段使用的扬声器或耳机。下次播放时生效。"));
-    const auto updateDevices = [outputChoice] {
-        const auto previous = outputChoice->currentData();
-        outputChoice->clear();
-        outputChoice->addItem(QStringLiteral("系统默认输出"), QByteArray());
-        for (const auto &device : QMediaDevices::audioOutputs())
-            outputChoice->addItem(device.description(), device.id());
-        outputChoice->setCurrentIndex(qMax(0, outputChoice->findData(previous)));
-    };
-    updateDevices();
-    connect(devices, &QMediaDevices::audioOutputsChanged, this, updateDevices);
+    auto *outputChoice = new AudioOutputChoice(*audioOutput, this);
 
     auto *playback = ui::hint(QStringLiteral("选中一条片段可试听。"), this);
     playback->setObjectName("clipPlayback");
@@ -260,23 +322,13 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
                 playback->setText(QStringLiteral("已暂停试听。"));
                 return;
             }
+            outputChoice->refresh();
+            require(!audioOutput->device().isNull(), QStringLiteral("没有可用的音频输出设备。请连接耳机或扬声器后重试。"));
             if (player_->source() == source && player_->playbackState() == QMediaPlayer::PausedState) {
                 player_->play();
                 return;
             }
             player_->stop();
-            auto device = QMediaDevices::defaultAudioOutput();
-            const auto choice = outputChoice->currentData().toByteArray();
-            if (!choice.isEmpty()) {
-                for (const auto &output : QMediaDevices::audioOutputs()) {
-                    if (output.id() == choice) {
-                        device = output;
-                        break;
-                    }
-                }
-            }
-            require(!device.isNull(), QStringLiteral("没有可用的音频输出设备。请连接耳机或扬声器后重试。"));
-            audioOutput->setDevice(device);
             playback->setText(QStringLiteral("正在加载片段 · %1").arg(source.fileName()));
             player_->setSource({});
             player_->setSource(source);
@@ -382,18 +434,23 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     layout->addLayout(playbackRow);
 
     auto *training = new QHBoxLayout;
-    gpu_ = new QSpinBox(this);
-    gpu_->setPrefix(QStringLiteral("显卡 "));
-    gpu_->setRange(0, 15);
-    training->addWidget(gpu_);
+    gpu_ = new QComboBox(this);
+    gpu_->setObjectName("trainingDevice");
+    gpu_->setAccessibleName(QStringLiteral("训练设备"));
+    gpu_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    gpu_->setMinimumContentsLength(18);
+    selectDevice(0);
+    training->addWidget(gpu_, 1);
     batch_ = new QSpinBox(this);
     batch_->setPrefix(QStringLiteral("批量 "));
     batch_->setRange(1, 40);
+    batch_->setMaximumWidth(96);
     training->addWidget(batch_);
     epochs_ = new QSpinBox(this);
     epochs_->setPrefix(QStringLiteral("轮数 "));
     epochs_->setRange(2, 50);
     epochs_->setValue(4);
+    epochs_->setMaximumWidth(96);
     training->addWidget(epochs_);
     train_ = button(training, QStringLiteral("开始训练"), [this] {
         submit(nextTrainingStage());
@@ -402,9 +459,10 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
         submit(nextTrainingStage(), true);
     });
     resume_->setVisible(false);
-    for (auto *control : {gpu_, batch_, epochs_})
+    connect(gpu_, &QComboBox::currentIndexChanged, this, [this] { showState(); });
+    for (auto *control : {batch_, epochs_})
         connect(control, &QSpinBox::valueChanged, this, [this] { showState(); });
-    preview_ = button(training, QStringLiteral("试听并入库"), [this] { importVoice(); });
+    preview_ = button(training, QStringLiteral("保存声音"), [this] { importVoice(); });
     training->addStretch();
     layout->addLayout(training);
     layout->addWidget(status_);
@@ -440,7 +498,7 @@ TrainingPanel::TrainingPanel(QString root, TaskScheduler &scheduler, std::functi
     });
     connect(&scheduler_, &TaskScheduler::changed, this, [this] { showState(); });
     connect(&scheduler_.compatibility(), &CompatibilityRegistry::changed, this, &TrainingPanel::refreshEngineSelection);
-    connect(&scheduler_, &TaskScheduler::activityChanged, this, &TrainingPanel::showActivity);
+    connect(&scheduler_, &TaskScheduler::activityChanged, this, &TrainingPanel::updateStageVisibility);
     query.prepare("SELECT name,id FROM projects ORDER BY rowid DESC");
     execute(query);
     while (query.next())
@@ -527,11 +585,9 @@ void TrainingPanel::loadProject()
         loadLabels(project_.value("annotation").toString(), project_.value("annotation_automatic").toBool());
     reviewsDirty_ = false;
     const auto settings = project_.value("training_settings").toObject();
-    if (!settings.isEmpty()) {
-        gpu_->setValue(settings.value("gpu").toString().toInt());
-        batch_->setValue(settings.value("batch").toInt(1));
-        epochs_->setValue(settings.value("epochs").toInt(4));
-    }
+    selectDevice(settings.value("gpu").toString().toInt());
+    batch_->setValue(settings.value("batch").toInt(1));
+    epochs_->setValue(settings.value("epochs").toInt(4));
     status_->clear();
     showState();
 }
@@ -555,6 +611,7 @@ void TrainingPanel::importAudio(bool clips)
             QStringLiteral("选择如何处理本次导入。"), QMessageBox::Cancel, this);
         auto *append = method.addButton(QStringLiteral("追加"), QMessageBox::AcceptRole);
         auto *overwrite = method.addButton(QStringLiteral("替换本批"), QMessageBox::DestructiveRole);
+        method.button(QMessageBox::Cancel)->setText(QStringLiteral("取消"));
         method.setDefaultButton(append);
         method.exec();
         if (method.clickedButton() == overwrite)
@@ -581,6 +638,8 @@ void TrainingPanel::importAudio(bool clips)
             .arg(plan.additions).arg(plan.files.size() - plan.additions).arg(plan.duplicates.size())
             .arg(plan.conflicts.size()).arg(plan.replaced.size()),
         QMessageBox::Apply | QMessageBox::Cancel, this);
+    preview.button(QMessageBox::Apply)->setText(QStringLiteral("应用"));
+    preview.button(QMessageBox::Cancel)->setText(QStringLiteral("取消"));
     if (!details.isEmpty())
         preview.setDetailedText(details.join("\n\n"));
     if (plan.additions == 0 || preview.exec() != QMessageBox::Apply) {
@@ -589,8 +648,8 @@ void TrainingPanel::importAudio(bool clips)
         return;
     }
     const auto projectDirectory = project_.value("directory").toString();
-    const auto destination = checkedPath(projectDirectory + "/" + folder + "/" + batch);
-    const auto pendingDirectory = clips ? QString() : checkedPath(projectDirectory + "/raw-pending/" + batch);
+    const auto destination = nextArtifactPath(projectDirectory + "/" + folder, folder);
+    const auto pendingDirectory = clips ? QString() : nextArtifactPath(projectDirectory + "/raw-pending", "raw");
     QStringList pending;
     for (const auto &name : project_.value("pending_recordings").toArray())
         pending.append(name.toString());
@@ -826,6 +885,8 @@ void TrainingPanel::loadLabels(const QString &path, bool automatic)
             .arg(changes.join('\n'), unlabelled.join('\n'), missingAudio.join('\n'),
                  duplicateNames.join('\n'), malformed.join(", "), ambiguous.join('\n')));
         preview.button(QMessageBox::Apply)->setEnabled(!matches.isEmpty());
+        preview.button(QMessageBox::Apply)->setText(QStringLiteral("应用"));
+        preview.button(QMessageBox::Cancel)->setText(QStringLiteral("取消"));
         if (preview.exec() != QMessageBox::Apply)
             return;
     }
@@ -884,7 +945,7 @@ void TrainingPanel::saveLabels()
             return;
         }
     }
-    const auto annotation = checkedPath(project_.value("directory").toString() + "/labels-" + newId() + ".list");
+    const auto annotation = nextArtifactPath(project_.value("directory").toString(), "labels", ".list");
     QSaveFile out(annotation);
     require(out.open(QIODevice::WriteOnly) && out.write(content) == content.size() && out.commit(),
             QStringLiteral("无法保存校对结果"));
@@ -903,6 +964,8 @@ void TrainingPanel::submit(const QString &operation, bool resume)
     const auto launcher = launcher_();
     require(!launcher.isEmpty(), QStringLiteral("请在「设置」中添加并选择引擎"));
     const auto training = operation == "train_sovits" || operation == "train_gpt";
+    const auto device = operation == "slice" ? QString() : deviceIssue();
+    require(device.isEmpty(), device);
     const auto installation = scheduler_.compatibility().inspect(launcher);
     const auto capability = resume ? "resume_" + operation.mid(6) : operation;
     const auto issue = installation.issue(capability, project_.value("family").toString(),
@@ -913,7 +976,7 @@ void TrainingPanel::submit(const QString &operation, bool resume)
     auto request = project_;
     request["operation"] = operation;
     request["project"] = project_.value("directory");
-    request["gpu"] = QString::number(gpu_->value());
+    request["gpu"] = gpu_->currentData().toString();
     request["batch"] = batch_->value();
     request["epochs"] = epochs_->value();
     request["source"] = project_.value(operation == "slice" ? "raw" : "clips");
@@ -933,7 +996,7 @@ void TrainingPanel::submit(const QString &operation, bool resume)
     }
     if (operation == "slice" || operation == "asr") {
         require(!request.value("source").toString().isEmpty(), QStringLiteral("请先导入该阶段所需的录音"));
-        request["destination"] = project_.value("directory").toString() + "/" + operation + "-" + newId();
+        request["destination"] = nextArtifactPath(project_.value("directory").toString(), operation);
         request["asr_language"] = project_.value("language") == "yue" ? "yue" : "zh";
     } else if (operation == "prepare") {
         require(project_.contains("annotation"), QStringLiteral("请保存校对后的标注"));
@@ -1118,7 +1181,7 @@ QString TrainingPanel::resumeJob(const QString &operation) const
         const auto state = query.value(1).toString();
         if (state == "succeeded" || state == "queued" || state == "running")
             return {};
-        if (!jobId.match(id).hasMatch() || request.value("gpu").toString() != QString::number(gpu_->value())
+        if (!jobId.match(id).hasMatch() || request.value("gpu").toString() != gpu_->currentData().toString()
             || request.value("batch").toInt() != batch_->value() || request.value("epochs").toInt() != epochs_->value()
             || request.value("annotation") != project_.value("annotation"))
             continue;
@@ -1177,7 +1240,8 @@ void TrainingPanel::showState()
     const auto trainingStage = nextTrainingStage();
     const auto training = installation.issue(trainingStage, family);
     const auto resumeIssue = installation.issue("resume_" + trainingStage.mid(6), family);
-    const auto resumeJobId = !active && resumeIssue.isEmpty() ? resumeJob(trainingStage) : QString();
+    const auto device = deviceIssue();
+    const auto resumeJobId = !active && resumeIssue.isEmpty() && device.isEmpty() ? resumeJob(trainingStage) : QString();
     const auto canResume = !resumeJobId.isEmpty();
     resume_->setVisible(canResume);
     const bool canCreate = !installation.families(fullTraining).isEmpty();
@@ -1189,20 +1253,22 @@ void TrainingPanel::showState()
     const auto slice = installation.issue("slice");
     const auto asr = installation.issue("asr", {}, language);
     const auto prepare = installation.issue("prepare", family);
-    const auto synthesis = installation.issue("synthesize", family);
     const bool hasRaw = project_.contains("raw") || project_.contains("raw_pending");
     const bool hasClips = project_.contains("clips");
     const bool hasAnnotation = project_.contains("annotation");
     const bool hasDataset = project_.contains("dataset");
     const bool hasWeights = project_.contains("gpt") && project_.contains("sovits");
+    train_->setVisible(!hasWeights);
+    preview_->setVisible(hasWeights);
     const bool sameEngine = project_.value("engine").toString().compare(launcher, Qt::CaseInsensitive) == 0;
     const auto trainingIssue = hasDataset && !sameEngine
         ? QStringLiteral("此项目的数据已在另一整合包中准备。可切回原整合包，或为当前整合包重新准备数据。") : training;
     setAvailable(slice_, slice, hasRaw);
-    setAvailable(transcribe_, asr, hasClips);
-    setAvailable(prepare_, prepare, hasClips);
-    setAvailable(train_, trainingIssue, hasDataset && !hasWeights);
-    setAvailable(preview_, synthesis, hasWeights);
+    setAvailable(transcribe_, asr.isEmpty() ? device : asr, hasClips);
+    setAvailable(prepare_, prepare.isEmpty() ? device : prepare, hasClips);
+    setAvailable(train_, trainingIssue.isEmpty() ? device : trainingIssue, hasDataset && !hasWeights);
+    setAvailable(preview_, {}, hasWeights);
+    gpu_->setToolTip(device.isEmpty() ? gpu_->currentText() : device);
     QString issue;
     if (project_.isEmpty()) {
         if (!canCreate) {
@@ -1210,10 +1276,8 @@ void TrainingPanel::showState()
             if (!installation.error.isEmpty() || installation.package().isEmpty())
                 issue += "\n" + installation.description();
         }
-    } else if (!active) {
-        if (hasWeights)
-            issue = synthesis;
-        else if (project_.contains("raw_pending") || (hasRaw && !hasClips))
+    } else if (!active && !hasWeights) {
+        if (project_.contains("raw_pending") || (hasRaw && !hasClips))
             issue = slice;
         else if (hasDataset)
             issue = trainingIssue;
@@ -1246,32 +1310,34 @@ void TrainingPanel::showState()
         highlight(suggested_, true);
     };
     if (project_.isEmpty()) {
-        advise(create_, QStringLiteral("下一步：点「新建项目」，再导入原始录音或已切好的 WAV。"));
+        advise(create_, QStringLiteral("新建项目后即可导入录音或切片。"));
     } else if (active) {
-        advise(nullptr, QStringLiteral("当前阶段已排队，等待引擎或前面的任务。可在「任务记录」取消。"));
-        showActivity();
+        advise(nullptr, QStringLiteral("已排队，等待运行。"));
     } else if (project_.contains("raw_pending")) {
-        advise(slice_, QStringLiteral("有新录音待切片。切片后可继续校对，已有片段的校对会保留。"));
+        advise(slice_, QStringLiteral("有新录音待切片。已有校对会保留。"));
     } else if (project_.contains("gpt") && project_.contains("sovits")) {
-        advise(preview_, QStringLiteral("两份模型权重已完成。选一段清晰的参考录音，点「试听并入库」。"));
+        advise(preview_, QStringLiteral("权重已保存。选择参考片段后可保存声音。"));
+    } else if (hasClips && !device.isEmpty()) {
+        advise(nullptr, device);
     } else if (canResume) {
-        advise(resume_, QStringLiteral("已找到匹配的检查点，可点「从检查点继续」。"));
+        advise(resume_, QStringLiteral("可以从检查点继续训练。"));
     } else if (project_.contains("sovits")) {
-        advise(train_, QStringLiteral("SoVITS 阶段已完成。点击「开始训练」继续 GPT 阶段。"));
+        advise(train_, QStringLiteral("SoVITS 已训练完成。下一阶段是 GPT。"));
     } else if (project_.contains("dataset")) {
         const int count = project_.value("sampleCount").toInt();
-        advise(train_, count > 0 ? QStringLiteral("%1 条训练样本已校验。确认显卡、批量和轮数后开始训练。").arg(count)
-                                 : QStringLiteral("训练数据已就绪。确认显卡、批量和轮数后开始训练。"));
+        advise(train_, count > 0 ? QStringLiteral("%1 条训练样本已就绪。").arg(count)
+                                 : QStringLiteral("训练数据已就绪。"));
     } else if (project_.contains("annotation")) {
         advise(prepare_, project_.value("training_recovery").toString(
-            QStringLiteral("选中片段试听，双击「文本」校对。校对后点击「准备数据」，会自动保存标注。")));
+            QStringLiteral("双击文本校对。「准备数据」会自动保存标注。")));
     } else if (project_.contains("clips")) {
-        advise(transcribe_, QStringLiteral("切片已就绪。可自动转写、导入已有标注，或双击「文本」手动填写。"));
+        advise(transcribe_, QStringLiteral("转写、导入标注，或双击文本手动填写。"));
     } else if (project_.contains("raw")) {
-        advise(slice_, QStringLiteral("原始录音已导入。点「切片」，将录音分成便于逐条标注的片段。"));
+        advise(slice_, QStringLiteral("录音已导入，可以切片。"));
     } else {
-        advise(recordings_, QStringLiteral("导入原始录音进行切片，或直接导入已切好的 WAV 片段。"));
+        advise(recordings_, QStringLiteral("导入整段录音或已切好的 WAV。"));
     }
+    updateStageVisibility();
 }
 
 void TrainingPanel::refreshEngineSelection()
@@ -1283,11 +1349,47 @@ void TrainingPanel::refreshEngineSelection()
     }
 }
 
-void TrainingPanel::showActivity()
+void TrainingPanel::setDeviceNames(const QMap<int, QString> &devices)
+{
+    if (deviceNames_ == devices)
+        return;
+    const auto selected = gpu_->currentData().toInt();
+    deviceNames_ = devices;
+    selectDevice(selected);
+    refreshEngineSelection();
+}
+
+QString TrainingPanel::deviceIssue() const
+{
+    if (!deviceNames_.isEmpty() && !deviceNames_.contains(gpu_->currentData().toInt()))
+        return QStringLiteral("原训练设备不可用，请选择当前可用的设备。");
+    return {};
+}
+
+void TrainingPanel::selectDevice(int ordinal)
+{
+    const QSignalBlocker block(gpu_);
+    gpu_->clear();
+    const auto names = deviceNames_.values();
+    for (auto item = deviceNames_.cbegin(); item != deviceNames_.cend(); ++item) {
+        const auto name = names.count(item.value()) > 1
+            ? QStringLiteral("%1 · 设备 %2").arg(item.value()).arg(item.key()) : item.value();
+        gpu_->addItem(name, item.key());
+    }
+    auto selected = gpu_->findData(ordinal);
+    if (selected < 0) {
+        const auto label = !deviceNames_.isEmpty() ? QStringLiteral("原设备不可用")
+            : ordinal == 0 ? QStringLiteral("引擎默认设备") : QStringLiteral("待确认设备");
+        gpu_->addItem(label, ordinal);
+        selected = gpu_->count() - 1;
+    }
+    gpu_->setCurrentIndex(selected);
+}
+
+void TrainingPanel::updateStageVisibility()
 {
     const auto &activity = scheduler_.activity();
-    if (!activity.id.isEmpty() && project_.value("pending").toString() == activity.id)
-        stage_->setText(jobActivityText(activity));
+    stage_->setVisible(activity.id.isEmpty() || project_.value("pending").toString() != activity.id);
 }
 
 }

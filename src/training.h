@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QJsonObject>
+#include <QMap>
 #include <QWidget>
 #include <functional>
 
@@ -23,6 +24,7 @@ public:
     TrainingPanel(QString root, TaskScheduler &scheduler, std::function<QString()> launcher,
                   std::function<void(QJsonObject)> openVoice, QWidget *parent = nullptr);
     void refreshEngineSelection();
+    void setDeviceNames(const QMap<int, QString> &devices);
 
 signals:
     void engineDetailsRequested();
@@ -45,10 +47,12 @@ private:
     void complete(const QString &id, const QJsonObject &result, bool live = true);
     void importVoice();
     void showState();
-    void showActivity();
+    void updateStageVisibility();
     bool busy() const;
     QString nextTrainingStage() const;
     QString resumeJob(const QString &operation) const;
+    void selectDevice(int ordinal);
+    QString deviceIssue() const;
     bool eventFilter(QObject *watched, QEvent *event) override;
     void showEvent(QShowEvent *event) override;
 
@@ -61,7 +65,8 @@ private:
     QTableWidget *labels_ = nullptr;
     QCheckBox *pendingOnly_ = nullptr;
     bool reviewsDirty_ = false;
-    QSpinBox *gpu_ = nullptr;
+    QComboBox *gpu_ = nullptr;
+    QMap<int, QString> deviceNames_;
     QSpinBox *batch_ = nullptr;
     QSpinBox *epochs_ = nullptr;
     QPushButton *create_ = nullptr;

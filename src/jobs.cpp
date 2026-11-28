@@ -137,9 +137,11 @@ QString recoveryHint(const QString &message, const QString &logs, const QString 
     return message;
 }
 
+const QString archivePartialSuffix = QStringLiteral(".ez-partial");
+
 QString partialWavePath(const QString &target)
 {
-    return target + ".ez-partial";
+    return target + archivePartialSuffix;
 }
 
 QString stageWave(const QString &source, const QString &partial, qint64 expectedBytes,
@@ -183,18 +185,13 @@ QString jobActivityText(const JobActivity &activity)
 {
     if (activity.id.isEmpty())
         return {};
-    auto text = operationLabel(activity.operation) + QStringLiteral(" · ") + activity.phase;
-    if (activity.total > 0)
-        text += QStringLiteral(" %1/%2 %3").arg(activity.completed).arg(activity.total).arg(activity.unit);
-    if (!activity.device.isEmpty())
-        text += QStringLiteral(" · %1").arg(activity.device);
     const auto hours = activity.seconds / 3600;
     const auto minutes = activity.seconds / 60 % 60;
     const auto seconds = activity.seconds % 60;
     auto elapsed = QStringLiteral("%1 分 %2 秒").arg(minutes).arg(seconds, 2, 10, QChar('0'));
     if (hours > 0)
         elapsed.prepend(QStringLiteral("%1 时 ").arg(hours));
-    return text + QStringLiteral(" · 已用 %1").arg(elapsed);
+    return QStringLiteral("%1 · %2 · 已用 %3").arg(operationLabel(activity.operation), activity.phase, elapsed);
 }
 
 static QJsonObject prepareJob(const EngineManager &engine, const QString &root,
@@ -281,11 +278,16 @@ TaskScheduler::TaskScheduler(QString dataRoot, QString defaultOutputRoot, Engine
             const auto completion = resolvedWorkspacePaths(receipt);
             const auto audio = completion.value("audio").toString();
             const auto output = outputRootForRequest(root_, request);
+            const auto filename = QFileInfo(audio).fileName();
+            const auto version = completion.value("archive_version").toInt();
+            static const QRegularExpression timestamped(R"(^synth-[0-9]{12}(?:-[0-9]+)?\.wav$)");
+            const bool matchingName = version == 2
+                ? completion.value("archive_job").toString() == id && timestamped.match(filename).hasMatch()
+                : (version == 0 || version == 1) && filename == id + ".wav";
             if (!audio.startsWith(output.endsWith('/') ? output : output + '/', Qt::CaseInsensitive)
-                || QDir::cleanPath(audio) != audio
-                || QFileInfo(audio).fileName() != id + ".wav")
+                || QDir::cleanPath(audio) != audio || !matchingName)
                 continue;
-            if (!QUuid(id).isNull() && completion.value("archive_version").toInt() == 1)
+            if (version == 1 || version == 2)
                 QFile::remove(checkedPath(partialWavePath(audio)));
             if (isArchivedWave(audio, completion))
                 update(id, "succeeded", {}, completion);
@@ -549,13 +551,6 @@ void TaskScheduler::next()
             checkOutputDirectory(outputRootForRequest(root_, activeRequest_));
             const auto launcher = engine_.root() + "/go-webui.bat";
             activeVoiceVersion_ = voiceInputVersion(activeRequest_, launcher);
-            if (!activeVoiceVersion_.isEmpty()) {
-                payload["record_voice_verification"] = true;
-                const auto previous = latestBatchVerification(activeRequest_.value("voice_id").toString(),
-                                                               activeRequest_.value("batch_id").toString());
-                if (previous.value("input_version").toObject() == activeVoiceVersion_)
-                    payload["verification_hashes"] = previous.value("sha256");
-            }
         }
         update(active_, "running");
         activityClock_.start();
@@ -659,32 +654,13 @@ void TaskScheduler::pollActivity()
         const auto phase = progress.value("phase").toString();
         if (!phase.isEmpty())
             next.phase = phase.left(100);
-        next.completed = progress.value("completed").toInt();
-        next.total = progress.value("total").toInt();
-        next.unit = progress.value("unit").toString().left(8);
-        next.device = progress.value("device").toString().left(24);
-        if (next.completed < 0 || next.total < next.completed || next.unit.isEmpty())
-            next.total = 0;
     } else if (activity_.id == active_) {
         next.phase = activity_.phase;
-        next.completed = activity_.completed;
-        next.total = activity_.total;
-        next.unit = activity_.unit;
-        next.device = activity_.device;
     }
-    if (next.device.isEmpty()) {
-        const auto gpu = activeRequest_.value("gpu").toString();
-        if (!gpu.isEmpty())
-            next.device = QStringLiteral("所选显卡 %1").arg(gpu.left(2));
-    }
-    if (!archiveReceipt_.isEmpty()) {
+    if (!archiveReceipt_.isEmpty())
         next.phase = QStringLiteral("正在归档 WAV");
-        next.total = 0;
-    }
-    if (cancelling_) {
+    if (cancelling_)
         next.phase = QStringLiteral("正在取消任务");
-        next.total = 0;
-    }
     if (activity_ != next) {
         activity_ = next;
         emit activityChanged();
@@ -758,26 +734,17 @@ void TaskScheduler::finish(bool processSucceeded, QString message)
 
 void TaskScheduler::startArchive(QJsonObject result)
 {
-    const auto hashes = result.take("verification_hashes").toObject();
     if (!activeVoiceVersion_.isEmpty()) {
         const auto launcher = engine_.root() + "/go-webui.bat";
         const auto current = voiceInputVersion(activeRequest_, launcher);
         if (!sameSynthesisInputs(activeVoiceVersion_, current))
             fail(QStringLiteral("合成期间权重、参考音频或引擎文件发生变化。请确认文件后重试。"));
-        if (hashes.size() == 3) {
-            result["voice_verification"] = QJsonObject{
-                {"launcher", launcher}, {"input_version", current}, {"sha256", hashes},
-                {"verified_at", QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs)},
-                {"parameters", result.value("parameters")}, {"seed", result.value("seed")},
-                {"language", activeRequest_.value("language").toString(QStringLiteral("中文"))},
-            };
-        }
     }
     const auto voice = QUuid(activeRequest_.value("voice_id").toString()).toString(QUuid::WithoutBraces);
     const auto outputRoot = outputRootForRequest(root_, activeRequest_);
     const auto directory = checkedPath(QDir(outputRoot).filePath(
         voice + "/" + QDate::currentDate().toString(Qt::ISODate)));
-    const auto output = checkedPath(directory + "/" + active_ + ".wav");
+    const auto output = nextArtifactPath(directory, "synth", ".wav", archivePartialSuffix);
     const auto partial = checkedPath(partialWavePath(output));
     const auto source = checkedPath(jobPath_ + "/verified.wav");
     if (!QDir().mkpath(directory))
@@ -787,7 +754,8 @@ void TaskScheduler::startArchive(QJsonObject result)
     result["audio"] = output;
     if (activeRequest_.value("external_output").toBool())
         result["external_output"] = true;
-    result["archive_version"] = 1;
+    result["archive_version"] = 2;
+    result["archive_job"] = active_;
     save(jobPath_ + "/completion.json", json(storedWorkspacePaths(result)));
 
     const auto bytes = result.value("bytes").toInteger();

@@ -12,6 +12,7 @@ QStringList engineOperations();
 QString operationLabel(const QString &operation);
 bool resourceRuleIncludesScript(const QString &operation, const QString &family,
                                 const QString &language, const QString &script);
+QStringList resourceScripts(const QString &operation, const QString &family, const QString &language);
 QString resourceIssue(const QString &engine, const QString &operation, const QString &family,
                       const QString &asrLanguage = QStringLiteral("zh"), const std::atomic_bool *cancelled = nullptr);
 QString jobResourceIssue(const QString &engine, const QString &data, const QJsonObject &request);

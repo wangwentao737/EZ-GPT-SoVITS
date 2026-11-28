@@ -33,10 +33,6 @@ QJsonObject fileVersion(const QString &path)
         {"changed", QString::number(timestamps.ChangeTime.QuadPart)}};
 }
 
-const QString verifiedJobs = QStringLiteral(
-    " FROM jobs WHERE operation='synthesize' AND state='succeeded'"
-    " AND json_type(CAST(result AS TEXT),'$.voice_verification')='object'");
-
 }
 
 bool sameSynthesisInputs(const QJsonObject &before, const QJsonObject &after)
@@ -85,42 +81,6 @@ QJsonObject voiceInputVersion(const QJsonObject &settings, const QString &launch
     } catch (const std::exception &) {
         return {};
     }
-}
-
-QJsonObject latestBatchVerification(const QString &voice, const QString &batch)
-{
-    if (voice.isEmpty() || batch.isEmpty())
-        return {};
-    QSqlQuery query;
-    query.prepare("SELECT json_extract(CAST(result AS TEXT),'$.voice_verification')" + verifiedJobs
-        + " AND json_extract(CAST(request AS TEXT),'$.voice_id')=?"
-          " AND json_extract(CAST(request AS TEXT),'$.batch_id')=? ORDER BY rowid DESC LIMIT 1");
-    query.addBindValue(voice);
-    query.addBindValue(batch);
-    if (!query.exec() || !query.next())
-        return {};
-    return QJsonDocument::fromJson(query.value(0).toByteArray()).object();
-}
-
-QSqlQuery voicesWithVerification(const QSqlDatabase &database)
-{
-    return QSqlQuery("SELECT voice.id,voice.name,voice.settings,voice.verified_engine,"
-        " (SELECT json_extract(CAST(result AS TEXT),'$.voice_verification')" + verifiedJobs
-        + " AND json_extract(CAST(request AS TEXT),'$.voice_id')=voice.id ORDER BY rowid DESC LIMIT 1)"
-          " FROM voices AS voice ORDER BY voice.name", database);
-}
-
-QString voiceVerificationStatus(const QJsonObject &settings, const QJsonObject &record,
-                                const QString &previousEngine, const QString &selectedEngine)
-{
-    if (record.isEmpty())
-        return previousEngine.isEmpty() ? QStringLiteral("待验证") : QStringLiteral("待重新验证");
-    const auto launcher = record.value("launcher").toString();
-    if (!selectedEngine.isEmpty() && selectedEngine.compare(launcher, Qt::CaseInsensitive) != 0)
-        return QStringLiteral("当前引擎待验证");
-    const auto live = voiceInputVersion(settings, launcher);
-    return !live.isEmpty() && live == record.value("input_version").toObject()
-        ? QStringLiteral("已验证") : QStringLiteral("待重新验证");
 }
 
 }

@@ -42,6 +42,7 @@ signals:
 private:
     void showEvent(QShowEvent *event) override;
     void generate();
+    void resetAudio();
     void refreshSubmission();
     void refreshVoiceCompatibility();
     void updateGenerateButton();

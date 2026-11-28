@@ -147,6 +147,26 @@ QPair<QString, QString> instanceKey(const QString &directory, const QString &fin
 
 QString defaultEngineAdapter() { return "20261006"; }
 
+QJsonObject validatedCompatibilityRegistry(const QByteArray &contents)
+{
+    return readRegistry(contents);
+}
+
+QStringList supportedEngineAdapters()
+{
+    return {defaultEngineAdapter(), QString::fromLatin1(legacyAdapter)};
+}
+
+QStringList adapterOperations(const QString &adapter)
+{
+    QStringList supported;
+    for (const auto &operation : compatibilityOperations()) {
+        if (adapterSupportsOperation(adapter, operation))
+            supported.append(operation);
+    }
+    return supported;
+}
+
 QString adapterContractFile(const QString &adapter)
 {
     if (adapter == defaultEngineAdapter() || adapter == legacyAdapter)

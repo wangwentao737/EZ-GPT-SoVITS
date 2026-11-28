@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -81,6 +82,7 @@ def main():
     parser.add_argument("--engine", type=Path, default=scratch / "engine-20261006")
     parser.add_argument("--prepared", type=Path, default=scratch / "training" / "prepare.json")
     parser.add_argument("--labels", type=Path, help="Use alternate annotated WAV files under .test.")
+    parser.add_argument("--long-paths", action="store_true", help="Use CJK clip paths beyond the bundled FFmpeg limit.")
     parser.add_argument("--voice", type=Path, default=scratch / "synthesis" / "fixtures" / "synthesis.json")
     args = parser.parse_args()
     engine = args.engine.resolve(strict=True)
@@ -97,15 +99,20 @@ def main():
     label_path = (args.labels or Path(fixture["annotation"])).resolve(strict=True)
     assert label_path.is_relative_to(scratch), label_path
     lines = []
-    for line in label_path.read_text(encoding="utf-8-sig").splitlines():
+    originals = {}
+    for index, line in enumerate(label_path.read_text(encoding="utf-8-sig").splitlines(), 1):
         source, speaker, language, text = line.split("|", 3)
         origin = Path(source).resolve(strict=True)
         assert origin.is_relative_to(scratch), origin
-        clip = clips / origin.name
+        clip = clips / (f"{index:02d}-{('这是一段用于校验的中文录音' * 12)}.wav" if args.long_paths else origin.name)
+        if args.long_paths:
+            assert len(str(clip).encode("utf-16-le")) // 2 >= 260
+            originals[clip] = hashlib.sha256(origin.read_bytes()).hexdigest()
         clone(origin, clip)
         lines.append(f"{clip.as_posix()}|{speaker}|{language.lower()}|{text}")
     annotation = project / "annotations.list"
     annotation.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    annotated_bytes = annotation.read_bytes()
 
     prepare = {**fixture, "operation": "prepare", "experiment": identifier(), "project": str(project),
                "source": str(clips), "annotation": str(annotation), "batch": 1, "epochs": 2}
@@ -121,11 +128,20 @@ def main():
     assert prepared["sample_count"] == len(lines)
     manifest = json.loads((dataset / "ez-dataset.json").read_text(encoding="utf-8"))
     assert set(manifest["samples"]) == {clip.name for clip in clips.glob("*.wav")}
+    engine_names = manifest.get("engine_samples")
+    if args.long_paths:
+        assert set(engine_names) == set(manifest["samples"])
+        assert set(engine_names.values()) == {path.name for path in (dataset / "5-wav32k").glob("*.wav")}
+        assert annotation.read_bytes() == annotated_bytes
+        assert all(hashlib.sha256(clip.read_bytes()).hexdigest() == digest for clip, digest in originals.items())
+        assert not list((data / "jobs" / rows[0][0]).glob("ezp-*"))
+        print("Long original filenames, audio bytes, and reviewed annotations were preserved.", flush=True)
     print(f"Real preparation: {prepared['sample_count']} samples and their required artifacts matched.", flush=True)
 
     missing_id, duplicate_id = identifier(), identifier()
-    missing = next(iter(manifest["samples"])) + ".pt"
-    clone_dataset(dataset, engine / "logs" / missing_id, missing=missing)
+    missing = next(iter(manifest["samples"]))
+    artifact = engine_names[missing] if engine_names is not None else missing
+    clone_dataset(dataset, engine / "logs" / missing_id, missing=artifact + ".pt")
     clone_dataset(dataset, engine / "logs" / duplicate_id, duplicate=True)
     changed = project / "changed.list"
     changed.write_text(annotation.read_text(encoding="utf-8").replace("\n", " edited\n", 1), encoding="utf-8")
@@ -155,7 +171,7 @@ def main():
         assert state == "failed" and expected in message, (state, message)
         assert not (data / "jobs" / job / "training-run.json").exists()
     runs = []
-    for job, state, message, result in rows[3:]:
+    for kind, (job, state, message, result) in zip(("sovits", "gpt"), rows[3:], strict=True):
         assert state == "succeeded", (state, message)
         output = json.loads(result)
         updates = [entry for entry in progress_updates(data, job) if entry["unit"] == "轮"]
@@ -165,12 +181,15 @@ def main():
         assert Path(output["checkpoints"]) != dataset
         weight = workspace_path(data, output["weight"])
         assert weight.is_file() and weight.is_relative_to(project)
+        extension = "pth" if kind == "sovits" else "ckpt"
+        assert re.fullmatch(rf"{kind}-[0-9]{{12}}(?:-[0-9]+)?\.{extension}", weight.name)
         output["weight"] = weight.as_posix()
         record = json.loads((data / "jobs" / job / "training-run.json").read_text(encoding="utf-8"))
         assert record["checkpoints"] == output["checkpoints"] and record["epochs"] == 2
         runs.append(output)
     assert runs[0]["checkpoints"] != runs[1]["checkpoints"]
     assert (old_copy.stat().st_size, old_copy.stat().st_mtime_ns) == (old_stat.st_size, old_stat.st_mtime_ns)
+    assert annotation.read_bytes() == annotated_bytes
     print("Invalid datasets rejected; both stages trained with blank text-index lines in fresh directories.", flush=True)
 
     source = Path(voice["reference"]).resolve(strict=True)
@@ -181,7 +200,9 @@ def main():
                                          "reference": str(reference), "voice_id": str(uuid.uuid4())}], expected=0)
     assert len(rows) == 1 and rows[0][1] == "succeeded", rows
     audio = json.loads(rows[0][3])
-    assert hashlib.sha256(workspace_path(data, audio["audio"]).read_bytes()).hexdigest() == audio["sha256"]
+    file = workspace_path(data, audio["audio"])
+    assert re.fullmatch(r"synth-[0-9]{12}(?:-[0-9]+)?\.wav", file.name)
+    assert hashlib.sha256(file.read_bytes()).hexdigest() == audio["sha256"]
     print("The newly trained pair synthesized and archived a WAV with a matching checksum.", flush=True)
 
 

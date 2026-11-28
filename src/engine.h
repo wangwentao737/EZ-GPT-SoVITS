@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QFutureWatcher>
+#include <QJsonObject>
 #include <QMap>
 #include <QObject>
 #include <QStringList>
@@ -27,8 +28,17 @@ struct EnginePorts {
     quint16 inference = 9872;
 };
 
+struct EngineInterfaceSnapshot {
+    QJsonObject config;
+    QJsonObject info;
+};
+
 EnginePorts enginePorts(const QString &directory, const QString &adapter = {});
+QJsonObject engineContract(const QString &adapter);
+EngineInterfaceSnapshot capturePackageInterface(const QString &directory, quint16 port);
+QStringList compareEngineInterface(const EngineInterfaceSnapshot &observed, const QJsonObject &expected);
 QString engineFingerprint(const QString &directory);
+QMap<int, QString> reportedTrainingDevices(const QString &report);
 QString resumeEngineIssue(const QString &directory, const QString &family,
                           const QString &operation = {}, const QString &adapter = {});
 
@@ -47,6 +57,8 @@ public:
     QString fingerprint() const { return fingerprint_; }
     QMap<QString, QString> interfaceIssues() const;
     QString devices() const;
+    QMap<int, QString> trainingDevices(const QString &launcher) const;
+    void discoverLocalDevices();
     QString gradioVersion() const;
     EnginePorts ports() const;
     quint32 webuiPid() const;
@@ -55,6 +67,7 @@ public:
 signals:
     void statusChanged(const QString &message);
     void readinessChanged(bool ready);
+    void trainingDevicesChanged();
     void instanceFailed(const QString &launcher, const QString &message);
 
 private:
@@ -62,6 +75,8 @@ private:
     std::unique_ptr<Process> process_;
     QTimer timer_;
     QFutureWatcher<EngineProbe> probe_;
+    QFutureWatcher<QMap<int, QString>> localDeviceProbe_;
+    QMap<int, QString> localDevices_;
     QMap<QString, QString> unavailable_;
     QString devices_;
     QString gradio_;

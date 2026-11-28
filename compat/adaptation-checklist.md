@@ -229,7 +229,7 @@ gh pr ready $pr --repo $repo
 
 评审要求更新到最新上游时，在同一功能分支执行 `git fetch $baseRemote` 和 `git merge $baseRef`。有冲突时用 `git status` 找到文件，合并完登记条目和修订号后，逐个暂存解决的文件，用 `git merge --continue` 完成合并。完成回归后再次执行 `git push $pushRemote $branch`。
 
-合并后，先检查上游 `main` 实际提供的清单，再用目标 EZ 构建进入「设置 → 检查兼容清单更新」。核对修订号、目标包和 20261006 的选项，重复检查一次应提示已是最新。再用一个独立数据目录做离线导入。新适配器随支持它的 EZ 构建交付。遇到旧构建拒绝未知适配器时，旧构建会保留上一次可用清单。
+合并后，先检查上游 `main` 实际提供的清单，再用目标 EZ 构建进入「设置 → 整合包兼容清单 → 检查清单更新」。核对修订号、目标包和 20261006 的选项，重复检查一次应提示已是最新。再用一个独立数据目录做离线导入。新适配器随支持它的 EZ 构建交付。遇到旧构建拒绝未知适配器时，旧构建会保留上一次可用清单。
 
 ```powershell
 $url = "https://api.github.com/repos/$repo/contents/compat/registry-v1.json?ref=main"

@@ -4,12 +4,10 @@
 #include "settings.h"
 #include "synthesis.h"
 #include "ui.h"
-#include "voiceverification.h"
 #include "workspacepaths.h"
 
 #include <QAction>
 #include <QComboBox>
-#include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
 #include <QFile>
@@ -64,9 +62,6 @@ struct Asset {
 struct Voice {
     QString name;
     QJsonObject settings;
-    QString verifiedEngine;
-    QJsonObject verification;
-    QString verificationStatus;
 };
 
 struct Library {
@@ -172,17 +167,11 @@ Library readLibrary(QSqlDatabase database, const QString &root, bool scan)
         }
     }
 
-    check(query.exec("SELECT value FROM workspace_settings WHERE key='currentEngine'"), query);
-    const auto selectedEngine = query.next() ? query.value(0).toString() : QString();
-    query = voicesWithVerification(database);
-    check(!query.lastError().isValid(), query);
+    check(query.exec("SELECT id,name,settings FROM voices ORDER BY name"), query);
     while (query.next()) {
         const auto id = query.value(0).toString();
         const auto settings = readObject(query.value(2));
-        const auto legacy = query.value(3).toString();
-        const auto record = query.value(4).isNull() ? QJsonObject{} : readObject(query.value(4));
-        library.voices.insert(id, {query.value(1).toString(), settings, legacy, record,
-                                   voiceVerificationStatus(settings, record, legacy, selectedEngine)});
+        library.voices.insert(id, {query.value(1).toString(), settings});
         addInputs(library, settings, id, settings.value("project_id").toString());
     }
 
@@ -261,7 +250,8 @@ private:
     void renameVoice();
     void removeCopy();
     QString selection() const;
-    QString associated(const Asset &asset) const;
+    QString projectNames(const QSet<QString> &projects) const;
+    QString associated(const Asset &asset, bool includeProjects = true) const;
 
     QString root_;
     SynthesisPanel *synthesis_;
@@ -288,8 +278,7 @@ LibraryPage::LibraryPage(QString root, const QString &defaultOutput, TaskSchedul
     : QWidget(tabs), root_(std::move(root)), synthesis_(synthesis)
 {
     auto *layout = new QVBoxLayout(this);
-    ui::pageHeader(layout, this, QStringLiteral("声音与素材"),
-        QStringLiteral("左键选中一项可查看详情。右键可使用声音、播放音频或打开文件位置。"));
+    ui::pageHeader(layout, this, QStringLiteral("声音与素材"));
     auto *filters = new QHBoxLayout;
     kind_ = new QComboBox(this);
     kind_->addItem(QStringLiteral("全部类型"), -1);
@@ -302,19 +291,24 @@ LibraryPage::LibraryPage(QString root, const QString &defaultOutput, TaskSchedul
     kind_->setAccessibleName(QStringLiteral("按素材类型筛选"));
     voice_->setAccessibleName(QStringLiteral("按声音筛选"));
     project_->setAccessibleName(QStringLiteral("按项目筛选"));
+    ui::fitComboBox(voice_, 12);
+    ui::fitComboBox(project_, 12);
     filters->addWidget(kind_);
     filters->addWidget(project_, 1);
     filters->addWidget(voice_, 1);
     layout->addLayout(filters);
 
-    table_ = new QTableWidget(0, 4, this);
+    table_ = new QTableWidget(0, 5, this);
     table_->setHorizontalHeaderLabels({QStringLiteral("名称"), QStringLiteral("类型"),
-        QStringLiteral("模型家族"), QStringLiteral("关联")});
+        QStringLiteral("模型家族"), QStringLiteral("项目"), QStringLiteral("关联")});
     table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
     ui::styleTable(table_);
-    table_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    table_->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
     table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    table_->horizontalHeader()->setStretchLastSection(true);
+    table_->setColumnWidth(1, 110);
+    table_->setColumnWidth(2, 92);
+    table_->setColumnWidth(3, 128);
+    table_->setColumnWidth(4, 156);
     layout->addWidget(table_, 1);
     empty_ = new QLabel(QStringLiteral("导入声音，或在训练完成后将新声音保存到这里。"), this);
     empty_->setObjectName("emptyState");
@@ -452,15 +446,25 @@ QString LibraryPage::selection() const
     return item ? item->data(Qt::UserRole).toString() : QString();
 }
 
-QString LibraryPage::associated(const Asset &asset) const
+QString LibraryPage::projectNames(const QSet<QString> &projects) const
+{
+    QStringList names;
+    for (const auto &id : projects)
+        names << library_.projects.value(id, id);
+    names.sort(Qt::CaseInsensitive);
+    names.removeDuplicates();
+    return names.join(QStringLiteral("、"));
+}
+
+QString LibraryPage::associated(const Asset &asset, bool includeProjects) const
 {
     QStringList refs;
     for (const auto &id : asset.voices) {
         const auto voice = library_.voices.constFind(id);
         refs << QStringLiteral("声音 · %1").arg(voice == library_.voices.cend() ? id : voice->name);
     }
-    for (const auto &id : asset.projects)
-        refs << QStringLiteral("项目 · %1").arg(library_.projects.value(id, id));
+    if (includeProjects && !asset.projects.isEmpty())
+        refs << QStringLiteral("项目 · %1").arg(projectNames(asset.projects));
     refs.sort(Qt::CaseInsensitive);
     if (!asset.jobs.isEmpty())
         refs << QStringLiteral("%1 条任务记录").arg(asset.jobs.size());
@@ -476,9 +480,12 @@ void LibraryPage::refill()
     const auto append = [this, selected](const QString &key, const QStringList &fields) {
         const int row = table_->rowCount();
         table_->insertRow(row);
-        for (int column = 0; column < fields.size(); ++column)
-            table_->setItem(row, column, new QTableWidgetItem(fields[column]));
-        table_->item(row, 0)->setToolTip(fields.constFirst());
+        for (int column = 0; column < fields.size(); ++column) {
+            const auto &value = fields[column];
+            auto *item = new QTableWidgetItem(value);
+            item->setToolTip(value);
+            table_->setItem(row, column, item);
+        }
         table_->item(row, 0)->setData(Qt::UserRole, key);
         if (key == selected)
             table_->selectRow(row);
@@ -494,11 +501,8 @@ void LibraryPage::refill()
                 if ((!voice.isEmpty() && item.key() != voice) || (!project.isEmpty() && projectId != project))
                     continue;
                 const auto projectName = library_.projects.value(projectId);
-                auto summary = preset.verificationStatus;
-                if (!projectName.isEmpty())
-                    summary += QStringLiteral(" · ") + projectName;
-                append("voice:" + item.key(), {preset.name, typeNames[Preset], preset.settings.value("family").toString(),
-                    summary});
+                append("voice:" + item.key(), {preset.name, typeNames[Preset],
+                    preset.settings.value("family").toString(), projectName, {}});
             }
         }
         for (auto item = library_.files.cbegin(); item != library_.files.cend(); ++item) {
@@ -506,7 +510,7 @@ void LibraryPage::refill()
             if ((type != -1 && file.kind != type) || (!voice.isEmpty() && !file.voices.contains(voice))
                 || (!project.isEmpty() && !file.projects.contains(project)))
                 continue;
-            append(item.key(), {file.name, typeNames[file.kind], file.family, associated(file)});
+            append(item.key(), {file.name, typeNames[file.kind], file.family, projectNames(file.projects), associated(file, false)});
         }
     }
     table_->setUpdatesEnabled(true);
@@ -532,28 +536,10 @@ void LibraryPage::showDetails()
     folder_->setEnabled(file != library_.files.cend());
     if (preset != library_.voices.cend()) {
         const auto &settings = preset->settings;
-        const auto &record = preset->verification;
-        const auto date = QDateTime::fromString(record.value("verified_at").toString(), Qt::ISODateWithMs).toLocalTime();
-        const auto engine = record.value("launcher").toString(preset->verifiedEngine);
-        const auto hashes = record.value("sha256").toObject();
-        const auto params = record.value("parameters").toObject();
-        auto description = QStringLiteral("验证状态 · %1").arg(preset->verificationStatus);
-        if (!engine.isEmpty())
-            description += QStringLiteral("\n上次验证引擎 · %1").arg(engine);
-        if (date.isValid()) {
-            description += QStringLiteral("\n上次试音 · %1\n语言 · %2　切句 · %3　语速 · %4　种子 · %5"
-                                          "\nTop K · %6　Top P · %7　温度 · %8")
-                .arg(date.toString("yyyy-MM-dd HH:mm:ss"), record.value("language").toString(), params.value("split").toString())
-                .arg(params.value("speed").toDouble()).arg(record.value("seed").toInteger())
-                .arg(params.value("top_k").toInt()).arg(params.value("top_p").toDouble()).arg(params.value("temperature").toDouble());
-        }
-        description += QStringLiteral("\nGPT 权重 · %1\nSoVITS 权重 · %2\n参考音频 · %3\n参考文本 · %4\n参考语言 · %5\n默认台词语言 · %6")
+        const auto description = QStringLiteral("GPT 权重 · %1\nSoVITS 权重 · %2\n参考音频 · %3\n参考文本 · %4\n参考语言 · %5\n默认台词语言 · %6")
             .arg(settings.value("gpt").toString(), settings.value("sovits").toString(),
                  settings.value("reference").toString(), settings.value("prompt").toString(),
                  settings.value("prompt_language").toString(), settings.value("default_language").toString(QStringLiteral("中文")));
-        if (!hashes.isEmpty())
-            description += QStringLiteral("\nGPT SHA-256 · %1\nSoVITS SHA-256 · %2\n参考音频 SHA-256 · %3")
-                .arg(hashes.value("gpt").toString(), hashes.value("sovits").toString(), hashes.value("reference").toString());
         details_->setPlainText(description);
     } else if (file != library_.files.cend()) {
         QStringList description{QDir::toNativeSeparators(file->path), associated(*file)};

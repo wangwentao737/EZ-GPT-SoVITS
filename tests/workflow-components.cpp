@@ -2,14 +2,19 @@
 #include "scriptlines.h"
 #include "waveexport.h"
 #include "engine.h"
+#include "compatdraft.h"
 #include "jobs.h"
 #include "settings.h"
+#include "synthesis.h"
 #include "training.h"
+#include "ui.h"
 #include "workspacepaths.h"
 
+#include <QAbstractItemView>
 #include <QApplication>
 #include <QAudioDevice>
 #include <QAudioOutput>
+#include <QComboBox>
 #include <QCryptographicHash>
 #include <QDataStream>
 #include <QDir>
@@ -27,6 +32,7 @@
 #include <QNetworkProxy>
 #include <QPushButton>
 #include <QSaveFile>
+#include <QScreen>
 #include <QScopeGuard>
 #include <QSignalSpy>
 #include <QSqlDatabase>
@@ -78,6 +84,41 @@ QString sha(const QString &path)
     QCryptographicHash hash(QCryptographicHash::Sha256);
     check(file.open(QIODevice::ReadOnly) && hash.addData(&file), "Cannot hash fixture");
     return QString::fromLatin1(hash.result().toHex());
+}
+
+void comboPopupPlacement()
+{
+    QApplication::setStyle("Fusion");
+    QWidget window;
+    window.resize(240, 100);
+    QComboBox choice(&window);
+    choice.setGeometry(12, 12, 135, 34);
+    choice.addItems({QStringLiteral("深色"), QStringLiteral("浅色")});
+    window.move(window.screen()->availableGeometry().topLeft() + QPoint(80, 80));
+    window.show();
+    check(QTest::qWaitForWindowExposed(&window), "Cannot show the popup test window");
+
+    for (const auto theme : {ui::Theme::Dark, ui::Theme::Light}) {
+        ui::applyTheme(theme);
+        for (int index = 0; index < choice.count(); ++index) {
+            choice.setCurrentIndex(index);
+            choice.showPopup();
+            const auto *popup = choice.view()->window();
+            const auto anchor = choice.mapToGlobal(QPoint(0, choice.height()));
+            check(popup->isVisible() && (popup->geometry().topLeft() - anchor).manhattanLength() <= 2,
+                "The popup moved away from the bottom edge when its selection or theme changed");
+            QTest::keyClick(choice.view(), Qt::Key_Escape);
+            check(!popup->isVisible() && choice.currentIndex() == index, "Escape must close the list without changing the selection");
+        }
+    }
+
+    const auto screen = window.screen()->availableGeometry();
+    window.move(screen.left() + 80, screen.bottom() - 48);
+    choice.showPopup();
+    const auto *popup = choice.view()->window();
+    check(popup->isVisible() && popup->geometry().bottom() <= choice.mapToGlobal(QPoint()).y()
+        && screen.contains(popup->geometry()), "The popup must open above the field if the screen has no room below it");
+    choice.hidePopup();
 }
 
 void writeFixture(const QString &path, const QByteArray &contents = "fixture")
@@ -215,6 +256,91 @@ void engineCompatibility(const QDir &root)
     check(reopened.inspect(renamed + launcher).package().isEmpty(), "An in-place upgrade retained registration");
 }
 
+void draftExport(const QDir &root)
+{
+    using namespace ez::adaptation;
+    const auto directory = root.filePath("draft-sample");
+    const auto output = root.filePath("exports");
+    check(QDir().mkpath(output), "Cannot make the test export directory");
+    const QString inference = "GPT_SoVITS/inference_webui_fast.py";
+    for (const auto &path : QStringList{"go-webui.bat", "webui.py", inference})
+        writeFixture(directory + '/' + path, path.toUtf8());
+    Capture capture;
+    capture.directory = directory;
+    capture.adapter = defaultEngineAdapter();
+    capture.fingerprint = engineFingerprint(directory);
+    capture.identity = {{"webui.py", engineScriptDigest(directory, "webui.py")},
+        {inference, engineScriptDigest(directory, inference)}};
+    capture.checks = {{"start", {}, {}, {}, {}}, {"synthesize", "v2", {}, QStringLiteral("快速推理参数变化"), {}}};
+    auto baseline = loadBaseline({});
+    Draft draft{"wizard-fixture", "Wizard fixture", "Fixture package archive", baseline,
+        {{0, "unverified", {}}, {1, "unverified", {}}}};
+    const auto path = exportDraft(capture, draft, output, false);
+    auto read = [](const QString &file) {
+        QFile source(file);
+        check(source.open(QIODevice::ReadOnly), "Cannot read generated compatibility draft");
+        return validatedCompatibilityRegistry(source.readAll());
+    };
+    const auto draftJson = read(path + "/registry-candidate.json");
+    const auto entries = draftJson.value("packages").toArray().last().toObject().value("capabilities").toArray();
+    check(entries.at(0).toObject().value("result") == "unverified"
+        && entries.at(1).toObject().value("result") == "unverified"
+        && QFileInfo::exists(path + "/PR-草稿.md"), "A desk check must not mark actual acceptance as passed");
+    const auto local = exportDraft(capture, draft, output, true);
+    const auto localEntries = read(local + "/registry-local-test.json").value("packages").toArray().last().toObject()
+        .value("capabilities").toArray();
+    check(localEntries.at(0).toObject().value("result") == "passed"
+        && localEntries.at(1).toObject().value("result") == "unverified", "Local candidate enabled an incompatible operation");
+    check(!QFileInfo::exists(local + "/PR-草稿.md"), "Local testing artifacts must be separate from the PR draft");
+    draft.entries[0].result = "passed";
+    bool refused = false;
+    try {
+        exportDraft(capture, draft, output, false);
+    } catch (const std::exception &) {
+        refused = true;
+    }
+    check(refused, "Exported final acceptance without evidence");
+    draft.entries[0].evidence = "Observed the standalone startup.";
+    const auto accepted = exportDraft(capture, draft, output, false);
+    check(accepted != path && read(accepted + "/registry-candidate.json").value("revision").toInt()
+        == baseline.value("revision").toInt() + 1, "Draft collision or invalid revision");
+}
+
+void liveDraftCapture(const QString &engine, const QString &output)
+{
+    using namespace ez::adaptation;
+    const auto captured = scan(engine, defaultEngineAdapter(), true);
+    check(captured.inferenceIssue.isEmpty() && !captured.inference.info.isEmpty(),
+        "Could not capture the real quick-inference service");
+    Draft draft{"20261006", "20261006 live test fixture", "Independent engine fixture", loadBaseline({}), {}};
+    for (int index = 0; index < captured.checks.size(); ++index) {
+        const auto &operation = captured.checks.at(index);
+        if (operation.operation == "start" || (operation.operation == "synthesize" && operation.family == "v5turbo")) {
+            check(operation.issue.isEmpty(), operation.issue);
+            draft.entries.append({index, "unverified", {}});
+        }
+    }
+    check(draft.entries.size() == 2, "Missing a required operation in the real interface capture");
+    const auto draftPath = exportDraft(captured, draft, output, false);
+    const auto localPath = exportDraft(captured, draft, output, true);
+    check(QFileInfo::exists(draftPath + "/registry-candidate.json") && QFileInfo::exists(draftPath + "/PR-草稿.md")
+        && QFileInfo::exists(localPath + "/capture-local/inference-config.json"),
+        "Real capture failed to produce the candidate registry, local evidence or PR draft");
+    for (const auto &path : {draftPath + "/registry-candidate.json", localPath + "/registry-local-test.json"}) {
+        QTemporaryDir storage(QDir(output).filePath("registry-import-XXXXXX"));
+        check(storage.isValid(), "Cannot prepare registry import test");
+        EngineManager manager;
+        CompatibilityRegistry registry(storage.path(), manager);
+        QFile file(path);
+        check(file.open(QIODevice::ReadOnly), "Cannot read the generated registry");
+        registry.install(file.readAll());
+        const auto selected = registry.inspect(captured.directory + "/go-webui.bat");
+        check(selected.package() == "20261006" && selected.issue("synthesize", "v5turbo").isEmpty(),
+            "Updating an already published build must preserve compatibility while a recheck is pending");
+    }
+    QTextStream(stdout) << "Real adaptation exports: " << draftPath << " | " << localPath << Qt::endl;
+}
+
 void recordings(const QDir &root)
 {
     const auto old = root.filePath("old");
@@ -302,6 +428,7 @@ QString operateImport(TrainingPanel &panel, const QString &control, const QStrin
                       const QString &previewTitle)
 {
     QString result;
+    bool localized = false;
     QSet<QString> seen;
     QStringList dialogs;
     QElapsedTimer clock;
@@ -340,6 +467,9 @@ QString operateImport(TrainingPanel &panel, const QString &control, const QStrin
             if (widget->windowTitle() == previewTitle) {
                 result = box->text() + '\n' + box->detailedText();
                 choice = qobject_cast<QPushButton *>(box->button(QMessageBox::Apply));
+                const auto *cancel = box->button(QMessageBox::Cancel);
+                localized = choice && choice->text() == QStringLiteral("应用")
+                    && cancel && cancel->text() == QStringLiteral("取消");
             } else if (widget->windowTitle() == QStringLiteral("导入录音")) {
                 choice = button(*box, QStringLiteral("追加"));
             }
@@ -359,6 +489,7 @@ QString operateImport(TrainingPanel &panel, const QString &control, const QStrin
         }
         check(false, QStringLiteral("No import preview for %1\n%2").arg(control, dialogs.join('\n')));
     }
+    check(localized, QStringLiteral("The import preview buttons must be in Chinese"));
     return result;
 }
 
@@ -398,7 +529,35 @@ void trainingReview(const QDir &root)
     EngineManager engine;
     TaskScheduler scheduler(data, data + "/outputs", engine);
     TrainingPanel panel(data, scheduler, [] { return QString(); }, [](QJsonObject) {});
+    auto *output = panel.findChild<QComboBox *>("clipAudioOutput");
+    check(output && output->count() == QMediaDevices::audioOutputs().size() + 1, "Missing startup audio inventory");
+    const auto system = QMediaDevices::defaultAudioOutput();
+    const auto expected = system.isNull() ? QStringLiteral("无可用音频输出")
+        : QStringLiteral("系统默认 · %1").arg(system.description());
+    check(output->itemText(0) == expected, "Default device name is absent from the output selector");
+    output->addItem("Disconnected test device", QByteArray("fixture-removed"));
+    output->setCurrentIndex(output->count() - 1);
+    auto *mediaDevices = output->findChild<QMediaDevices *>();
+    check(mediaDevices && QMetaObject::invokeMethod(mediaDevices, "audioOutputsChanged"), "Missing new audio inventory signal");
+    check(output->currentIndex() == 0 && output->itemText(0) == expected, "Missing device failed to fall back to the system output");
+    output->setItemText(0, "Stale label");
+    const auto devices = reportedTrainingDevices(QStringLiteral("0\tNVIDIA GeForce RTX 4070 Laptop GPU\n2\tNVIDIA GeForce RTX 4060"));
+    check(devices.size() == 2 && devices.value(2) == "NVIDIA GeForce RTX 4060"
+        && reportedTrainingDevices(QStringLiteral("0\tCPU CPU训练,较慢")).value(0) == "CPU",
+        "Cannot parse engine device names and ordinals");
+    auto *device = panel.findChild<QComboBox *>("trainingDevice");
+    check(device, "Cannot find the training device selector");
+    panel.setDeviceNames(devices);
+    check(device->currentText() == devices.value(0) && device->currentData().toString() == "0",
+        "Training device must show the model and retain the request ordinal");
+    device->setCurrentIndex(device->findData(2));
+    panel.setDeviceNames({{0, devices.value(0)}});
+    check(device->currentText() == QStringLiteral("原设备不可用") && device->currentData().toString() == "2",
+        "An unavailable saved ordinal must survive a device refresh");
+    panel.setDeviceNames(devices);
+    check(device->currentText() == devices.value(2), "Returning hardware must recover its model name");
     panel.show();
+    check(output->itemText(0) == expected, "Opening training did not refresh audio output");
     auto *table = panel.findChild<QTableWidget *>();
     check(table && table->rowCount() == 10, "Cannot load reviewed project");
     const auto newA = writeWave(root.filePath("new-clips/new-a.wav"), 16000, 700, 800);
@@ -451,13 +610,45 @@ void trainingReview(const QDir &root)
     QTest::keyClick(editor, Qt::Key_Return, Qt::ControlModifier);
     check(table->currentRow() == 11 && table->item(10, 3)->text() == "Edited with spaces"
         && table->item(10, 2)->text() == QStringLiteral("已校对"), "Saving the edit did not advance.");
+    output->setItemText(0, "Stale dropdown label");
+    output->showPopup();
+    output->hidePopup();
+    check(output->itemText(0) == expected, "Opening the audio menu did not refresh the default device label");
+    {
+        const auto gpt = project + "/fixture.ckpt";
+        const auto sovits = project + "/fixture.pth";
+        writeFixture(gpt, "GPT fixture");
+        writeFixture(sovits, "SoVITS fixture");
+        SynthesisPanel synthesis(data, scheduler, [] { return QString(); });
+        synthesis.show();
+        QTimer confirm;
+        confirm.setInterval(20);
+        QObject::connect(&confirm, &QTimer::timeout, &synthesis, [&] {
+            auto *modal = QApplication::activeModalWidget();
+            if (modal) {
+                confirm.stop();
+                button(*modal, QStringLiteral("保存声音"))->click();
+            }
+        });
+        confirm.start();
+        synthesis.importVoice({{"id", projectKey}, {"name", "Finished voice"}, {"family", "v5turbo"}, {"gpt", gpt},
+            {"sovits", sovits}, {"reference", clips + "/clip-00.wav"}, {"prompt", "Reviewed line 0"},
+            {"prompt_language", QStringLiteral("英文")}});
+        check(QTest::qWaitFor([&] { return !synthesis.importing(); }, 4000), "Saving the trained voice did not finish");
+        QSqlQuery stored("SELECT settings FROM voices WHERE name='Finished voice'");
+        check(stored.next() && readWorkspaceRecord(stored.value(0).toByteArray()).value("project_id") == projectKey,
+            "Trained voice was not saved with its project");
+        QSqlQuery jobs("SELECT COUNT(*) FROM jobs");
+        check(jobs.next() && jobs.value(0).toInt() == 0, "Saving a trained voice must not start a test synthesis");
+    }
 }
 
 void scriptReview(const QDir &root)
 {
     const auto data = root.filePath("training");
     QSqlQuery query;
-    check(query.exec("CREATE TABLE voices(id TEXT PRIMARY KEY,name TEXT,settings BLOB)"), query.lastError().text());
+    check(query.exec("CREATE TABLE IF NOT EXISTS voices(id TEXT PRIMARY KEY,name TEXT,settings BLOB)"), query.lastError().text());
+    check(query.exec("DELETE FROM voices WHERE name='Finished voice'"), query.lastError().text());
     const QString voiceA = "a1111111-1111-1111-1111-111111111111";
     const QString voiceB = "b2222222-2222-2222-2222-222222222222";
     const QStringList voices{voiceA, voiceB, voiceA};
@@ -542,18 +733,25 @@ int main(int argc, char **argv)
 {
     QApplication::setAttribute(Qt::AA_DontUseNativeDialogs);
     QApplication app(argc, argv);
-    if (app.arguments().size() != 2)
-        return 2;
-    QTemporaryDir scratch(QDir(app.arguments().at(1)).filePath("workflow-components-XXXXXX"));
     try {
+        const auto arguments = app.arguments();
+        if (arguments.size() == 4 && arguments.at(1) == "--capture-adaptation") {
+            liveDraftCapture(arguments.at(2), arguments.at(3));
+            return 0;
+        }
+        if (arguments.size() != 2)
+            return 2;
+        QTemporaryDir scratch(QDir(arguments.at(1)).filePath("workflow-components-XXXXXX"));
         check(scratch.isValid(), "Cannot create temporary project fixtures");
         const QDir root(scratch.path());
         engineCompatibility(root);
+        draftExport(root);
         recordings(root);
         exports(root);
         trainingReview(root);
         scriptReview(root);
-        QTextStream(stdout) << "Compatibility registry, recording append, failed/cancelled copy, Qt label review, script revision and mixed-rate WAV export passed."
+        comboPopupPlacement();
+        QTextStream(stdout) << "Compatibility registry, recording append, failed/cancelled copy, Qt label review, script revision, mixed-rate WAV export and dropdown placement passed."
                             << Qt::endl;
     } catch (const std::exception &error) {
         QTextStream(stderr) << error.what() << Qt::endl;

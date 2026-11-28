@@ -27,11 +27,13 @@ def interrupted_synthesis(database, data, variant):
     job_id = str(uuid.uuid4())
     custom = variant in ("custom_output", "custom_partial")
     output_root = data.with_name(data.name + "-external") if custom else data / "outputs"
-    target = output_root / f"{job_id}.wav"
+    number = {"timestamped_complete": 2, "timestamped_partial": 3, "timestamped_unrelated": 4}.get(variant)
+    timestamped = number is not None
+    target = output_root / (f"synth-202601011200-{number}.wav" if timestamped else f"{job_id}.wav")
     temporary = data / "jobs" / job_id
     temporary.mkdir(parents=True)
     target.parent.mkdir(exist_ok=True)
-    wave_path = temporary / "verified.wav" if variant in ("before_move", "custom_partial") else target
+    wave_path = temporary / "verified.wav" if variant in ("before_move", "custom_partial", "timestamped_partial") else target
     with wave.open(str(wave_path), "wb") as stream:
         stream.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
         stream.writeframes(b"\0\0" * 1600)
@@ -39,7 +41,9 @@ def interrupted_synthesis(database, data, variant):
     receipt = {"audio": target.as_posix(), "duration": 0.1}
     if variant != "legacy_truncated":
         receipt.update(bytes=len(content), sha256=hashlib.sha256(content).hexdigest())
-        receipt["archive_version"] = 1
+        receipt["archive_version"] = 2 if timestamped else 1
+        if timestamped:
+            receipt["archive_job"] = str(uuid.uuid4()) if variant == "timestamped_unrelated" else job_id
         target.with_suffix(".wav.ez-partial").write_bytes(content[:100])
     if variant == "changed":
         wave_path.write_bytes(content[:-1] + b"\xff")
@@ -63,7 +67,8 @@ def main():
     data = workspace / ".test" / f"recovery-{uuid.uuid4().hex}"
     start(program, data)
     database = sqlite3.connect(data / "library.sqlite")
-    variants = ("complete", "custom_output", "before_move", "custom_partial", "changed", "legacy_truncated")
+    variants = ("complete", "custom_output", "before_move", "custom_partial", "changed", "legacy_truncated",
+                "timestamped_complete", "timestamped_partial", "timestamped_unrelated")
     jobs = {variant: interrupted_synthesis(database, data, variant) for variant in variants}
     unrelated = data / "outputs" / "unrelated.wav.ez-partial"
     unrelated.write_bytes(b"owned by another app")
@@ -95,11 +100,11 @@ def main():
             "SELECT state,request,result FROM jobs WHERE id=?", (job_id,)
         ).fetchone()
         assert json.loads(request)["text"] == "snapshot"
-        if variant in ("complete", "custom_output"):
+        if variant in ("complete", "custom_output", "timestamped_complete"):
             assert state == "succeeded" and workspace_path(data, json.loads(result)["audio"]).is_file(), (variant, state)
         else:
             assert state == "interrupted" and result is None, (variant, state, result)
-        assert not target.with_suffix(".wav.ez-partial").exists(), variant
+        assert target.with_suffix(".wav.ez-partial").exists() == (variant == "timestamped_unrelated"), variant
     assert unrelated.read_bytes() == b"owned by another app"
     recovered = json.loads(database.execute("SELECT state FROM projects WHERE id=?", (project_id,)).fetchone()[0])
     assert workspace_path(data, recovered["sovits"]) == weight and "pending" not in recovered

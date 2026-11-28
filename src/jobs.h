@@ -19,10 +19,6 @@ struct JobActivity {
     QString id;
     QString operation;
     QString phase;
-    QString device;
-    QString unit;
-    int completed = 0;
-    int total = 0;
     qint64 seconds = 0;
 
     bool operator==(const JobActivity &) const = default;

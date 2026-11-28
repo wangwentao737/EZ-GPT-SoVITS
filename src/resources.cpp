@@ -137,6 +137,16 @@ QString operationLabel(const QString &operation)
     return labels.value(operation, operation);
 }
 
+QStringList resourceScripts(const QString &operation, const QString &family, const QString &language)
+{
+    QStringList scripts;
+    for (const auto &file : resourcesFor(operation, family, language)) {
+        if (file.endsWith(".py"))
+            scripts.append(file);
+    }
+    return scripts;
+}
+
 bool resourceRuleIncludesScript(const QString &operation, const QString &family,
                                 const QString &language, const QString &script)
 {

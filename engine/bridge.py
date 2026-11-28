@@ -1,12 +1,14 @@
 """Run EZ jobs with the Gradio client bundled in the selected engine."""
 
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from datetime import datetime
 import hashlib
 import importlib.util
 import json
 import os
 import re
 import sys
+from tempfile import TemporaryDirectory
 import time
 import traceback
 import uuid
@@ -56,6 +58,12 @@ def shell_path(value, root):
     if any(character in str(path) for character in ('"', "%", "!", "&", "|", "^", "<", ">", "\r", "\n")):
         raise ValueError("请使用不含命令行特殊字符的数据目录")
     return path.as_posix()
+
+
+def artifact_stem(kind, folder=None):
+    if folder is not None and re.fullmatch(rf"{kind}-[0-9]{{12}}(?:-[0-9]+)?", folder.name):
+        return folder.name
+    return f"{kind}-{datetime.now():%Y%m%d%H%M}"
 
 
 def publish(**values):
@@ -388,23 +396,12 @@ def synthesize(session, data, job, request, cancel):
     text = request["text"].strip()
     if not prompt or not text:
         raise ValueError("请填写参考文本和目标台词")
-    verification_hashes = {}
     tts, reused, copied = session.load(request, data, job, cancel, progress)
     try:
         verify_interface(tts, "inference", CONTRACT["inference"]["inference"])
     except InterfaceChanged as error:
         (job / "interface-error.json").write_text(json.dumps({"issue": str(error)}), encoding="utf-8")
         raise
-    if request.get("record_voice_verification"):
-        progress("校验模型和参考音频")
-        inputs = {key: safe_path(session.engine / relative, session.engine)
-                  for key, relative in zip(("gpt", "sovits"), session.staged, strict=True)}
-        inputs["reference"] = reference
-        cached = request.get("verification_hashes", {})
-        verification_hashes = {
-            key: cached[key] if re.fullmatch(r"[0-9a-f]{64}", cached.get(key, "")) else sha256_file(path, cancel)
-            for key, path in inputs.items()
-        }
     progress("生成音频")
     audio_path, actual_seed = invoke(tts, "inference", *inference_arguments(request, reference, parameters), cancel=cancel)
     progress("校验并保存音频")
@@ -425,7 +422,7 @@ def synthesize(session, data, job, request, cancel):
     check_cancel(cancel)
     publish(audio=str(temporary), seed=int(actual_seed), duration=info.duration,
             bytes=temporary.stat().st_size, sha256=digest, parameters=parameters,
-            verification_hashes=verification_hashes, inference_reused=reused, weight_bytes_copied=copied)
+            inference_reused=reused, weight_bytes_copied=copied)
 
 
 def require_outputs(folder, glob, stage):
@@ -485,7 +482,7 @@ def transcribe(engine, project, request, gpu, cancel, progress):
     check_cancel(cancel)
     progress("保存转写标注", len(labels), len(clips), "段", device)
     destination.mkdir()
-    annotation = safe_path(destination / f"{source.name}.list", project)
+    annotation = safe_path(destination / f"{artifact_stem('asr', destination)}.list", project)
     annotation.write_text("\n".join(labels) + "\n", encoding="utf-8")
     publish(annotation=str(annotation))
 
@@ -494,6 +491,7 @@ def annotated_samples(annotation, clips, cancel, inspect_audio):
     content = annotation.read_bytes()
     languages = {}
     names = set()
+    rows = []
     for number, line in enumerate(content.decode("utf-8-sig").splitlines(), 1):
         check_cancel(cancel)
         fields = line.split("|", maxsplit=3)
@@ -510,9 +508,58 @@ def annotated_samples(annotation, clips, cancel, inspect_audio):
             inspect_wav(clip, cancel=cancel)
         names.add(clip.name.casefold())
         languages[clip.name] = language
+        rows.append((clip, speaker, language, text))
     if len(languages) < 2:
         raise ValueError("至少需要两个有效录音片段")
-    return {"annotation_sha256": hashlib.sha256(content).hexdigest(), "samples": languages}
+    return {"annotation_sha256": hashlib.sha256(content).hexdigest(), "samples": languages}, rows
+
+
+def engine_audio_path_fits(path):
+    # The bundled Windows FFmpeg refuses input paths at MAX_PATH.
+    return len(str(path).encode("utf-16-le")) // 2 < 260
+
+
+@contextmanager
+def preparation_inputs(job, annotation, clips, rows, snapshot, cancel):
+    if (engine_audio_path_fits(annotation)
+            and all(clip.parent == clips and engine_audio_path_fits(clip) for clip, *_ in rows)):
+        try:
+            original_paths = shell_path(annotation, annotation.parent), shell_path(clips, clips)
+        except ValueError:
+            pass  # Stage shell-sensitive paths as well.
+        else:
+            yield original_paths
+            return
+
+    # Prefer the job's volume so the staged audio can be hard linked.
+    candidate = job / "ezp-12345678" / "ez-00000001.wav"
+    workdir = None
+    if engine_audio_path_fits(candidate):
+        try:
+            shell_path(job, job)
+            workdir = job
+        except ValueError:
+            pass
+    with TemporaryDirectory(prefix="ezp-", dir=workdir) as directory:
+        stage = safe_path(directory)
+        staged_labels = stage / "labels.list"
+        aliases = {}
+        lines = []
+        for number, (clip, speaker, language, text) in enumerate(rows, 1):
+            check_cancel(cancel)
+            alias = f"ez-{number:08d}.wav"
+            target = stage / alias
+            if not engine_audio_path_fits(target):
+                raise ValueError("无法创建短路径预处理目录。请检查 Windows 临时文件夹的位置。")
+            try:
+                os.link(clip, target)
+            except OSError:
+                copy_with_cancel(clip, target, cancel)
+            aliases[clip.name] = alias
+            lines.append(f"{target.as_posix()}|{speaker}|{language}|{text}")
+        staged_labels.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        snapshot["engine_samples"] = aliases
+        yield shell_path(staged_labels, stage), shell_path(stage, stage)
 
 
 def read_dataset_index(path, width, cancel, header=None):
@@ -552,12 +599,21 @@ def verify_dataset(directory, family, snapshot, cancel):
     phones = read_dataset_index(text_index, 4, cancel)
     semantics = read_dataset_index(semantic_index, 2, cancel, header="item_name\tsemantic_audio")
     languages = snapshot["samples"] if snapshot is not None else {}
-    expected = set(languages) if snapshot is not None else set(phones)
+    aliases = snapshot.get("engine_samples") if snapshot is not None else None
+    if aliases is not None:
+        if (not isinstance(aliases, dict) or aliases.keys() != languages.keys()
+                or any(not isinstance(name, str) or not re.fullmatch(r"ez-\d{8}\.wav", name) for name in aliases.values())
+                or len(set(aliases.values())) != len(languages)):
+            raise ValueError("预处理的片段映射无效，请重新准备数据。")
+        originals = {name: original for original, name in aliases.items()}
+    else:
+        originals = {name: name for name in (languages if snapshot is not None else phones)}
+    expected = set(originals)
     for filename, found in ((text_index.name, phones), (semantic_index.name, semantics)):
         missing = sorted(expected - set(found))
         unexpected = sorted(set(found) - expected)
         if missing or unexpected:
-            samples = [f"缺少 {name}" for name in missing[:3]] + [f"多出 {name}" for name in unexpected[:3]]
+            samples = [f"缺少 {originals[name]}" for name in missing[:3]] + [f"多出 {name}" for name in unexpected[:3]]
             raise ValueError(f"预处理样本不匹配：{filename} · {'、'.join(samples)}")
     if len(expected) < 2:
         raise ValueError("预处理数据至少需要两个有效样本")
@@ -565,9 +621,10 @@ def verify_dataset(directory, family, snapshot, cancel):
     artifacts = [Path("2-name2text.txt"), Path("6-name2semantic.tsv")]
     for name in sorted(expected):
         check_cancel(cancel)
+        original = originals[name]
         wave = safe_path(directory / "5-wav32k" / name, directory)
         if not wave.is_file():
-            raise FileNotFoundError(f"缺少重采样音频：{name}")
+            raise FileNotFoundError(f"缺少重采样音频：{original}")
         inspect_wav(wave, cancel=cancel)
         artifacts.append(Path("5-wav32k") / name)
 
@@ -575,12 +632,12 @@ def verify_dataset(directory, family, snapshot, cancel):
         if family in {"v2Pro", "v2ProPlus"}:
             features.append("7-sv_cn")
         bert = safe_path(directory / "3-bert" / f"{name}.pt", directory)
-        if languages.get(name) == "zh" or bert.is_file():
+        if languages.get(original) == "zh" or bert.is_file():
             features.append("3-bert")
         for group in features:
             feature = safe_path(directory / group / f"{name}.pt", directory)
             if not feature.is_file() or not zipfile.is_zipfile(feature):
-                raise ValueError(f"特征缺失或文件不完整：{group}/{name}.pt。请重新准备训练数据。")
+                raise ValueError(f"特征缺失或文件不完整：{group}/{original}.pt。请重新准备训练数据。")
             artifacts.append(Path(group) / f"{name}.pt")
     return artifacts, len(expected)
 
@@ -753,19 +810,21 @@ def run_training(client, engine, data, job, request, cancel):
         discarded = set(request.get("discarded_clips", ()))
         previous = [path for path in previous if path.name not in discarded]
         taken = {path.name.casefold() for path in [*previous, *clips]}
-        occupied = {path.name.casefold() for path in previous}
+        stem = artifact_stem("slice", destination)
+        number = 1
         for index, clip in enumerate(clips):
             check_cancel(cancel)
             match = re.fullmatch(r"(.*)_\d{10}_\d{10}\.wav", clip.name, re.IGNORECASE)
             recording = match[1] if match else ""
-            if clip.name.casefold() in occupied:
-                target = destination / f"slice-{uuid.uuid4().hex}.wav"
-                while target.name.casefold() in taken:
-                    target = destination / f"slice-{uuid.uuid4().hex}.wav"
-                os.replace(clip, target)
-                clips[index] = clip = target
-                taken.add(target.name.casefold())
-            added.append({"name": clip.name, "recording": recording})
+            name = f"{stem}.wav" if len(clips) == 1 else f"{stem}-{number:03d}.wav"
+            while name.casefold() in taken:
+                name = f"{stem}-{number:03d}.wav"
+                number += 1
+            target = safe_path(destination / name, destination)
+            clip.rename(target)
+            clips[index] = target
+            taken.add(name.casefold())
+            added.append({"name": name, "recording": recording})
         for prior_clip in previous:
             target = safe_path(destination / prior_clip.name, destination)
             check_cancel(cancel)
@@ -795,20 +854,22 @@ def run_training(client, engine, data, job, request, cancel):
         progress("核对标注与录音")
         annotation = safe_path(request["annotation"], project)
         clips = safe_path(request["source"], project)
-        snapshot = annotated_samples(annotation, clips, cancel, inspect_audio=True)
+        snapshot, rows = annotated_samples(annotation, clips, cancel, inspect_audio=True)
         snapshot["family"] = family
         if experiment_dir.exists():
             raise ValueError("此预处理实验已存在，请从项目重新准备训练数据")
-        invoke(client, "switch_version", family)
-        progress("启动数据预处理")
-        seen = set()
-        invoke(client, "open1abc", family, shell_path(annotation, project), shell_path(clips, project),
-               experiment, gpu, gpu, gpu,
-               BERT, HUBERT, sovits, cancel=cancel, stop="close1abc",
-               on_wait=lambda pending: preparation_progress(pending, progress, seen))
+        with preparation_inputs(job, annotation, clips, rows, snapshot, cancel) as (labels_path, clips_path):
+            invoke(client, "switch_version", family)
+            progress("启动数据预处理")
+            seen = set()
+            invoke(client, "open1abc", family, labels_path, clips_path, experiment, gpu, gpu, gpu,
+                   BERT, HUBERT, sovits, cancel=cancel, stop="close1abc",
+                   on_wait=lambda pending: preparation_progress(pending, progress, seen))
         progress("校验预处理产物")
         if hashlib.sha256(annotation.read_bytes()).hexdigest() != snapshot["annotation_sha256"]:
             raise ValueError("预处理时标注发生变更，请重新准备训练数据")
+        if not any((experiment_dir / "4-cnhubert").glob("*.pt")):
+            raise ValueError("未生成音频特征。请在引擎日志中查看录音读取或特征提取错误。")
         _, sample_count = verify_dataset(experiment_dir, family, snapshot, cancel)
         receipt = safe_path(experiment_dir / "ez-dataset.json", experiment_dir)
         temporary = safe_path(experiment_dir / "ez-dataset.json.partial", experiment_dir)
@@ -827,10 +888,11 @@ def run_training(client, engine, data, job, request, cancel):
         raise ValueError("训练数据使用了其他模型家族，请重新准备训练数据")
     if request.get("annotation"):
         annotation = safe_path(request["annotation"], project)
-        labels = annotated_samples(annotation, safe_path(request["source"], project), cancel, inspect_audio=False)
+        labels, _ = annotated_samples(annotation, safe_path(request["source"], project), cancel, inspect_audio=False)
         if snapshot is not None and labels["annotation_sha256"] != snapshot["annotation_sha256"]:
             raise ValueError("当前标注与预处理版本不同，请重新准备训练数据")
-        snapshot = labels
+        if snapshot is None:
+            snapshot = labels
     artifacts, sample_count = verify_dataset(experiment_dir, family, snapshot, cancel)
     batch = int(request.get("batch", 1))
     epochs = int(request.get("epochs", 2))
@@ -901,13 +963,22 @@ def run_training(client, engine, data, job, request, cancel):
     else:
         pattern = f"{run.name}-e{epochs}.ckpt"
     weight = max(require_outputs(weights, pattern, stage), key=lambda path: path.stat().st_mtime_ns)
-    saved = safe_path(project / "weights" / experiment / weight.name, project)
-    saved.parent.mkdir(parents=True, exist_ok=True)
+    directory = safe_path(project / "weights" / experiment, project)
+    directory.mkdir(parents=True, exist_ok=True)
+    stem = artifact_stem(kind.lower())
     temporary = safe_path(job / f"weight-{uuid.uuid4().hex}.partial", job)
     try:
         copy_with_cancel(safe_path(weight, engine), temporary, cancel)
         check_cancel(cancel)
-        os.replace(temporary, saved)
+        saved = directory / f"{stem}.{extension}"
+        sequence = 2
+        while True:
+            try:
+                temporary.rename(saved)
+                break
+            except FileExistsError:
+                saved = directory / f"{stem}-{sequence}.{extension}"
+                sequence += 1
     finally:
         temporary.unlink(missing_ok=True)
     publish(weight=str(saved), checkpoints=str(run), dataset=str(experiment_dir), sample_count=sample_count,
